@@ -23,6 +23,7 @@
 #include "Scheduler/LayerInfo.h"
 
 #include "LayerCreationArgs.h"
+#include "ExternalDesktopOwnedInputBlock.h"
 #include "QueuedTransactionState.h"
 
 struct RenderCommandBuffer;
@@ -111,6 +112,11 @@ struct RequestedLayerState : layer_state_t {
     const std::string name;
     bool canBeRoot = false;
     const uint32_t layerCreationFlags;
+    // Only authenticated SF root creation initializes this NONRESOURCE token.
+    // layer_state_t transactions/metadata cannot assign or clear it.
+    const sp<IBinder> externalDesktopOwnedInputBlockOrigin;
+    const sp<NativeLifetimeToken> nativeResourceGroup; // actual creation value, not transaction metadata.
+    ExternalDesktopOwnedInputBlockControl externalDesktopOwnedInputBlockControl;
     // The owner of the layer. If created from a non system process, it will be the calling uid.
     // If created from a system process, the value can be passed in.
     const gui::Uid ownerUid;

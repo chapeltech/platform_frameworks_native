@@ -115,6 +115,9 @@ public:
     void forEachMergedSnapshot(const ConstVisitor& visitor) const;
 
     bool hasMergedSnapshots() const { return !mMergedSnapshots.empty(); }
+    std::vector<sp<NativeLifetimeToken>> takeNativeRetiredSnapshots() {
+        auto result=std::move(mNativeRetiredSnapshots);mNativeRetiredSnapshots.clear();return result;
+    }
 
     // Visit each snapshot interesting to input reverse z-order
     void forEachInputSnapshot(const ConstVisitor& visitor) const;
@@ -195,6 +198,7 @@ private:
             mNeedsTouchableRegionCrop;
     std::vector<std::unique_ptr<LayerSnapshot>> mSnapshots;
     std::vector<std::unique_ptr<LayerSnapshot>> mMergedSnapshots;
+    std::vector<sp<NativeLifetimeToken>> mNativeRetiredSnapshots; // Nonresource observations only.
     bool mResortSnapshots = false;
     int mNumInterestingSnapshots = 0;
     bool mHasMirrorRequests = false;

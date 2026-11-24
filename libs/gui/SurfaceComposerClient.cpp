@@ -2747,6 +2747,50 @@ sp<SurfaceControl> SurfaceComposerClient::mirrorSurface(SurfaceControl* mirrorFr
     return nullptr;
 }
 
+status_t SurfaceComposerClient::transitionExternalDesktopOwnedInputBlocks(
+        const std::vector<sp<SurfaceControl>>& roots, const std::vector<sp<IBinder>>& origins,
+        const std::vector<int64_t>& revisions, int64_t epoch, bool blocked) {
+    if (roots.empty() || roots.size() > 128 * 8 || roots.size() != origins.size() ||
+            roots.size() != revisions.size() || epoch <= 0) return BAD_VALUE;
+    std::vector<sp<IBinder>> handles;
+    handles.reserve(roots.size());
+    for (const auto& root : roots) {
+        if (!root || !root->isValid()) return BAD_VALUE;
+        handles.push_back(root->getHandle());
+    }
+    const auto client = getClient();
+    if (client == nullptr) return NO_INIT;
+    return statusTFromBinderStatus(client->setExternalDesktopOwnedInputBlocks(handles, origins, revisions, epoch, blocked));
+}
+
+status_t SurfaceComposerClient::transitionExternalDesktopRootStates(
+        const std::vector<sp<SurfaceControl>>& roots, const std::vector<sp<IBinder>>& origins,
+        const std::vector<int64_t>& revisions, int32_t operation, int64_t generation,
+        int64_t atlas, int64_t geometry, int64_t epoch, const std::vector<int64_t>& presentations) {
+    if (roots.empty() || roots.size() > 128 * 8 || roots.size() != origins.size() ||
+            roots.size() != revisions.size() || roots.size() != presentations.size()) return BAD_VALUE;
+    std::vector<sp<IBinder>> handles;
+    handles.reserve(roots.size());
+    for (const auto& root : roots) {
+        if (!root || !root->isValid()) return BAD_VALUE;
+        handles.push_back(root->getHandle());
+    }
+    const auto client = getClient();
+    if (client == nullptr) return NO_INIT;
+    return statusTFromBinderStatus(client->transitionExternalDesktopRootStates(handles, origins, revisions,
+            operation, generation, atlas, geometry, epoch, presentations));
+}
+
+sp<SurfaceControl> SurfaceComposerClient::mirrorExternalDesktopBlockedSurface(SurfaceControl* source) {
+    if (source == nullptr) return nullptr;
+    Mutex::Autolock lock(mLock);
+    gui::CreateSurfaceResult result;
+    const auto status = mClient->mirrorExternalDesktopBlockedSurface(source->getHandle(), &result);
+    if (statusTFromBinderStatus(status) != NO_ERROR) return nullptr;
+    return sp<SurfaceControl>::make(sp<SurfaceComposerClient>::fromExisting(this),
+                                    result.handle, result.layerId, toString(result.layerName));
+}
+
 sp<SurfaceControl> SurfaceComposerClient::mirrorLayerStack(DisplayId displayId) {
     const Mutex::Autolock lock(mLock);
 

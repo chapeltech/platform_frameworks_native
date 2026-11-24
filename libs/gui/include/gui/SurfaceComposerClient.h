@@ -418,6 +418,20 @@ public:
     sp<SurfaceControl> mirrorSurface(SurfaceControl* mirrorFromSurface,
                                      SurfaceControl* stopAt = nullptr,
                                      SurfaceControl* cropBy = nullptr);
+    // PRIVATE system_server-only restrictive creation; no tag or clear API.
+    sp<SurfaceControl> mirrorExternalDesktopBlockedSurface(SurfaceControl* mirrorFromSurface);
+    // PRIVATE coherent-OS TCB continuation. No production caller until the
+    // native Stage transition/route/retirement cut is integrated. This method
+    // does not modify stock drop mode or acknowledge compositor publication.
+    status_t transitionExternalDesktopOwnedInputBlocks(const std::vector<sp<SurfaceControl>>& roots,
+            const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+            int64_t epoch, bool blocked);
+    // PRIVATE TCB producer. No StageLive/default-deny caller is enabled here.
+    // Do not invoke synchronous SF IPC while holding InputDispatcher::mLock.
+    status_t transitionExternalDesktopRootStates(const std::vector<sp<SurfaceControl>>& roots,
+            const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+            int32_t operation, int64_t generation, int64_t atlas, int64_t geometry,
+            int64_t epoch, const std::vector<int64_t>& presentations);
 
     // Finds the layer stack associated with the provided `displayId`, and returns the
     // `SurfaceControl` associated with the root layer of the mirrored hierarchy. Otherwise, nullptr

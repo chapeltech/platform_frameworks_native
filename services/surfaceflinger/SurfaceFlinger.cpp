@@ -151,6 +151,7 @@
 #include "FrontEnd/LayerCreationArgs.h"
 #include "FrontEnd/LayerHandle.h"
 #include "FrontEnd/LayerLifecycleManager.h"
+#include "FrontEnd/LayerSourceInfoBuilder.h"
 #include "FrontEnd/LayerLog.h"
 #include "FrontEnd/LayerSnapshot.h"
 #include "HdrLayerInfoReporter.h"
@@ -2970,7 +2971,27 @@ bool SurfaceFlinger::updateLayerSnapshots(VsyncId vsyncId, nsecs_t frameTimeNs,
         }
     });
 
+    const auto retirementWake=[weak=wp<SurfaceFlinger>::fromExisting(this)] {
+        if (auto flinger=weak.promote()) {
+            // Resource destruction can hold mStateLock. Only enqueue here;
+            // transaction flags/scheduler/Power HAL work runs on a later loop.
+            // Neither queued closure nor token retains a strong SF reference.
+            static_cast<void>(flinger->mScheduler->schedule([weak] {
+                if (auto current=weak.promote()) {
+                    current->setTransactionFlags(eInputInfoUpdateNeeded);
+                }
+            }));
+        }
+    };
+    for (const auto& token:mLayerSnapshotBuilder.takeNativeRetiredSnapshots()) {
+        mNativeRetirements.removed(token,retirementWake);
+    }
     for (auto& destroyedLayer : mLayerLifecycleManager.getDestroyedLayers()) {
+        if (auto it=mLegacyLayers.find(destroyedLayer->id);it!=mLegacyLayers.end()) {
+            mNativeRetirements.removed(it->second->getNativeRetirementToken(),retirementWake);
+            mNativeRetirements.removed(it->second->getNativeRetirementToken()->resourceGroup(),
+                                       retirementWake);
+        }
         mLegacyLayers.erase(destroyedLayer->id);
     }
 
@@ -2978,6 +2999,9 @@ bool SurfaceFlinger::updateLayerSnapshots(VsyncId vsyncId, nsecs_t frameTimeNs,
         SFTRACE_NAME("LayerLifecycleManager:commitChanges");
         mLayerLifecycleManager.commitChanges();
     }
+    // Only AFTER the actual frontend removal commit and all completed resource
+    // destructors. A later resource-copy destructor schedules another main pass.
+    if (mNativeRetirements.afterCommit()) mUpdateInputInfo=true;
 
     // enter boot animation on first buffer latch
     if (CC_UNLIKELY(mBootStage == BootStage::BOOTLOADER && newDataLatched)) {
@@ -4916,21 +4940,27 @@ void SurfaceFlinger::updateInputFlinger(VsyncId vsyncId, TimePoint frameTime) {
 
     std::vector<WindowInfo> windowInfos;
     std::vector<DisplayInfo> displayInfos;
+    std::vector<gui::LayerSourceInfo> layerSources;
+    bool layerSourcesComplete = false;
     bool updateWindowInfo = false;
     bool visibleWindowsChanged = false;
     if (mUpdateInputInfo) {
         mUpdateInputInfo = false;
         updateWindowInfo = true;
-        buildWindowInfos(windowInfos, displayInfos, mVisibleWindowIds);
+        buildWindowInfos(windowInfos, displayInfos, mVisibleWindowIds, layerSources, layerSourcesComplete);
         if (mVisibleWindowIds != mLastVisibleWindowIds) {
             visibleWindowsChanged = true;
             std::swap(mLastVisibleWindowIds, mVisibleWindowIds);
         }
     }
 
+    const uint64_t nativeRemovalPass=mNativeRetirements.pass();
+    auto nativeRetirements=mNativeRetirements.candidates();
     BackgroundExecutor::getInstance().sendCallbacks(
             {[updateWindowInfo, windowInfos = std::move(windowInfos),
               displayInfos = std::move(displayInfos),
+              layerSources = std::move(layerSources), layerSourcesComplete,
+              nativeRemovalPass,nativeRetirements=std::move(nativeRetirements),
               inputWindowCommands = std::move(mInputWindowCommands), inputFlinger = mInputFlinger,
               this, visibleWindowsChanged, vsyncId, frameTime]() mutable {
                 SFTRACE_NAME("BackgroundExecutor::updateInputFlinger");
@@ -4939,11 +4969,13 @@ void SurfaceFlinger::updateInputFlinger(VsyncId vsyncId, TimePoint frameTime) {
                             ->windowInfosChanged(gui::WindowInfosUpdate{std::move(windowInfos),
                                                                         std::move(displayInfos),
                                                                         ftl::to_underlying(vsyncId),
-                                                                        frameTime.ns()},
+                                                                        frameTime.ns(), std::move(layerSources),
+                                                                        layerSourcesComplete},
                                                  inputWindowCommands.releaseListeners(),
                                                  /* forceImmediateCall= */ visibleWindowsChanged ||
                                                          !inputWindowCommands.getFocusRequests()
-                                                                  .empty());
+                                                                  .empty(),nativeRemovalPass,
+                                                 std::move(nativeRetirements));
                 } else {
                     // If there are listeners but no changes to input windows, call the listeners
                     // immediately.
@@ -4993,14 +5025,41 @@ void SurfaceFlinger::persistDisplayBrightness(bool needsComposite) {
 
 void SurfaceFlinger::buildWindowInfos(std::vector<WindowInfo>& outWindowInfos,
                                       std::vector<DisplayInfo>& outDisplayInfos,
-                                      std::vector<int32_t>& outVisibleWindowIds) {
+                                      std::vector<int32_t>& outVisibleWindowIds,
+                                      std::vector<gui::LayerSourceInfo>& outLayerSources,
+                                      bool& outLayerSourcesComplete) {
     static size_t sNumWindowInfos = 0;
     outWindowInfos.reserve(sNumWindowInfos);
     outVisibleWindowIds.clear();
+    outLayerSources.clear();
+    outLayerSourcesComplete = true;
+    gui::LayerSourceBudget sourceBudget;
+    const frontend::LayerSourceLifetimeResolver sourceLifetimes = [this](uint32_t id)
+            FTL_FAKE_GUARD(kMainThreadContext)
+            -> std::optional<gui::LayerSourceLifetime> {
+        const auto found = mLegacyLayers.find(id);
+        if (found == mLegacyLayers.end() || !found->second ||
+            static_cast<uint32_t>(found->second->getSequence()) != id) return {};
+        return found->second->getSourceLifetimeForFacts();
+    };
 
     mLayerSnapshotBuilder.forEachInputSnapshot(
-            [&outWindowInfos, &outVisibleWindowIds](const frontend::LayerSnapshot& snapshot) {
+            [this, &outWindowInfos, &outVisibleWindowIds, &outLayerSources,
+             &outLayerSourcesComplete, &sourceBudget, &sourceLifetimes](const frontend::LayerSnapshot& snapshot)
+                    FTL_FAKE_GUARD(kMainThreadContext) {
                 outWindowInfos.push_back(snapshot.inputInfo);
+                if (outLayerSourcesComplete) {
+                    auto source = frontend::buildLayerSourceInfo(snapshot,
+                            static_cast<uint32_t>(outWindowInfos.size() - 1),
+                            mLayerLifecycleManager, mLayerSnapshotBuilder, sourceLifetimes, sourceBudget);
+                    if (!source || !gui::layerSourceMatchesWindow(*source, outWindowInfos.back(),
+                                                                  outWindowInfos.size() - 1)) {
+                        outLayerSourcesComplete = false;
+                        outLayerSources.clear(); // no partial facts, ordinary rows still publish
+                    } else {
+                        outLayerSources.push_back(std::move(*source));
+                    }
+                }
                 if (!snapshot.inputInfo.inputConfig.test(WindowInfo::InputConfig::NOT_VISIBLE)) {
                     outVisibleWindowIds.push_back(snapshot.inputInfo.id);
                 }
@@ -6161,6 +6220,60 @@ uint32_t SurfaceFlinger::addInputWindowCommands(const InputWindowCommands& input
     return hasChanges ? eTraversalNeeded : 0;
 }
 
+status_t SurfaceFlinger::transitionExternalDesktopRootStates(const std::vector<sp<IBinder>>& roots,
+        const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+        int32_t operation, int64_t generation, int64_t atlas, int64_t geometry,
+        int64_t epoch, const std::vector<int64_t>& presentations) {
+    if (roots.empty() || roots.size() > 128 * 8 || roots.size() != origins.size() ||
+            roots.size() != revisions.size() || roots.size() != presentations.size() ||
+            operation < 0 || operation > 2 || epoch <= 0) return BAD_VALUE;
+    return mScheduler->schedule([=, this]() FTL_FAKE_GUARD(kMainThreadContext) -> status_t {
+        std::vector<uint32_t> ids;
+        std::vector<sp<Layer>> layers;
+        ids.reserve(roots.size()); layers.reserve(roots.size());
+        // Pin actual referents through the WHOLE atomic main-thread operation.
+        for (const auto& handle : roots) {
+            if (!handle) return BAD_VALUE;
+            auto layer = LayerHandle::getLayer(handle);
+            if (!layer) return NAME_NOT_FOUND;
+            ids.push_back(layer->getSequence()); layers.push_back(std::move(layer));
+        }
+        if (!mLayerLifecycleManager.transitionExternalDesktopRootStates(ids, origins, revisions, operation,
+                generation, atlas, geometry, epoch, presentations)) return BAD_VALUE;
+        setTransactionFlags(eTransactionNeeded | eTraversalNeeded | eInputInfoUpdateNeeded);
+        // Success is NOT B0/B1/B2, StageMachine acceptance, or a report fence.
+        return NO_ERROR;
+    }).get();
+}
+
+status_t SurfaceFlinger::setExternalDesktopOwnedInputBlocks(const std::vector<sp<IBinder>>& roots,
+        const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+        int64_t epoch, bool blocked) {
+    if (roots.empty() || roots.size() > 128 * 8 || roots.size() != origins.size() ||
+            roots.size() != revisions.size() || epoch <= 0) return BAD_VALUE;
+    return mScheduler->schedule([=, this]() FTL_FAKE_GUARD(kMainThreadContext) -> status_t {
+        std::vector<uint32_t> ids;
+        ids.reserve(roots.size());
+        std::vector<sp<Layer>> layers;
+        layers.reserve(roots.size());
+        // Keep actual referents alive for the WHOLE atomic lifecycle update.
+        // IDs/foreign Binders cannot substitute for real LayerHandles.
+        for (const auto& handle : roots) {
+            if (!handle) return BAD_VALUE;
+            auto layer = LayerHandle::getLayer(handle);
+            if (!layer) return NAME_NOT_FOUND;
+            ids.push_back(layer->getSequence());
+            layers.push_back(std::move(layer));
+        }
+        if (!mLayerLifecycleManager.setExternalDesktopOwnedInputBlocks(ids, origins, revisions, epoch,
+                                                           blocked)) return BAD_VALUE;
+        // Real Input change, including already-PARKED ARM. This return is NOT
+        // commit/report/B1 or StageMachine acceptance. No callback is invented.
+        setTransactionFlags(eTransactionNeeded | eTraversalNeeded | eInputInfoUpdateNeeded);
+        return NO_ERROR;
+    }).get();
+}
+
 status_t SurfaceFlinger::mirrorLayer(const LayerCreationArgs& args,
                                      const sp<IBinder>& mirrorFromHandle,
                                      const sp<IBinder>& stopAtHandle,
@@ -6173,6 +6286,12 @@ status_t SurfaceFlinger::mirrorLayer(const LayerCreationArgs& args,
     sp<Layer> mirrorLayer;
     sp<Layer> mirrorFrom;
     LayerCreationArgs mirrorArgs = LayerCreationArgs::fromOtherArgs(args);
+    if (args.createExternalDesktopOwnedInputBlock) {
+        // New identity per ACTUAL root creation, never an externally supplied
+        // token or a reused origin from fromOtherArgs/metadata. No Layer/FD/SC
+        // back-pointer is retained by this empty nonresource Binder.
+        mirrorArgs.externalDesktopOwnedInputBlockOrigin = sp<BBinder>::make();
+    }
     {
         Mutex::Autolock _l(mStateLock);
         mirrorFrom = LayerHandle::getLayer(mirrorFromHandle);

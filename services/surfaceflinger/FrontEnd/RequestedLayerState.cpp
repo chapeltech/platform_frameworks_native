@@ -52,6 +52,8 @@ RequestedLayerState::RequestedLayerState(const LayerCreationArgs& args)
         name(args.name + "#" + std::to_string(args.sequence)),
         canBeRoot(args.addToRoot),
         layerCreationFlags(args.flags),
+        externalDesktopOwnedInputBlockOrigin(args.externalDesktopOwnedInputBlockOrigin),
+        nativeResourceGroup(args.nativeResourceGroup),
         ownerUid(args.ownerUid),
         ownerPid(args.ownerPid),
         ownerPermissions(args.ownerPermissions),

@@ -298,7 +298,8 @@ LayerProtoFromSnapshotGenerator& LayerProtoFromSnapshotGenerator::with(
         }
         LayerProtoFromSnapshotGenerator::writeHierarchyToProto(*child,
                                                                path.makeChild(child->getLayer()->id,
-                                                                              variant));
+                                                                              variant),
+                                                               mNativeEmptyResourceRoot);
     }
 
     // fill in relative and parent info
@@ -356,21 +357,29 @@ LayerProtoFromSnapshotGenerator& LayerProtoFromSnapshotGenerator::withOffscreenL
 
 frontend::LayerSnapshot* LayerProtoFromSnapshotGenerator::getSnapshot(
         const frontend::LayerHierarchy::TraversalPath& path,
-        const frontend::RequestedLayerState& layer) {
+        const frontend::RequestedLayerState& layer,
+        const frontend::LayerSnapshot& parent) {
     frontend::LayerSnapshot* snapshot = mSnapshotBuilder.getSnapshot(path);
     if (snapshot) {
         return snapshot;
     } else {
-        mDefaultSnapshots[path] = frontend::LayerSnapshot(layer, path);
-        return &mDefaultSnapshots[path];
+        // Preserve the old reconstruction-on-each-fallback behavior without
+        // assigning over a live resource guard before its real member dtors.
+        // Keep the old node alive through construction: a relative traversal
+        // can supply that very snapshot as parent. Never borrow a destroyed
+        // parent, nor replace an old resource guard before its member dtors.
+        auto displaced=mDefaultSnapshots.extract(path);
+        static_cast<void>(displaced);
+        return &mDefaultSnapshots.try_emplace(path,layer,path,parent).first->second;
     }
 }
 
 void LayerProtoFromSnapshotGenerator::writeHierarchyToProto(
-        const frontend::LayerHierarchy& root, const frontend::LayerHierarchy::TraversalPath& path) {
+        const frontend::LayerHierarchy& root, const frontend::LayerHierarchy::TraversalPath& path,
+        const frontend::LayerSnapshot& parent) {
     using Variant = frontend::LayerHierarchy::Variant;
     const frontend::RequestedLayerState& layer = *root.getLayer();
-    frontend::LayerSnapshot* snapshot = getSnapshot(path, layer);
+    frontend::LayerSnapshot* snapshot = getSnapshot(path, layer, parent);
     if (mVisitedLayers.find(snapshot->uniqueSequence) != mVisitedLayers.end()) {
         TransactionTraceWriter::getInstance().invoke("DuplicateLayer", /* overwrite= */ false);
         return;
@@ -381,7 +390,7 @@ void LayerProtoFromSnapshotGenerator::writeHierarchyToProto(
 
     for (const auto& [child, variant] : root.mChildren) {
         frontend::LayerSnapshot* childSnapshot =
-                getSnapshot(path.makeChild(child->getLayer()->id, variant), layer);
+                getSnapshot(path.makeChild(child->getLayer()->id, variant), layer, *snapshot);
         if (variant == Variant::Attached || variant == Variant::Detached ||
             frontend::LayerHierarchy::isMirror(variant)) {
             mChildToParent[childSnapshot->uniqueSequence] = snapshot->uniqueSequence;
@@ -404,7 +413,7 @@ void LayerProtoFromSnapshotGenerator::writeHierarchyToProto(
         if (variant == Variant::Detached) {
             continue;
         }
-        writeHierarchyToProto(*child, path.makeChild(child->getLayer()->id, variant));
+        writeHierarchyToProto(*child, path.makeChild(child->getLayer()->id, variant), *snapshot);
     }
 }
 

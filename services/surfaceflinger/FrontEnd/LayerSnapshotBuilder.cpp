@@ -20,6 +20,8 @@
 #include "FrontEnd/LayerSnapshot.h"
 #include "ui/Transform.h"
 
+#include <cmath>
+#include <limits>
 #include <numeric>
 #include <optional>
 
@@ -112,6 +114,77 @@ Region transformTouchableRegionSafely(const ui::Transform& t, const Region& r,
     return ret;
 }
 
+bool preViewportRectValid(const Rect& rect) {
+    constexpr int32_t limit = gui::WindowInfo::kMaxStagedAtlasCoordinate;
+    const int64_t width = int64_t{rect.right} - rect.left;
+    const int64_t height = int64_t{rect.bottom} - rect.top;
+    return rect.left >= -limit && rect.left <= limit && rect.top >= -limit &&
+            rect.top <= limit && rect.right >= -limit && rect.right <= limit &&
+            rect.bottom >= -limit && rect.bottom <= limit && width > 0 && width <= limit &&
+            height > 0 && height <= limit;
+}
+
+bool preViewportRegionValid(const Region& region) {
+    if (region.isEmpty()) return region.hasSameRects(Region());
+    if (static_cast<size_t>(region.end() - region.begin()) >
+        gui::WindowInfo::kMaxPreViewportRegionRects) return false;
+    for (const Rect& rect : region) {
+        if (!preViewportRectValid(rect)) return false;
+    }
+    return true;
+}
+
+std::optional<Region> transformPreViewportRegion(const ui::Transform& transform, const Region& region,
+                                               const std::string& name) {
+    if (!preViewportRegionValid(region) || !std::isfinite(transform.dsdx()) ||
+        !std::isfinite(transform.dtdx()) || !std::isfinite(transform.dtdy()) ||
+        !std::isfinite(transform.dsdy()) || !std::isfinite(transform.tx()) ||
+        !std::isfinite(transform.ty()) || !LayerSnapshot::isTransformValid(transform) ||
+        !transform.preserveRects()) return std::nullopt;
+    // The stock Region transform may broaden a non-rect-preserving transform to
+    // one bounding box. This optional exact-rectangle path refuses that case.
+    constexpr double low = std::numeric_limits<int32_t>::min() + 2.0;
+    constexpr double high = std::numeric_limits<int32_t>::max() - 2.0;
+    const double tx = static_cast<double>(transform.tx()) + 0.5;
+    const double ty = static_cast<double>(transform.ty()) + 0.5;
+    if (tx < low || tx > high || ty < low || ty > high) return std::nullopt;
+    if (region.isEmpty()) return Region();
+    const Rect bounds = region.getBounds();
+    for (int32_t x : {bounds.left, bounds.right}) {
+        for (int32_t y : {bounds.top, bounds.bottom}) {
+            const double px = double{transform.dsdx()} * x + double{transform.dtdx()} * y;
+            const double py = double{transform.dtdy()} * x + double{transform.dsdy()} * y;
+            // Check the intermediate without translation too: the stock helper
+            // performs integer Region conversion before adding its rounded offset.
+            if (px < low || px > high || py < low || py > high) return std::nullopt;
+            // Both operands may fit independently while their integer sum does
+            // not. Refuse before stock Region translation can overflow.
+            if (px + tx < low || px + tx > high || py + ty < low || py + ty > high) {
+                return std::nullopt;
+            }
+        }
+    }
+    Region result = transformTouchableRegionSafely(transform, region, name);
+    return preViewportRegionValid(result) ? std::make_optional(std::move(result)) : std::nullopt;
+}
+
+bool preViewportFloatBoundsValid(const FloatRect& bounds) {
+    constexpr float limit = gui::WindowInfo::kMaxStagedAtlasCoordinate;
+    return std::isfinite(bounds.left) && std::isfinite(bounds.top) &&
+            std::isfinite(bounds.right) && std::isfinite(bounds.bottom) &&
+            bounds.left >= -limit && bounds.top >= -limit && bounds.right <= limit &&
+            bounds.bottom <= limit && bounds.getWidth() > 0 && bounds.getWidth() <= limit &&
+            bounds.getHeight() > 0 && bounds.getHeight() <= limit;
+}
+
+bool preViewportTransformedBoundsValid(const FloatRect& bounds, const ui::Transform& transform) {
+    return preViewportFloatBoundsValid(bounds) && std::isfinite(transform.dsdx()) &&
+            std::isfinite(transform.dtdx()) && std::isfinite(transform.dtdy()) &&
+            std::isfinite(transform.dsdy()) && std::isfinite(transform.tx()) &&
+            std::isfinite(transform.ty()) && LayerSnapshot::isTransformValid(transform) &&
+            transform.preserveRects() && preViewportFloatBoundsValid(transform.transform(bounds));
+}
+
 /*
  * We don't want to send the layer's transform to input, but rather the
  * parent's transform. This is because Layer's transform is
@@ -192,7 +265,7 @@ Rect getInputBoundsInDisplaySpace(const LayerSnapshot& snapshot, const FloatRect
 }
 
 void fillInputFrameInfo(gui::WindowInfo& info, const ui::Transform& screenToDisplay,
-                        const LayerSnapshot& snapshot) {
+                        LayerSnapshot& snapshot) {
     auto [inputBounds, inputBoundsValid] = getInputBounds(snapshot, /*fillParentBounds=*/false);
     if (!inputBoundsValid) {
         info.touchableRegion.clear();
@@ -211,6 +284,13 @@ void fillInputFrameInfo(gui::WindowInfo& info, const ui::Transform& screenToDisp
     // The touchable region is specified in the input coordinate space. Change it to display space.
     info.touchableRegion =
             transformTouchableRegionSafely(inputToDisplay, info.touchableRegion, snapshot.name);
+    if (info.preViewportTouchableRegion) {
+        info.preViewportTouchableRegion = inputBoundsValid && preViewportFloatBoundsValid(inputBounds)
+                ? transformPreViewportRegion(inputToDisplay, *info.preViewportTouchableRegion,
+                                             snapshot.name)
+                : std::nullopt;
+    }
+    snapshot.preViewportTouchableRegionBeforeCrop = info.preViewportTouchableRegion;
 }
 
 void handleDropInputMode(LayerSnapshot& snapshot, const LayerSnapshot& parentSnapshot) {
@@ -264,6 +344,34 @@ void handleDropInputMode(LayerSnapshot& snapshot, const LayerSnapshot& parentSna
         snapshot.inputInfo.inputConfig |= gui::WindowInfo::InputConfig::DROP_INPUT_IF_OBSCURED;
     }
 }
+
+// Finalize EVERY updateInput exit, including structural/no-input early returns.
+// Stock policy runs unchanged against stock-only dropInputMode. Capture it
+// before adding the independent restrictive component; NEVER subtract flags.
+struct FinalizeExternalDesktopInputProjection {
+    LayerSnapshot& value;
+    ~FinalizeExternalDesktopInputProjection() {
+        // Requested tags were stripped unconditionally. Only the protected
+        // actual-root state can label its OWN actual clone traversal.
+        value.inputInfo.stageTag.reset();
+        if (value.nativeOwnedInputBlock.stageTag && value.inputInfo.cloneLineage) {
+            const auto& roots = value.inputInfo.cloneLineage->mirrorRootIds;
+            if (value.nativeOwnedInputBlock.covered &&
+                    std::count(roots.begin(), roots.end(), value.nativeOwnedInputBlock.root) == 1) {
+                value.inputInfo.stageTag = value.nativeOwnedInputBlock.stageTag;
+            } else {
+                value.nativeOwnedInputBlock.covered = false;
+                value.nativeOwnedInputBlock.all = true;
+            }
+        }
+        value.nativeStockInputConfig = value.inputInfo.inputConfig.get();
+        value.nativeStockProjectionComplete = value.nativeOwnedInputBlock.covered;
+        if (value.nativeOwnedInputBlock.all &&
+                !value.inputInfo.inputConfig.test(gui::WindowInfo::InputConfig::NO_INPUT_CHANNEL)) {
+            value.inputInfo.inputConfig |= gui::WindowInfo::InputConfig::DROP_INPUT;
+        }
+    }
+};
 
 auto getBlendMode(const LayerSnapshot& snapshot, const RequestedLayerState& requested) {
     auto blendMode = Hwc2::IComposerClient::BlendMode::NONE;
@@ -547,6 +655,11 @@ void LayerSnapshotBuilder::updateSnapshots(const Args& args) {
             continue;
         }
 
+        if (auto token=it->get()->getNativeRetirementToken()) {
+            if (mNativeRetiredSnapshots.size()<8192) mNativeRetiredSnapshots.push_back(std::move(token));
+            else token->state()->unavailable(); // Explicitly unavailable, never infer removal by ID/absence.
+        }
+
         mPathToSnapshot.erase(traversalPath);
 
         auto range = mIdToSnapshots.equal_range(traversalPath.id);
@@ -590,6 +703,10 @@ const LayerSnapshot& LayerSnapshotBuilder::updateSnapshotsInHierarchy(
         snapshot->merge(*layer, /*forceUpdate=*/true, /*displayChanges=*/true, args.forceFullDamage,
                         primaryDisplayRotationFlags, args.shaderRegistry);
         snapshot->changes |= RequestedLayerState::Changes::Created;
+    } else {
+        // Acquire any new actual-root membership BEFORE changing observable
+        // resources/state. Old leases last through the real object destructor.
+        snapshot->retainNativeResourceGroups(*layer,traversalPath,parentSnapshot);
     }
 
     if (traversalPath.isRelative()) {
@@ -643,7 +760,7 @@ LayerSnapshot* LayerSnapshotBuilder::getSnapshot(const LayerHierarchy::Traversal
 LayerSnapshot* LayerSnapshotBuilder::createSnapshot(const LayerHierarchy::TraversalPath& path,
                                                     const RequestedLayerState& layer,
                                                     const LayerSnapshot& parentSnapshot) {
-    mSnapshots.emplace_back(std::make_unique<LayerSnapshot>(layer, path));
+    mSnapshots.emplace_back(std::make_unique<LayerSnapshot>(layer, path, parentSnapshot));
     LayerSnapshot* snapshot = mSnapshots.back().get();
     snapshot->globalZ = static_cast<size_t>(mSnapshots.size()) - 1;
     if (path.isClone() && !LayerHierarchy::isMirror(path.variant)) {
@@ -791,6 +908,7 @@ void LayerSnapshotBuilder::updateSnapshot(LayerSnapshot& snapshot, const Args& a
                                           const LayerSnapshot& parentSnapshot,
                                           const LayerHierarchy::TraversalPath& path,
                                           bool forMergedSnapshot) {
+    snapshot.nativeTraversalParent = parentSnapshot.path;
     // Always update flags and visibility
     ftl::Flags<RequestedLayerState::Changes> parentChanges = parentSnapshot.changes &
             (RequestedLayerState::Changes::Hierarchy | RequestedLayerState::Changes::Geometry |
@@ -1456,9 +1574,16 @@ void LayerSnapshotBuilder::updateInput(LayerSnapshot& snapshot,
     using InputConfig = gui::WindowInfo::InputConfig;
 
     snapshot.inputInfo = requested.getWindowInfo();
+    snapshot.nativeOwnedInputBlock.inherit(parentSnapshot.nativeOwnedInputBlock,
+                                           requested.externalDesktopOwnedInputBlockOrigin,
+                                           requested.externalDesktopOwnedInputBlockControl, requested.id);
+    FinalizeExternalDesktopInputProjection finalize{snapshot};
+    snapshot.nativeParentDropInputMode = parentSnapshot.nativeOwnedInputBlock.all
+            ? gui::DropInputMode::ALL : parentSnapshot.dropInputMode;
     snapshot.touchCropId = requested.touchCropId;
 
     snapshot.inputInfo.id = static_cast<int32_t>(snapshot.uniqueSequence);
+    snapshot.updateInputCloneLineage(path);
     snapshot.inputInfo.displayId =
             ui::LogicalDisplayId{static_cast<int32_t>(snapshot.outputFilter.layerStack.id)};
     snapshot.inputInfo.touchOcclusionMode = requested.hasInputInfo()
@@ -1482,7 +1607,13 @@ void LayerSnapshotBuilder::updateInput(LayerSnapshot& snapshot,
     }
 
     updateVisibility(snapshot, snapshot.isVisible);
+    if (!requested.hasInputInfo() || snapshot.inputInfo.token == nullptr ||
+        snapshot.inputInfo.inputConfig.test(InputConfig::NO_INPUT_CHANNEL) ||
+        !snapshot.canReceiveInput()) {
+        snapshot.inputInfo.preViewportTouchableRegion.reset();
+    }
     if (!requested.needsInputInfo()) {
+        snapshot.inputInfo.preViewportTouchableRegion.reset();
         return;
     }
 
@@ -1491,6 +1622,9 @@ void LayerSnapshotBuilder::updateInput(LayerSnapshot& snapshot,
             args.displays.get(snapshot.outputFilter.layerStack);
     bool noValidDisplay = !displayInfoOpt.has_value();
     auto displayInfo = displayInfoOpt.value_or(sDefaultInfo);
+    if (noValidDisplay || !displayInfo.receivesInput) {
+        snapshot.inputInfo.preViewportTouchableRegion.reset();
+    }
 
     if (!requested.hasInputInfo()) {
         snapshot.inputInfo.inputConfig |= InputConfig::NO_INPUT_CHANNEL;
@@ -1638,6 +1772,81 @@ uint32_t LayerSnapshotBuilder::getPrimaryDisplayRotationFlags(
 }
 
 void LayerSnapshotBuilder::updateTouchableRegionCrop(const Args& args) {
+    // Keep the entire legacy crop pass below unchanged. Candidate-only paths
+    // must not cause a new ordinary crop/replacement operation.
+    for (auto& item : mSnapshots) {
+        auto* snapshot = item.get();
+        if (!snapshot->preViewportTouchableRegionBeforeCrop &&
+            !snapshot->inputInfo.preViewportTouchableRegion) continue;
+        const auto& path = snapshot->path;
+        const std::optional<frontend::DisplayInfo> displayInfoOpt =
+                args.displays.get(snapshot->outputFilter.layerStack);
+        const auto displayInfo = displayInfoOpt.value_or(frontend::DisplayInfo{});
+        const auto* clonedRootSnapshot =
+                path.isClone() ? getSnapshot(snapshot->mirrorRootPath) : nullptr;
+        // SECONDARY metadata only. Always start from the transformed uncut value,
+        // including on crop-only updates/growth. Never modify the ordinary region.
+        auto candidate = snapshot->preViewportTouchableRegionBeforeCrop;
+        if (candidate && (!snapshot->hasInputInfo() || !snapshot->canReceiveInput() ||
+                snapshot->inputInfo.inputConfig.test(gui::WindowInfo::InputConfig::NO_INPUT_CHANNEL))) {
+            candidate.reset();
+        }
+        if (candidate) {
+            const auto intersectBounds = [&](const LayerSnapshot& crop) {
+                const FloatRect bounds = getInputBounds(crop, /*fillParentBounds=*/true).first;
+                const FloatRect clipped = crop.geomLayerBounds.intersect(bounds);
+                if (!preViewportTransformedBoundsValid(clipped,
+                        displayInfo.transform * getInputTransform(crop))) {
+                    candidate.reset(); return;
+                }
+                const Rect displayBounds =
+                        getInputBoundsInDisplaySpace(crop, bounds, displayInfo.transform);
+                if (!preViewportRectValid(displayBounds)) { candidate.reset(); return; }
+                *candidate = candidate->intersect(displayBounds);
+            };
+            if (!displayInfoOpt || !displayInfo.receivesInput) {
+                candidate.reset();
+            } else if (snapshot->touchCropId != UNASSIGNED_LAYER_ID) {
+                auto cropPath = path;
+                cropPath.id = snapshot->touchCropId;
+                auto counterpart = getSnapshot(cropPath);
+                size_t matches = 0;
+                const auto [first, last] = mIdToSnapshots.equal_range(snapshot->touchCropId);
+                for (auto it = first; it != last; ++it) {
+                    if (it->second->path == cropPath) ++matches;
+                }
+                if (!counterpart || matches != 1) candidate.reset();
+                else intersectBounds(*counterpart);
+            } else if (snapshot->inputInfo.replaceTouchableRegionWithCrop) {
+                // Intersect, never broaden an optional app candidate by replacing it.
+                intersectBounds(*snapshot);
+            }
+            if (candidate && path.isClone()) {
+                if (!clonedRootSnapshot || !preViewportTransformedBoundsValid(
+                        clonedRootSnapshot->transformedBounds, displayInfo.transform)) {
+                    candidate.reset();
+                } else {
+                    const Rect rootBounds = displayInfo.transform.transform(
+                            Rect{clonedRootSnapshot->transformedBounds});
+                    if (!preViewportRectValid(rootBounds)) candidate.reset();
+                    else *candidate = candidate->intersect(rootBounds);
+                }
+            }
+            if (candidate) {
+                const int32_t width = displayInfo.info.logicalWidth;
+                const int32_t height = displayInfo.info.logicalHeight;
+                const auto viewport = preViewportRectValid(Rect{0, 0, width, height})
+                        ? transformPreViewportRegion(displayInfo.transform,
+                                                     Region(Rect{0, 0, width, height}), snapshot->name)
+                        : std::nullopt;
+                if (!viewport) candidate.reset();
+                else *candidate = candidate->intersect(*viewport);
+            }
+            if (candidate && !preViewportRegionValid(*candidate)) candidate.reset();
+        }
+        snapshot->inputInfo.preViewportTouchableRegion = std::move(candidate);
+    }
+
     if (mNeedsTouchableRegionCrop.empty()) {
         return;
     }

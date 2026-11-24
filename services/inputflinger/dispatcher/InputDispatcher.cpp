@@ -39,6 +39,7 @@
 #include <private/android_filesystem_config.h>
 #include <unistd.h>
 #include <utils/StrongPointer.h>
+#include <utils/SystemClock.h>
 #include <utils/Trace.h>
 
 #include <cerrno>
@@ -49,6 +50,10 @@
 #include <queue>
 #include <sstream>
 #include <variant>
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+#include <android-base/scopeguard.h>
+#include <cmath>
+#endif
 
 #include "../InputDeviceMetricsSource.h"
 
@@ -398,6 +403,52 @@ std::unique_ptr<DispatchEntry> createDispatchEntry(const IdGenerator& idGenerato
                                                    ftl::Flags<InputTarget::Flags> inputTargetFlags,
                                                    int64_t vsyncId,
                                                    trace::InputTracerInterface* tracer) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    if (eventEntry->type == EventEntry::Type::MOTION) {
+        const auto& motion = static_cast<const MotionEntry&>(*eventEntry);
+        const auto& origin = motion.externalDesktopPointerOwnership;
+        const auto& target = inputTarget.getExternalDesktopPointerOwnership();
+        if (origin || target) {
+            if (motion.pointerCoords.size() != motion.pointerProperties.size() ||
+                (origin && !origin->matches(motion.pointerProperties))) return nullptr;
+            const bool cancellation = MotionEvent::getActionMasked(motion.action) == AMOTION_EVENT_ACTION_CANCEL ||
+                    MotionEvent::getActionMasked(motion.action) == AMOTION_EVENT_ACTION_HOVER_EXIT ||
+                    motion.flags.test(MotionFlag::CANCELED);
+            ExternalDesktopPointerOwnershipPtr ownership;
+            if (origin && cancellation) {
+                // Exact old origin wins, NEVER retag a cancellation with a new
+                // target/generation. Its delivery geometry remains PhaseB work.
+                ownership = origin;
+            } else {
+                auto selected = ExternalDesktopPointerOwnership::select(target, motion.pointerProperties);
+                if (!selected.ok()) return nullptr;
+                ownership = origin ? origin : *selected;
+                if (origin && target) {
+                    for (const auto& property : motion.pointerProperties) {
+                        if (ExternalDesktopPointerOwnership::keyAt(origin, property.id) !=
+                            ExternalDesktopPointerOwnership::keyAt(*selected, property.id)) return nullptr;
+                    }
+                }
+            }
+            if (ownership != origin) {
+                // Never mutate a raw shared event while binding one target.
+                auto copy = std::make_shared<MotionEntry>(
+                        idGenerator.nextId(), motion.injectionState, motion.eventTime,
+                        motion.deviceId, motion.source, motion.displayId, motion.policyFlags,
+                        motion.action, motion.actionButton, motion.flags, motion.metaState,
+                        motion.buttonState, motion.classification, motion.xPrecision, motion.yPrecision,
+                        motion.xCursorPosition, motion.yCursorPosition, motion.downTime,
+                        motion.pointerProperties, motion.pointerCoords);
+                copy->externalDesktopPointerOwnership = std::move(ownership);
+                if (tracer) {
+                    if (!motion.traceTracker) return nullptr;
+                    copy->traceTracker = tracer->traceDerivedEvent(*copy, *motion.traceTracker);
+                }
+                eventEntry = std::move(copy);
+            }
+        }
+    }
+#endif
     const bool zeroCoords = inputTargetFlags.test(InputTarget::Flags::ZERO_COORDS);
     const sp<WindowInfoHandle> win = inputTarget.windowHandle;
     const std::optional<int32_t> windowId =
@@ -461,6 +512,9 @@ std::unique_ptr<DispatchEntry> createDispatchEntry(const IdGenerator& idGenerato
                                           motionEntry.yPrecision, motionEntry.xCursorPosition,
                                           motionEntry.yCursorPosition, motionEntry.downTime,
                                           motionEntry.pointerProperties, pointerCoords);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    combinedMotionEntry->externalDesktopPointerOwnership = motionEntry.externalDesktopPointerOwnership;
+#endif
     if (tracer) {
         combinedMotionEntry->traceTracker =
                 tracer->traceDerivedEvent(*combinedMotionEntry, *motionEntry.traceTracker);
@@ -629,14 +683,15 @@ std::optional<std::string> verifyTargetedInjection(const sp<WindowInfoHandle>& w
     return {};
 }
 
-std::pair<float, float> resolveTouchedPosition(const MotionEntry& entry) {
+std::pair<float, float> resolveTouchedPosition(const MotionEntry& entry,
+                                              std::optional<size_t> overrideIndex = std::nullopt) {
     const bool isFromMouse = isFromSource(entry.source, AINPUT_SOURCE_MOUSE);
     // Always dispatch mouse events to cursor position.
     if (isFromMouse) {
         return {entry.xCursorPosition, entry.yCursorPosition};
     }
 
-    const int32_t pointerIndex = MotionEvent::getActionIndex(entry.action);
+    const size_t pointerIndex = overrideIndex.value_or(MotionEvent::getActionIndex(entry.action));
     return {entry.pointerCoords[pointerIndex].getAxisValue(AMOTION_EVENT_AXIS_X),
             entry.pointerCoords[pointerIndex].getAxisValue(AMOTION_EVENT_AXIS_Y)};
 }
@@ -914,7 +969,17 @@ InputDispatcher::InputDispatcher(
         mWindowInfosVsyncId(-1),
         mMinTimeBetweenUserActivityPokes(DEFAULT_USER_ACTIVITY_POKE_INTERVAL),
         mConnectionManager(mLooper),
-        mTouchStates(mWindowInfos, mConnectionManager),
+        mTouchStates(mWindowInfos, mConnectionManager
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+            ,[this](const gui::WindowInfo& window,const MotionEntry* entry,ExternalDesktopPointerOwnership::Ids ids,
+                    InputTarget& target,const ui::Transform& transform,InputTarget::DispatchMode selectedMode) REQUIRES(mLock) {
+                // Unclaimed windows execute the original stock aggregation
+                // below, including its error/dump behavior, not a new wrapper.
+                if (!mExternalDesktopStageOwner.ownsNativeWindow(window)) return std::optional<bool>{};
+                return std::optional<bool>{stampExternalDesktopTargetLocked(window,entry,ids,target,transform,selectedMode)};
+            }
+#endif
+            ),
         mNextUnblockedEvent(nullptr),
         mMonitorDispatchingTimeout(DEFAULT_INPUT_DISPATCHING_TIMEOUT),
         mDispatchEnabled(false),
@@ -985,6 +1050,10 @@ void InputDispatcher::dispatchOnce() {
     { // acquire lock
         std::scoped_lock _l(mLock);
         mDispatcherIsAlive.notify_all();
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        expireExternalDesktopSuspensionsLocked(now(),nextWakeupTime);
+        if (!mDispatchFrozen) pumpExternalDesktopSuspendedOutboundLocked();
+#endif
 
         // Run a dispatch loop if there are no pending commands.
         // The dispatch loop might enqueue commands to run afterwards.
@@ -997,6 +1066,9 @@ void InputDispatcher::dispatchOnce() {
         if (runCommandsLockedInterruptable()) {
             nextWakeupTime = LLONG_MIN;
         }
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        markDrainedExternalDesktopTransportLocked();
+#endif
 
         // If we are still waiting for ack on some events,
         // we might have to wake up earlier to check if an app is ANRing.
@@ -1172,6 +1244,22 @@ nsecs_t InputDispatcher::processAnrsLocked() {
         mAnrTracker.eraseToken(mAnrTracker.firstToken());
         return nextAnrCheck;
     }
+    // A withdrawn passive observer can still owe an ACK for the terminal
+    // HOVER_EXIT/CANCEL queued when its WindowInfo disappeared. It no longer
+    // has a target and cannot stall foreground input. Do not turn that stale
+    // passive wait into an application ANR (and a dialog on another display).
+    // Keep the queue/ACK accounting intact and the connection responsive;
+    // a new live window/event will install its own timeout normally. Never
+    // exempt monitors, live windows or any outstanding foreground dispatch.
+    if (!connection->isFocusMonitor && !connection->waitQueue.empty() &&
+        mWindowInfos.findWindowHandle(connection->getToken()) == nullptr &&
+        std::none_of(connection->waitQueue.begin(), connection->waitQueue.end(),
+                     [](const auto& entry) {
+                         return entry->targetFlags.test(InputTarget::Flags::FOREGROUND);
+                     })) {
+        mAnrTracker.eraseToken(connection->getToken());
+        return LLONG_MIN;
+    }
     connection->responsive = false;
     // Stop waking up for this unresponsive connection
     mAnrTracker.eraseToken(connection->getToken());
@@ -1222,6 +1310,11 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t& nextWakeupTime) {
 
     // Ready to start a new event.
     // If we don't already have a pending event, go grab one.
+    if (!mPendingEvent) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        selectExternalDesktopDeferredRawLocked(currentTime, nextWakeupTime);
+#endif
+    }
     if (!mPendingEvent) {
         if (mInboundQueue.empty()) {
             // Legacy behaviour: only synthesize repeats if the queue is completely empty.
@@ -1318,6 +1411,15 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t& nextWakeupTime) {
         case EventEntry::Type::MOTION: {
             std::shared_ptr<const MotionEntry> motionEntry =
                     std::static_pointer_cast<const MotionEntry>(mPendingEvent);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+            if (dropReason == DropReason::NOT_DROPPED && deferExternalDesktopRawLocked(motionEntry)) {
+                // Owned FIFO, NOT completion/drop. Entire real raw packet is
+                // retained before TouchState/stock DROP can lose its UP/roster.
+                mPendingEvent.reset();
+                nextWakeupTime = LLONG_MIN;
+                return;
+            }
+#endif
             if (dropReason == DropReason::NOT_DROPPED && isStaleEvent(currentTime, *motionEntry)) {
                 // The event is stale. However, only drop stale events if there isn't an ongoing
                 // gesture. That would allow us to complete the processing of the current stroke.
@@ -1423,7 +1525,839 @@ bool InputDispatcher::shouldPruneInboundQueueLocked(const MotionEntry& motionEnt
     return false;
 }
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+ExternalDesktopPhysicalPacketPtr InputDispatcher::observeExternalDesktopPhysicalMotionLocked(const MotionEntry& event) {
+    auto& ledger = mExternalDesktopSubmissionLedger;
+    if (!ledger.mCoverageAvailable) return nullptr;
+    ExternalDesktopPointerOwnership::Ids rawIds;
+    const int32_t action = MotionEvent::getActionMasked(event.action);
+    if (!ExternalDesktopPointerOwnership::idsOf(event.pointerProperties, rawIds) ||
+        ((action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_UP) && event.getPointerCount() != 1) ||
+        ((action == AMOTION_EVENT_ACTION_POINTER_DOWN || action == AMOTION_EVENT_ACTION_POINTER_UP) &&
+         (event.getPointerCount() < 2 || MotionEvent::getActionIndex(event.action) >= event.getPointerCount()))) {
+        ledger.mCoverageAvailable = false; return nullptr;
+    }
+    bool hover = action == AMOTION_EVENT_ACTION_HOVER_ENTER ||
+            action == AMOTION_EVENT_ACTION_HOVER_MOVE || action == AMOTION_EVENT_ACTION_HOVER_EXIT;
+    const bool sampleOnly = action == AMOTION_EVENT_ACTION_SCROLL || action == AMOTION_EVENT_ACTION_BUTTON_PRESS ||
+            action == AMOTION_EVENT_ACTION_BUTTON_RELEASE;
+    auto before = mExternalDesktopPhysicalInputState.copyExternalDesktopPhysicalMotionSnapshotForOwner(event, hover);
+    if (!before.ok()) { ledger.mCoverageAvailable = false; return nullptr; }
+    if (sampleOnly) {
+        auto hovering = mExternalDesktopPhysicalInputState.copyExternalDesktopPhysicalMotionSnapshotForOwner(event, true);
+        if (!hovering.ok() || (before->has_value() && hovering->has_value())) {
+            ledger.mCoverageAvailable = false; return nullptr;
+        }
+        if (hovering->has_value()) { hover = true; before = std::move(hovering); }
+        if (!before->has_value()) return nullptr; // sample cannot create a physical lifetime
+    } else if (action != AMOTION_EVENT_ACTION_DOWN && action != AMOTION_EVENT_ACTION_POINTER_DOWN &&
+               action != AMOTION_EVENT_ACTION_MOVE && action != AMOTION_EVENT_ACTION_POINTER_UP &&
+               action != AMOTION_EVENT_ACTION_UP && action != AMOTION_EVENT_ACTION_CANCEL && !hover) {
+        return nullptr; // ordinary non-lifecycle packet, never physical release proof
+    }
+    ExternalDesktopPointerOwnership::Ids previousIds;
+    if (before->has_value() && !ExternalDesktopPointerOwnership::idsOf((*before)->pointerProperties, previousIds)) {
+        ledger.mCoverageAvailable = false; return nullptr;
+    }
+    bool consistent = true;
+    if (sampleOnly) consistent = before->has_value() && rawIds == previousIds;
+    else if (!hover && action != AMOTION_EVENT_ACTION_DOWN) {
+        consistent = before->has_value();
+        if (action == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+            const int32_t added = event.pointerProperties[MotionEvent::getActionIndex(event.action)].id;
+            consistent &= !previousIds.test(added) && (rawIds ^ previousIds).count() == 1 &&
+                    (previousIds & ~rawIds).none();
+        } else consistent &= rawIds == previousIds;
+    } else if (action == AMOTION_EVENT_ACTION_HOVER_EXIT) {
+        consistent = before->has_value() && rawIds == previousIds;
+    }
+    if (!consistent) { ledger.mCoverageAvailable = false; return nullptr; }
+    auto prepared = mExternalDesktopPhysicalInputState.prepareExternalDesktopPublishedMotion(event, event.flags);
+    if (!prepared.ok()) { ledger.mCoverageAvailable = false; return nullptr; }
+    const auto packetSlot = std::find_if(ledger.mPhysicalPackets.begin(), ledger.mPhysicalPackets.end(),
+            [](const auto& value) { return value.expired(); });
+    if (packetSlot == ledger.mPhysicalPackets.end()) {
+        ledger.mCoverageAvailable = false; return nullptr;
+    }
+    auto packet = std::shared_ptr<ExternalDesktopPhysicalPacket>(new ExternalDesktopPhysicalPacket);
+    auto matches = [&](const auto& pointer, int32_t id) {
+        return pointer && pointer->mKind == ExternalDesktopPhysicalPointer::Kind::READER &&
+                pointer->mDevice == event.deviceId && pointer->mSource == event.source &&
+                (isMouseOrTouchpad(event.source) || pointer->mDisplay == event.displayId) &&
+                pointer->mHover == hover && pointer->mId == id;
+    };
+    // Allocate every new physical referent before changing raw InputState or
+    // active slots. No Connection/window projection participates in this join.
+    auto active = ledger.mActivePhysical;
+    std::array<std::shared_ptr<ExternalDesktopPhysicalPointer>, ExternalDesktopPointerOwnership::kMaxIds> restarted{};
+    std::array<std::shared_ptr<ExternalDesktopPhysicalPointer>, ExternalDesktopPointerOwnership::kMaxIds> withdrawn{};
+    for (auto& pointer : active) {
+        if (!pointer || pointer->mKind != ExternalDesktopPhysicalPointer::Kind::READER ||
+            pointer->mDevice != event.deviceId || pointer->mSource != event.source || pointer->mHover != hover ||
+            (!isMouseOrTouchpad(event.source) && pointer->mDisplay != event.displayId)) continue;
+        if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_HOVER_ENTER) {
+            restarted[pointer->mId] = pointer; pointer.reset();
+        } else if (hover && !rawIds.test(pointer->mId)) {
+            withdrawn[pointer->mId] = pointer; pointer.reset();
+        }
+    }
+    for (size_t index = 0; index < event.pointerProperties.size(); ++index) {
+        const int32_t id = event.pointerProperties[index].id;
+        auto slot = std::find_if(active.begin(), active.end(), [&](const auto& p) { return matches(p, id); });
+        if (slot != active.end() && action == AMOTION_EVENT_ACTION_POINTER_DOWN &&
+            index == MotionEvent::getActionIndex(event.action)) {
+            ledger.mCoverageAvailable = false; return nullptr;
+        }
+        if (slot == active.end()) {
+            slot = std::find(active.begin(), active.end(), nullptr);
+            if (slot == active.end()) { ledger.mCoverageAvailable = false; return nullptr; }
+            *slot = std::shared_ptr<ExternalDesktopPhysicalPointer>(new ExternalDesktopPhysicalPointer(
+                    ExternalDesktopPhysicalPointer::Kind::READER, event.deviceId, event.source,
+                    event.displayId, id, hover));
+        }
+        packet->mPointers[id] = *slot;
+    }
+    if (!mExternalDesktopPhysicalInputState.swapExternalDesktopMotionProjection(**prepared)) {
+        ledger.mCoverageAvailable = false; return nullptr;
+    }
+    for (const auto& pointer : restarted) if (pointer) pointer->mRawRestart = true;
+    for (const auto& pointer : withdrawn) if (pointer) pointer->mRawRosterWithdrawn = true;
+    for (size_t index = 0; index < event.pointerProperties.size(); ++index) {
+        const int32_t id = event.pointerProperties[index].id;
+        auto& pointer = packet->mPointers[id];
+        const bool up = action == AMOTION_EVENT_ACTION_UP ||
+                (action == AMOTION_EVENT_ACTION_POINTER_UP && index == MotionEvent::getActionIndex(event.action));
+        if (up && !event.flags.test(MotionFlag::CANCELED)) pointer->mActualUp = true;
+        if (action == AMOTION_EVENT_ACTION_CANCEL || (up && event.flags.test(MotionFlag::CANCELED))) {
+            pointer->mReaderCancel = true;
+        }
+        if (action == AMOTION_EVENT_ACTION_HOVER_EXIT) pointer->mReaderHoverExit = true;
+        if (action == AMOTION_EVENT_ACTION_BUTTON_RELEASE) pointer->mButtonRelease = true;
+        if (up || action == AMOTION_EVENT_ACTION_CANCEL || action == AMOTION_EVENT_ACTION_HOVER_EXIT) {
+            for (auto& value : active) if (value == pointer) value.reset();
+        }
+    }
+    ledger.mActivePhysical = std::move(active);
+    *packetSlot = packet;
+    return packet;
+}
+
+std::optional<ExternalDesktopSubmissionLedger::PhysicalOwnerCensus>
+InputDispatcher::censusExternalDesktopPhysicalOwnersLocked(
+        const std::shared_ptr<const ExternalDesktopPhysicalPointer>& physical) const {
+    const auto& ledger = mExternalDesktopSubmissionLedger;
+    if (!ledger.mCoverageAvailable || !physical ||
+            physical->mKind != ExternalDesktopPhysicalPointer::Kind::READER ||
+            physical->mId < 0 || physical->mId > MAX_POINTER_ID ||
+            ledger.mCallbacks->load(std::memory_order_acquire) != 0) return std::nullopt;
+
+    // Pin the ENTIRE weak census for the duration of the count. Locking and
+    // releasing one packet at a time could count a just-destroyed known owner
+    // against an unrelated unknown strong owner. These pins add no direct
+    // physical-pointer references and are never a destruction observation.
+    std::array<ExternalDesktopPhysicalPacketPtr, ExternalDesktopSubmissionLedger::kMaxPhysicalPackets> packets;
+    for (size_t i = 0; i < packets.size(); ++i) packets[i] = ledger.mPhysicalPackets[i].lock();
+
+    // Reference counts describe a control block, not only an object address.
+    // A same-address alias owned by another control block must not compensate
+    // for an unknown strong owner of this actual Reader incarnation.
+    const auto samePhysicalOwner = [&](const auto& owner) {
+        return !owner.owner_before(physical) && !physical.owner_before(owner);
+    };
+    ExternalDesktopSubmissionLedger::PhysicalOwnerCensus result;
+    for (size_t i = 0; i < ledger.mRows.size(); ++i) {
+        const auto& row = ledger.mRows[i];
+        if (!row) continue;
+        // Two aliases of ONE row own only one mPhysical shared_ptr. Counting
+        // slots could conceal an additional unknown physical owner.
+        for (size_t prior = 0; prior < i; ++prior) {
+            if (ledger.mRows[prior] == row) return std::nullopt;
+        }
+        if (row->mPhysical == physical) {
+            if (!samePhysicalOwner(row->mPhysical)) return std::nullopt;
+            ++result.submissionRows;
+        }
+    }
+    for (const auto& active : ledger.mActivePhysical) {
+        if (active == physical) {
+            if (!samePhysicalOwner(active)) return std::nullopt;
+            ++result.activeSlots;
+        }
+    }
+    if (result.activeSlots > 1) return std::nullopt;
+    for (size_t i = 0; i < packets.size(); ++i) {
+        const auto& packet = packets[i];
+        if (!packet) continue;
+        for (size_t prior = 0; prior < i; ++prior) {
+            if (packets[prior] == packet) return std::nullopt;
+        }
+        for (size_t id = 0; id < packet->mPointers.size(); ++id) {
+            const auto& pointer = packet->mPointers[id];
+            if (pointer && (pointer->mKind != ExternalDesktopPhysicalPointer::Kind::READER ||
+                    pointer->mId != static_cast<int32_t>(id))) return std::nullopt;
+            if (pointer == physical) {
+                if (!samePhysicalOwner(pointer)) return std::nullopt;
+                ++result.packetSlots;
+            }
+        }
+    }
+    if (physical.use_count() != static_cast<long>(result.total())) return std::nullopt;
+    // A complete census is NOT a physical UP/EXIT/reset, a withdrawal ACK,
+    // claim-release authorization, or proof of SF/root destruction. The
+    // collector's existing physical-ended and sole-row-owner guards remain.
+    return result;
+}
+
+void InputDispatcher::observeExternalDesktopPhysicalResetLocked(DeviceId device) {
+    for (auto& pointer : mExternalDesktopSubmissionLedger.mActivePhysical) {
+        if (pointer && pointer->mKind == ExternalDesktopPhysicalPointer::Kind::READER && pointer->mDevice == device) {
+            pointer->mDeviceReset = true; pointer.reset();
+        }
+    }
+    // Actual raw-device state only. Reset is NOT UP, ACK, window loss, or an
+    // issuer/producer fence, and it never frees a submission tombstone.
+    std::erase_if(mExternalDesktopPhysicalInputState.mMotionMementos,
+            [&](const auto& memento) { return memento.deviceId == device; });
+}
+
+bool InputDispatcher::stampExternalDesktopTargetLocked(const gui::WindowInfo& window,const MotionEntry* event,
+        ExternalDesktopPointerOwnership::Ids ids,InputTarget& target,const ui::Transform& transform,
+        InputTarget::DispatchMode selectedMode) {
+    auto selected=mExternalDesktopStageOwner.routeNativeWindow(window);
+    if (selected.route==WS_ORDINARY) {
+        // Preserve stock's valid empty/default-pointer transform and its
+        // existing mixed typed/default rejection. No native row allocation.
+        return target.addPointers(ids,transform).ok();
+    }
+    // Phone input is never adopted into an external owned stream, even when
+    // its app/channel happens to be shared with a presentation elsewhere.
+    if (window.displayId==ui::LogicalDisplayId::DEFAULT ||
+            (event && event->displayId==ui::LogicalDisplayId::DEFAULT)) return false;
+    if (selected.route!=WS_VALID || ids.none() || !target.connection ||
+            (ids&target.getPointerIds()).any()) return false;
+    auto reservation=std::shared_ptr<ExternalDesktopSubmissionReservation>(new ExternalDesktopSubmissionReservation);
+    if (target.mExternalDesktopSubmissionReservation) reservation->mRows=target.mExternalDesktopSubmissionReservation->mRows;
+    std::array<ExternalDesktopPointerOwnership::Row,ExternalDesktopPointerOwnership::kMaxIds> owners{};
+    std::array<std::shared_ptr<ExternalDesktopSubmissionRow>,ExternalDesktopPointerOwnership::kMaxIds> fresh{};
+    size_t count=0,freshCount=0;
+    if (selected.route==WS_VALID) {
+        if (!event || event->isInjected() || !event->externalDesktopPhysicalPacket || !event->externalDesktopNativeIngress ||
+                event->externalDesktopNativeIngress->mOwner!=mExternalDesktopIngressOwner ||
+                event->externalDesktopNativeIngress->mKind!=ExternalDesktopNativeIngress::Kind::NOTIFY_MOTION ||
+                !mExternalDesktopSubmissionLedger.mCoverageAvailable || !selected.window || !selected.presentation ||
+                !selected.producer || selected.producer->mState!=ExternalDesktopSubmissionIdentity::State::ROUTABLE || !window.token ||
+                target.connection->getToken()!=window.token) return false;
+        ExternalDesktopPointerOwnership::Ids physicalIds;
+        if (!ExternalDesktopPointerOwnership::idsOf(event->pointerProperties,physicalIds) || (ids&~physicalIds).any()) return false;
+    }
+    for (size_t id=0;id<ExternalDesktopPointerOwnership::kMaxIds;++id) if (ids.test(id)) {
+        std::optional<ExternalDesktopPointerStreamKey> key;
+        if (selected.route==WS_VALID) {
+            const auto& physical=event->externalDesktopPhysicalPacket->mPointers[id];
+            if (!physical || physical->mKind!=ExternalDesktopPhysicalPointer::Kind::READER ||
+                    physical->mId!=static_cast<int32_t>(id) || physical->mDevice!=event->deviceId ||
+                    physical->mSource!=event->source || physical->mDeviceReset || physical->mRawRestart ||
+                    physical->mRawRosterWithdrawn) return false;
+            std::shared_ptr<ExternalDesktopSubmissionRow> prior;
+            for (const auto& row:mExternalDesktopSubmissionLedger.mRows) if (row && row->mPhysical==physical) {
+                // A held raw contact cannot acquire a second owner/epoch by
+                // ordinary selection. Rebind requires its existing real plan.
+                if (prior || row->mClosing || row->mProducer!=selected.producer ||
+                        row->mConnection.lock()!=target.connection || row->mWindow!=selected.window ||
+                        row->mPresentation!=selected.presentation) return false;
+                prior=row;
+            }
+            if (!prior) {
+                // Row reclamation must not turn this already-admitted raw
+                // referent into a fresh DOWN/hover stream. A real trusted
+                // rebind is separate from ordinary target selection.
+                if (physical->mOwnedAdmissionSeen) return false;
+                const auto action=MotionEvent::getActionMasked(event->action);
+                // CursorInputMapper emits genuine HOVER_MOVE, then stock
+                // selection derives this WINDOW'S HOVER_ENTER before enqueue
+                // rewrites its receiver action. Do not invent a Reader ENTER
+                // or use the coalesced channel's lead target mode. The prior
+                // physical-row scan still forbids held owned rebind/revival.
+                const bool freshHover=physical->mHover && selectedMode==InputTarget::DispatchMode::HOVER_ENTER &&
+                        (action==AMOTION_EVENT_ACTION_HOVER_ENTER || action==AMOTION_EVENT_ACTION_HOVER_MOVE);
+                bool freshDown=!physical->mHover && action==AMOTION_EVENT_ACTION_DOWN;
+                if (!physical->mHover && action==AMOTION_EVENT_ACTION_POINTER_DOWN &&
+                        MotionEvent::getActionIndex(event->action)<event->pointerProperties.size())
+                    freshDown=event->pointerProperties[MotionEvent::getActionIndex(event->action)].id==static_cast<int32_t>(id);
+                if ((!freshHover && !freshDown) || physical->mActualUp || physical->mReaderCancel ||
+                        physical->mReaderHoverExit || freshCount>=mExternalDesktopSubmissionLedger.mRows.size()-mExternalDesktopSubmissionLedger.mRowsUsed ||
+                        mExternalDesktopSubmissionLedger.mStreamHighWater==UINT64_MAX) return false;
+                const ExternalDesktopPointerStreamKey admitted{selected.domain,selected.generation,selected.windowLifetime,
+                    selected.presentationLifetime,++mExternalDesktopSubmissionLedger.mStreamHighWater};
+                if (!admitted.valid()) return false;
+                prior=std::shared_ptr<ExternalDesktopSubmissionRow>(new ExternalDesktopSubmissionRow(target.connection,
+                    selected.window,selected.presentation,selected.producer,physical,admitted,static_cast<int32_t>(id),
+                    target.connection->mExternalDesktopPublisherDestruction.mState,window.id,window.displayId.val()));
+                fresh[freshCount++]=prior;
+            }
+            key=prior->mKey;reservation->mRows[id]=std::move(prior);
+        }
+        owners[count++]={static_cast<int32_t>(id),key};
+    }
+    auto ownership=ExternalDesktopPointerOwnership::create(std::span<const ExternalDesktopPointerOwnership::Row>(owners.data(),count));
+    if (!ownership.ok() || !target.addPointersWithOwnership(ids,transform,*ownership).ok()) return false;
+    // Allocation/table/transform validation completes BEFORE ledger mutation.
+    for (size_t i=0;i<freshCount;++i) {
+        event->externalDesktopPhysicalPacket->mPointers[static_cast<size_t>(fresh[i]->mId)]->mOwnedAdmissionSeen=true;
+        mExternalDesktopSubmissionLedger.mRows[mExternalDesktopSubmissionLedger.mRowsUsed++]=std::move(fresh[i]);
+    }
+    if (target.mExternalDesktopPointerOwnership) target.mExternalDesktopSubmissionReservation=std::move(reservation);
+    return true;
+}
+
+bool InputDispatcher::validExternalDesktopPublicationLocked(const std::shared_ptr<Connection>& connection,const DispatchEntry& packet) {
+    const auto state = classifyExternalDesktopPublicationLocked(connection, packet);
+    return state == ExternalDesktopPublicationState::ORDINARY || state == ExternalDesktopPublicationState::ROUTABLE;
+}
+
+ExternalDesktopPublicationState InputDispatcher::classifyExternalDesktopPublicationLocked(
+        const std::shared_ptr<Connection>& connection, const DispatchEntry& packet) {
+    bool suspended = false;
+    if (const auto& tail=packet.externalDesktopClosingTail) {
+        if (tail->mPacket!=&packet || tail->mSeq!=packet.seq || tail->mEvent!=packet.eventEntry.get() ||
+                tail->mConnection.lock()!=connection || !tail->mClosing || !tail->mClosing->mSealed) return ExternalDesktopPublicationState::REFUSED;
+        bool any=false;
+        for (const auto& row:tail->mClosing->mRows) if (row) {
+            any=true;
+            if (!row->mClosing || row->mTransportDrained || row->mConnection.lock()!=connection ||
+                    !ExternalDesktopPublishedMotion::packetContains(packet,row->mKey) ||
+                    std::find(mExternalDesktopSubmissionLedger.mRows.begin(),mExternalDesktopSubmissionLedger.mRows.end(),row)==
+                        mExternalDesktopSubmissionLedger.mRows.end()) return ExternalDesktopPublicationState::REFUSED;
+        }
+        if (!any) return ExternalDesktopPublicationState::REFUSED;
+    }
+    if (!packet.externalDesktopPointerOwnership) return packet.externalDesktopClosingTail ?
+            ExternalDesktopPublicationState::ROUTABLE : ExternalDesktopPublicationState::ORDINARY;
+    if (packet.eventEntry->type!=EventEntry::Type::MOTION ||
+            !packet.externalDesktopPointerOwnership->matches(static_cast<const MotionEntry&>(*packet.eventEntry).pointerProperties)) return ExternalDesktopPublicationState::REFUSED;
+    for (size_t id=0;id<ExternalDesktopPointerOwnership::kMaxIds;++id) {
+        const auto key=ExternalDesktopPointerOwnership::keyAt(packet.externalDesktopPointerOwnership,static_cast<int32_t>(id));
+        if (!key) continue;
+        if (packet.externalDesktopClosingTail) {
+            const auto& closing=packet.externalDesktopClosingTail->mClosing->mRows[id];
+            if (closing && closing->mKey==*key) continue; // exact saved old-key tail only
+        }
+        const auto row=packet.externalDesktopSubmissionReservation?packet.externalDesktopSubmissionReservation->mRows[id]:nullptr;
+        if (!row || row->mClosing || row->mConnection.lock()!=connection || row->mKey!=*key ||
+                !row->mProducer || row->mProducer->mState==ExternalDesktopSubmissionIdentity::State::INERT || !row->mPhysical ||
+                std::find(mExternalDesktopSubmissionLedger.mRows.begin(),mExternalDesktopSubmissionLedger.mRows.end(),row)==
+                    mExternalDesktopSubmissionLedger.mRows.end()) return ExternalDesktopPublicationState::REFUSED;
+        if (row->mPhysical->mDeviceReset || row->mPhysical->mRawRestart || row->mPhysical->mRawRosterWithdrawn) {
+            mExternalDesktopStageOwner.invalidateNativeRoutes();return ExternalDesktopPublicationState::REFUSED;
+        }
+        if (row->mProducer->mState==ExternalDesktopSubmissionIdentity::State::SUSPENDED) {
+            suspended = true;
+            continue; // pending storage ONLY, no old route/lender/publication is authorized
+        }
+        const auto current=mExternalDesktopStageOwner.routeNativeStream(key->windowLifetime,key->presentationLifetime,row->mProducer);
+        if (current.route!=WS_VALID || current.domain!=key->domain || current.generation!=key->generation ||
+                current.window!=row->mWindow || current.presentation!=row->mPresentation || current.producer!=row->mProducer) return ExternalDesktopPublicationState::REFUSED;
+    }
+    return suspended ? ExternalDesktopPublicationState::SUSPENDED : ExternalDesktopPublicationState::ROUTABLE;
+}
+
+void InputDispatcher::refuseExternalDesktopSuspendedStreamLocked(const std::shared_ptr<Connection>& connection,
+        const DispatchEntry& packet) {
+    for (const auto& row : mExternalDesktopSubmissionLedger.mRows) {
+        if (!row || row->mConnection.lock()!=connection || !row->mProducer ||
+                row->mProducer->mState!=ExternalDesktopSubmissionIdentity::State::SUSPENDED) continue;
+        bool affected=ExternalDesktopPublishedMotion::packetContains(packet,row->mKey);
+        for (const auto& prior:connection->externalDesktopSuspendedQueue) {
+            affected |= Connection::sameExternalDesktopPhysicalStream(*prior,packet) &&
+                    ExternalDesktopPublishedMotion::packetContains(*prior,row->mKey);
+        }
+        if (affected) const_cast<ExternalDesktopSubmissionIdentity*>(row->mProducer.get())->mState=ExternalDesktopSubmissionIdentity::State::INERT;
+    }
+    mExternalDesktopSubmissionLedger.mCoverageAvailable=false; // bounded private coverage loss, not authority-generation revocation
+}
+
+void InputDispatcher::pumpExternalDesktopSuspendedOutboundLocked() {
+    std::vector<std::shared_ptr<Connection>> connections;
+    for (const auto& row:mExternalDesktopSubmissionLedger.mRows) if (row) {
+        const auto connection=row->mConnection.lock();
+        if (connection && !connection->externalDesktopSuspendedQueue.empty() &&
+                std::find(connections.begin(),connections.end(),connection)==connections.end()) connections.push_back(connection);
+    }
+    for (const auto& connection:connections) startDispatchCycleLocked(now(),connection);
+}
+
+bool InputDispatcher::sameExternalDesktopRawStream(const MotionEntry& a, const MotionEntry& b) {
+    return a.deviceId==b.deviceId && a.source==b.source &&
+            (isMouseOrTouchpad(a.source) || a.displayId==b.displayId);
+}
+
+void InputDispatcher::expireExternalDesktopSuspensionsLocked(nsecs_t currentTime, nsecs_t& nextWakeupTime) {
+    const int64_t bootNow=android::elapsedRealtime();
+    for (const auto& row:mExternalDesktopSubmissionLedger.mRows) {
+        if (!row || !row->mProducer || row->mProducer->mState!=ExternalDesktopSubmissionIdentity::State::SUSPENDED) continue;
+        const auto until=row->mProducer->mSuspendedUntil;
+        if (bootNow<0 || until<=bootNow || !row->mPhysical || row->mPhysical->mDeviceReset ||
+                row->mPhysical->mRawRestart || row->mPhysical->mRawRosterWithdrawn) {
+            const_cast<ExternalDesktopSubmissionIdentity*>(row->mProducer.get())->mState=ExternalDesktopSubmissionIdentity::State::INERT;
+        } else {
+            const int64_t delta=until-bootNow;
+            if (delta<=(LLONG_MAX-currentTime)/1000000) nextWakeupTime=std::min(nextWakeupTime,currentTime+delta*1000000);
+        }
+    }
+    if (!mDispatchFrozen) flushInactiveExternalDesktopSubmissionsLocked();
+}
+
+bool InputDispatcher::selectExternalDesktopDeferredRawLocked(nsecs_t currentTime, nsecs_t& nextWakeupTime) {
+    expireExternalDesktopSuspensionsLocked(currentTime,nextWakeupTime);
+    for (auto it=mExternalDesktopDeferredRaw.begin();it!=mExternalDesktopDeferredRaw.end();++it) {
+        bool suspended=false;
+        for (const auto& row:it->rows) suspended |= row->mProducer->mState==ExternalDesktopSubmissionIdentity::State::SUSPENDED;
+        if (suspended) continue;
+        // Earlier packets in this physical stream cannot be bypassed, even if
+        // a later packet's original subset happens to have no owned pointer.
+        bool earlier=false;
+        for (auto prior=mExternalDesktopDeferredRaw.begin();prior!=it;++prior) earlier |= sameExternalDesktopRawStream(*prior->event,*it->event);
+        if (earlier) continue;
+        mExternalDesktopResumingRaw=std::move(*it);mExternalDesktopDeferredRaw.erase(it);
+        mPendingEvent=mExternalDesktopResumingRaw->event;
+        return true; // ROUTABLE re-enters normal stock selection; INERT follows real saved cancellation
+    }
+    return false;
+}
+
+bool InputDispatcher::deferExternalDesktopRawLocked(const std::shared_ptr<const MotionEntry>& event) {
+    if (!event || event->isInjected() || !event->externalDesktopNativeIngress ||
+            event->externalDesktopNativeIngress->mOwner!=mExternalDesktopIngressOwner ||
+            event->externalDesktopNativeIngress->mKind!=ExternalDesktopNativeIngress::Kind::NOTIFY_MOTION ||
+            !event->externalDesktopPhysicalPacket || !isFromSource(event->source,AINPUT_SOURCE_CLASS_POINTER)) return false;
+    std::vector<std::shared_ptr<ExternalDesktopSubmissionRow>> rows;
+    std::vector<std::shared_ptr<const MotionEntry>> stockSamples;
+    const bool resuming=mExternalDesktopResumingRaw && mExternalDesktopResumingRaw->event==event;
+    if (resuming) {rows=mExternalDesktopResumingRaw->rows;stockSamples=mExternalDesktopResumingRaw->stockSamples;}
+    else for (auto prior=mExternalDesktopDeferredRaw.rbegin();prior!=mExternalDesktopDeferredRaw.rend();++prior) if (sameExternalDesktopRawStream(*prior->event,*event)) {
+        rows=prior->rows;stockSamples=prior->stockSamples;break; // latest ACTUAL per-row evidence, including pending owned UP
+    }
+    const bool storageComplete=stockSamples.size()==rows.size();
+    for (const auto& row:mExternalDesktopSubmissionLedger.mRows) {
+        if (!row || row->mClosing || !row->mProducer || row->mProducer->mState!=ExternalDesktopSubmissionIdentity::State::SUSPENDED ||
+                row->mId<0 || row->mId>MAX_POINTER_ID || !row->mPhysical ||
+                event->externalDesktopPhysicalPacket->mPointers[row->mId]!=row->mPhysical) continue;
+        if (std::find(rows.begin(),rows.end(),row)==rows.end()) rows.push_back(row);
+    }
+    stockSamples.resize(rows.size());
+    for (size_t i=0;i<rows.size();++i) {
+        const auto& row=rows[i];
+        if (row->mId>=0 && row->mId<=MAX_POINTER_ID &&
+                event->externalDesktopPhysicalPacket->mPointers[row->mId]==row->mPhysical &&
+                std::any_of(event->pointerProperties.begin(),event->pointerProperties.end(),
+                    [&](const auto& property){return property.id==row->mId;})) stockSamples[i]=event;
+    }
+    bool suspended=false,inert=false;
+    for (const auto& row:rows) {
+        suspended |= row->mProducer->mState==ExternalDesktopSubmissionIdentity::State::SUSPENDED;
+        inert |= row->mProducer->mState==ExternalDesktopSubmissionIdentity::State::INERT;
+    }
+    if (!suspended) return false;
+    bool valid=!inert && storageComplete && rows.size()<=ExternalDesktopSubmissionLedger::kMaxRows &&
+            event->displayId!=ui::LogicalDisplayId::DEFAULT && mExternalDesktopDeferredRaw.size()<kExternalDesktopMaxDeferredRaw;
+    ExternalDesktopPointerOwnership::Ids ids;
+    valid &= ExternalDesktopPointerOwnership::idsOf(event->pointerProperties,ids) &&
+            event->pointerProperties.size()==event->pointerCoords.size();
+    for (const auto& point:event->pointerCoords) valid &= BitSet64::count(point.bits)<=point.values.size();
+    for (size_t i=0;i<rows.size();++i) {
+        const auto& row=rows[i];
+        const auto connection=row->mConnection.lock();
+        if (!valid || !connection || connection->status!=Connection::Status::NORMAL || row->mClosing ||
+                row->mTransportDrained || row->mWindowId<=0 || row->mDestinationDisplay<=0 ||
+                !row->mPhysical || row->mPhysical->mKind!=ExternalDesktopPhysicalPointer::Kind::READER ||
+                row->mPhysical->mId!=row->mId || row->mPhysical->mDeviceReset ||
+                row->mPhysical->mRawRestart || row->mPhysical->mRawRosterWithdrawn ||
+                row->mPhysical->mDevice!=event->deviceId || row->mPhysical->mSource!=event->source ||
+                row->mProducer->mSuspendedUntil<=android::elapsedRealtime()) {valid=false;break;}
+        const auto& sample=stockSamples[i];
+        if (!sample || !sample->externalDesktopPhysicalPacket || !sample->externalDesktopNativeIngress || sample->isInjected() ||
+                sample->externalDesktopNativeIngress->mOwner!=mExternalDesktopIngressOwner ||
+                sample->externalDesktopNativeIngress->mKind!=ExternalDesktopNativeIngress::Kind::NOTIFY_MOTION ||
+                sample->deviceId!=row->mPhysical->mDevice || sample->source!=row->mPhysical->mSource ||
+                sample->displayId==ui::LogicalDisplayId::DEFAULT || !sameExternalDesktopRawStream(*sample,*event) ||
+                sample->externalDesktopPhysicalPacket->mPointers[row->mId]!=row->mPhysical) {valid=false;break;}
+        const auto point=std::find_if(sample->pointerProperties.begin(),sample->pointerProperties.end(),
+                [&](const auto& property){return property.id==row->mId;});
+        if (point==sample->pointerProperties.end() || sample->pointerProperties.size()!=sample->pointerCoords.size()) {valid=false;break;}
+        const size_t pointerIndex=static_cast<size_t>(point-sample->pointerProperties.begin());
+        sp<gui::WindowInfoHandle> actual;
+        bool duplicate=false;
+        mWindowInfos.forEachWindowHandle([&](const auto& handle) {
+            if (handle->getInfo()->id==row->mWindowId && handle->getToken()==connection->getToken() &&
+                    handle->getInfo()->displayId.val()==row->mDestinationDisplay) {
+                duplicate |= actual!=nullptr;actual=handle;
+            }
+        });
+        if (!actual || duplicate) {valid=false;break;}
+        const auto stock=mExternalDesktopStageOwner.suspendedStockWindow(*actual->getInfo(),row->mProducer);
+        if (!stock) {valid=false;break;}
+        auto exact=*actual->getInfo();exact.inputConfig=stock->inputConfig;
+        if (!ExternalDesktopStageOwner::sameNativeRoutingWindow(exact,*stock) ||
+                !mTouchStates.canWindowReceiveMotion(sp<gui::WindowInfoHandle>::make(*stock),*sample,pointerIndex)) {
+            valid=false;break; // real token/geometry/occlusion/stock checks, never merged-drop subtraction
+        }
+    }
+    if (!valid) {
+        for (const auto& row:rows) if (row->mProducer->mState==ExternalDesktopSubmissionIdentity::State::SUSPENDED)
+            const_cast<ExternalDesktopSubmissionIdentity*>(row->mProducer.get())->mState=ExternalDesktopSubmissionIdentity::State::INERT;
+        flushInactiveExternalDesktopSubmissionsLocked();
+        return false; // ordinary peers follow real stock path AFTER exact owned saved cancellation
+    }
+    ExternalDesktopDeferredRaw retained{event,std::move(rows),std::move(stockSamples)};
+    if (resuming) {mExternalDesktopDeferredRaw.push_front(std::move(retained));mExternalDesktopResumingRaw.reset();}
+    else mExternalDesktopDeferredRaw.push_back(std::move(retained));
+    return true; // no target, new key, InputState mutation, publication or completion
+}
+
+void InputDispatcher::closeInactiveExternalDesktopSubmissionsLocked(const std::shared_ptr<Connection>& connection) {
+    if (!connection) return;
+    for (const auto& first:mExternalDesktopSubmissionLedger.mRows) {
+        if (!first || first->mClosing || first->mConnection.lock()!=connection ||
+                (first->mProducer && first->mProducer->mState!=ExternalDesktopSubmissionIdentity::State::INERT)) continue;
+        auto closing=std::unique_ptr<ExternalDesktopClosingHandle>(new ExternalDesktopClosingHandle);
+        ExternalDesktopPointerOwnership::Ids selected;
+        for (const auto& row:mExternalDesktopSubmissionLedger.mRows) if (row && !row->mClosing &&
+                row->mConnection.lock()==connection && row->mKey==first->mKey) {
+            if (row->mId<0 || row->mId>MAX_POINTER_ID || selected.test(row->mId)) {
+                mExternalDesktopSubmissionLedger.mCoverageAvailable=false;continue;
+            }
+            selected.set(row->mId);closing->mRows[row->mId]=row; // SAME retained Reader referents, never fabricated
+        }
+        if (selected.none() || !canSealExternalDesktopCloseLocked(*closing)) {
+            mExternalDesktopSubmissionLedger.mCoverageAvailable=false;continue;
+        }
+        sealExternalDesktopCloseUncheckedLocked(*closing);
+        std::shared_ptr<const ExternalDesktopClosingHandle> sealed(std::move(closing));
+        auto canceled=commitExternalDesktopQueueChangeLocked(connection,first->mKey,true,sealed);
+        if (!canceled.ok()) {
+            // Stay closing/inert on unavailable saved geometry; never resurrect
+            // old routing or claim successful cancellation/delivery/retirement.
+            LOG(ERROR)<<"Private closing queue refused: "<<canceled.error().message();
+        }
+    }
+}
+
+void InputDispatcher::flushInactiveExternalDesktopSubmissionsLocked() {
+    markDrainedExternalDesktopTransportLocked();
+    std::vector<std::shared_ptr<Connection>> connections;
+    for (const auto& row:mExternalDesktopSubmissionLedger.mRows) if (row && !row->mClosing &&
+            (!row->mProducer || row->mProducer->mState==ExternalDesktopSubmissionIdentity::State::INERT)) {
+        auto connection=row->mConnection.lock();
+        if (connection && std::find(connections.begin(),connections.end(),connection)==connections.end())
+            connections.push_back(std::move(connection));
+    }
+    for (const auto& connection:connections) {
+        closeInactiveExternalDesktopSubmissionsLocked(connection);
+        if (!connection->outboundQueue.empty()) startDispatchCycleLocked(now(),connection);
+    }
+}
+
+android::base::Result<Connection::ExternalDesktopPreparedSentTail> InputDispatcher::prepareExternalDesktopSentTailLocked(
+        const std::shared_ptr<Connection>& connection, const DispatchEntry& packet) {
+    std::vector<std::shared_ptr<ExternalDesktopSentTail>> tails;
+    std::vector<ExternalDesktopSentTail*> withdrawnHover;
+    for (const auto& row : mExternalDesktopSubmissionLedger.mRows) {
+        if (!row || row->mConnection.lock() != connection ||
+                !ExternalDesktopPublishedMotion::packetContains(packet, row->mKey)) continue;
+        if (row->mPublisher != connection->mExternalDesktopPublisherDestruction.mState || row->mTransportDrained) {
+            return android::base::Error() << "Packet lost its exact publisher lifetime";
+        }
+        tails.push_back(row->mTail);
+        if (row->mClosing && row->mProducer &&
+                row->mProducer->mState == ExternalDesktopSubmissionIdentity::State::INERT && row->mPhysical &&
+                row->mPhysical->mKind == ExternalDesktopPhysicalPointer::Kind::READER && row->mPhysical->mHover &&
+                row->mPhysical->mId == row->mId && packet.windowId == row->mWindowId &&
+                connection->preparedExternalDesktopHoverWithdrawal(packet, row->mKey, row->mId)) {
+            const auto& event = static_cast<const MotionEntry&>(*packet.eventEntry);
+            const auto& origin = packet.externalDesktopPhysicalMotionOrigin;
+            // Same numeric device/source/id is not a physical incarnation.
+            // The saved native packet must retain THIS exact Reader referent.
+            const bool exactPhysical = origin && origin->externalDesktopPhysicalPacket &&
+                    origin->externalDesktopPhysicalPacket->mPointers[row->mId] == row->mPhysical;
+            if (event.displayId.val() == row->mDestinationDisplay &&
+                    event.deviceId == row->mPhysical->mDevice && event.source == row->mPhysical->mSource &&
+                    exactPhysical) {
+                withdrawnHover.push_back(row->mTail.get());
+            }
+        }
+    }
+    auto prepared = connection->prepareExternalDesktopSentTail(packet, tails);
+    if (!prepared.ok()) return android::base::Error() << prepared.error();
+    if (!withdrawnHover.empty()) {
+        if (!prepared->sent) return android::base::Error() << "Hover withdrawal lacks its sent journal";
+        // All allocation is before publish. The ordinary successful-send
+        // commit records publication; only its exact FINISHED records ACK.
+        prepared->sent->hoverWithdrawals = std::move(withdrawnHover);
+    }
+    return std::move(*prepared);
+}
+
+void InputDispatcher::noteExternalDesktopSentLiveLocked(const std::shared_ptr<Connection>& connection) {
+    // Only called after BOTH actual publish0 and the successful motion-state
+    // commit. Abort/queue clear never rewrites this independent last-live fact.
+    for (const auto& row : mExternalDesktopSubmissionLedger.mRows) {
+        if (row && row->mConnection.lock() == connection) {
+            row->mTail->mHasLivePointers = connection->externalDesktopPublishedMotion.livePointers(row->mKey) != 0;
+        }
+    }
+}
+
+void InputDispatcher::markDrainedExternalDesktopTransportLocked() {
+    if (!mExternalDesktopSubmissionLedger.mCoverageAvailable ||
+            mExternalDesktopSubmissionLedger.mCallbacks->load(std::memory_order_acquire) != 0) return;
+    bool changed=false;
+    for (const auto& row : mExternalDesktopSubmissionLedger.mRows) {
+        if (!row || row->mTransportDrained || !row->mClosing || row.use_count() != 1 || !row->mPublisher ||
+                !row->mProducer || row->mProducer->mState!=ExternalDesktopSubmissionIdentity::State::INERT ||
+                !row->mPublisher->mComplete || row->mTail->mSent != 0 || row->mTail->mHasLivePointers) continue;
+        const auto connection = row->mConnection.lock();
+        if (connection) {
+            // A surviving original app can share its channel with a retired
+            // replica. Prove THIS exact live publisher and actual per-key
+            // queue/ACK/live-state drainage; do not require closing that app.
+            if (connection->mExternalDesktopPublisherDestruction.mState != row->mPublisher ||
+                    !connection->mExternalDesktopDeliveredMotionComplete ||
+                    row->mPublisher->mLocalFdDestroyed.load(std::memory_order_acquire) ||
+                    mConnectionManager.getConnection(connection->getToken()) != connection ||
+                    !connection->externalDesktopStreamReferences(row->mKey).drained()) continue;
+        } else if (!row->mPublisher->mLocalFdDestroyed.load(std::memory_order_acquire)) {
+            continue;
+        }
+        // All row-bearing targets/reservations/closing handles (including cold
+        // prepared queues) must be gone too: only this non-evicting ledger owns
+        // the row under mLock. The dead-channel path additionally requires its
+        // actual local-FD sentinel; the live path requires registration above.
+        // Retain tombstone:
+        // NO row/key erasure, rebinding, root release or WsRelease is implied.
+        row->mTransportDrained = true;
+        changed=true;
+    }
+    if(changed)requestExternalDesktopRetirementLocked();
+}
+
+void InputDispatcher::requestExternalDesktopRetirementLocked() {
+    if(mExternalDesktopRetirementWakePosted || !mExternalDesktopStageOwner.hasRetirementHistory())return;
+    mExternalDesktopRetirementWakePosted=true;
+    auto command=[this]() REQUIRES(mLock) {
+        mExternalDesktopRetirementWakePosted=false;
+        scoped_unlock unlock(mLock);
+        mPolicy.notifyExternalDesktopRetirementWork(); // JNI only posts to the I/O looper
+    };
+    postCommandLocked(std::move(command));
+    // This may be queued by the I/O collector, or after this dispatch turn's
+    // runCommandsLockedInterruptable(). postCommandLocked only appends: wake
+    // the real looper so a quiet last ACK/removal needs no unrelated input.
+    mLooper->wake();
+}
+
+void InputDispatcher::finishExternalDesktopNotifyCallback() {
+    std::scoped_lock lock(mLock);
+    if (!mExternalDesktopRetirementCallbackWake ||
+            mExternalDesktopSubmissionLedger.mCallbacks->load(std::memory_order_acquire) != 0) return;
+    mExternalDesktopRetirementCallbackWake = false;
+    requestExternalDesktopRetirementLocked();
+}
+
+bool InputDispatcher::collectExternalDesktopRetiredClaims() {
+    std::optional<ExternalDesktopStageOwner::NativeRetirement> plan;
+    {
+        std::scoped_lock lock(mLock);
+        if(mExternalDesktopRetirementRunning)return false;
+        plan=mExternalDesktopStageOwner.prepareNativeRetirement();
+        if(!plan)return false;
+        mExternalDesktopRetirementRunning=true;
+    }
+    // This is the only IPC in the operation. It runs on the private I/O
+    // entry, OUTSIDE dispatcher/WMS locks, with at most64 nonresource tokens.
+    // The plan owns no submission row: use_count()==1 barriers remain genuine.
+    const auto facts=ExternalDesktopStageOwner::queryNativeRetirement(*plan);
+    std::scoped_lock lock(mLock);
+    mExternalDesktopRetirementRunning=false;
+    markDrainedExternalDesktopTransportLocked();
+    if(!mExternalDesktopSubmissionLedger.mCoverageAvailable)return plan->more;
+    if(mExternalDesktopSubmissionLedger.mCallbacks->load(std::memory_order_acquire)!=0){
+        // A consumed filter event may never enqueue or release an inbound
+        // event. Arm exactly one real completion wake instead of quiet polling.
+        mExternalDesktopRetirementCallbackWake=true;
+        return plan->more;
+    }
+    std::vector<uint64_t> drained;drained.reserve(plan->queries.size());
+    for(const auto& query:plan->queries){
+        const auto lifetime=std::find_if(mExternalDesktopStageOwner.mRouteLifetimes.begin(),
+            mExternalDesktopStageOwner.mRouteLifetimes.end(),[&](const auto& value){
+                return value.kind==query.kind && value.key==query.claim;});
+        bool complete=true;
+        if(lifetime!=mExternalDesktopStageOwner.mRouteLifetimes.end())for(const auto& row:mExternalDesktopSubmissionLedger.mRows){
+            if(!row || (row->mWindow!=lifetime->identity && row->mPresentation!=lifetime->identity))continue;
+            if(!row->mTransportDrained || row.use_count()!=1 || !row->mProducer ||
+                    row->mProducer->mState!=ExternalDesktopSubmissionIdentity::State::INERT || !row->mPhysical ||
+                    row->mPhysical->mKind!=ExternalDesktopPhysicalPointer::Kind::READER){complete=false;break;}
+            const auto& physical=row->mPhysical;
+            const bool ended=physical->mActualUp || physical->mReaderCancel || physical->mDeviceReset ||
+                (physical->mHover && physical->mReaderHoverExit);
+            // Publisher death alone is NOT a physical UP/cancel/exit/reset.
+            // Even after that real ingress, cold/raw queued packets may own
+            // this identity without retaining a submission row. Do not erase
+            // the last tail tombstone until those packet references are gone.
+            const auto references=std::count_if(mExternalDesktopSubmissionLedger.mRows.begin(),
+                mExternalDesktopSubmissionLedger.mRows.end(),[&](const auto& other){return other && other->mPhysical==physical;});
+            if(!ended || physical.use_count()!=references){complete=false;break;}
+        }
+        if(complete)drained.push_back(query.claim);
+    }
+    // Queries preserve the monotonically allocated key order. All-epoch
+    // physical transport completion is a separate necessary proof, never an
+    // SF destruction/removal assertion or an ACK-derived release.
+    std::vector<ExternalDesktopStageOwner::NativeRouteLifetime> retired;
+    if(!mExternalDesktopStageOwner.finishNativeRetirement(*plan,facts,drained,retired))return plan->more;
+    for(auto& row:mExternalDesktopSubmissionLedger.mRows){
+        if(!row || !row->mTransportDrained)continue;
+        if(std::any_of(retired.begin(),retired.end(),[&](const auto& value){return value.identity &&
+                (row->mWindow==value.identity || row->mPresentation==value.identity);})){
+            row.reset();
+        }
+    }
+    // Admission appends at mRowsUsed, so preserve its dense-prefix invariant.
+    // Moving shared_ptr slots preserves the identities of every surviving
+    // submission; never overwrite a live survivor when reusing freed space.
+    auto& rows=mExternalDesktopSubmissionLedger.mRows;
+    const auto end=std::remove_if(rows.begin(),rows.end(),[](const auto& row){return !row;});
+    mExternalDesktopSubmissionLedger.mRowsUsed=static_cast<size_t>(end-rows.begin());
+    std::fill(end,rows.end(),nullptr);
+    // Stream/claim/source high-water marks and sticky coverage loss survive.
+    // A bounded page can remove children after their root was withheld on an
+    // earlier page. Real removal progress warrants another turn, including a
+    // cursor wrap; a completed no-progress sweep still stops on more=false.
+    // No cancellation, new Current, route, desktop completion or API grant.
+    return plan->more || !retired.empty();
+}
+
+android::base::Result<void> InputDispatcher::filterExternalDesktopSubmissionLocked(
+        const std::shared_ptr<Connection>& connection, DispatchEntry& packet,
+        const ExternalDesktopPhysicalPacketPtr& physical) {
+    if (packet.eventEntry->type != EventEntry::Type::MOTION || !packet.externalDesktopPointerOwnership) return {};
+    const auto& event = static_cast<const MotionEntry&>(*packet.eventEntry);
+    ExternalDesktopPointerOwnership::Ids all, keep;
+    if (!ExternalDesktopPointerOwnership::idsOf(event.pointerProperties, all) ||
+        !packet.externalDesktopPointerOwnership->matches(event.pointerProperties) ||
+        event.pointerCoords.size() != event.pointerProperties.size()) {
+        return android::base::Error() << "Invalid submission roster";
+    }
+    for (const auto& point : event.pointerCoords) {
+        if (BitSet64::count(point.bits) > point.values.size()) {
+            return android::base::Error() << "Submission coordinate capacity exceeded";
+        }
+    }
+    for (const auto& property : event.pointerProperties) {
+        const int32_t id = property.id;
+        const auto key = ExternalDesktopPointerOwnership::keyAt(packet.externalDesktopPointerOwnership, id);
+        if (!key) { keep.set(id); continue; } // ordinary/null peers never need a row
+        const auto& reservation = packet.externalDesktopSubmissionReservation;
+        const auto row = reservation ? reservation->mRows[id] : nullptr;
+        if (row && !row->mClosing && row->mConnection.lock() == connection &&
+            row->mKey == *key && row->mId == id && row->mWindow && row->mPresentation && row->mProducer &&
+            row->mProducer->mState!=ExternalDesktopSubmissionIdentity::State::INERT &&
+            physical && physical->mPointers[id] == row->mPhysical &&
+            std::find(mExternalDesktopSubmissionLedger.mRows.begin(), mExternalDesktopSubmissionLedger.mRows.end(), row) !=
+                    mExternalDesktopSubmissionLedger.mRows.end()) keep.set(id);
+    }
+    if (keep == all) return {};
+    if (keep.none()) return android::base::Error() << "No admissible pointer remains";
+    auto split = MotionEvent::split(event.action, event.flags, 0, event.pointerProperties,
+            event.pointerCoords, keep, [&]() { return event.getDescription(); });
+    if (!split.ok()) return android::base::Error() << "Closed submission cannot preserve peers";
+    auto owners = ExternalDesktopPointerOwnership::select(event.externalDesktopPointerOwnership, std::get<1>(*split));
+    if (!owners.ok()) return android::base::Error() << owners.error();
+    if (mTracer && !event.traceTracker) return android::base::Error() << "Submission trace origin absent";
+    auto copy = std::make_shared<MotionEntry>(mIdGenerator.nextId(), event.injectionState,
+            event.eventTime, event.deviceId, event.source, event.displayId, event.policyFlags,
+            std::get<0>(*split), event.actionButton, event.flags, event.metaState, event.buttonState,
+            event.classification, event.xPrecision, event.yPrecision, event.xCursorPosition,
+            event.yCursorPosition, event.downTime, std::get<1>(*split), std::get<2>(*split));
+    copy->externalDesktopPointerOwnership = std::move(*owners);
+    copy->externalDesktopNativeIngress = event.externalDesktopNativeIngress;
+    copy->externalDesktopPhysicalPacket = physical;
+    if (!connection->inputState.canTrackExternalDesktopMotion(*copy)) {
+        // Mandatory OPEN: a SAME-ID new presentation may already survive in
+        // this channel. Never erase it, retag stale raw coordinates, or call
+        // a refused mixed packet completed peer progress. That requires the
+        // separate owned NEW-ID+peer composite-provenance transaction.
+        return android::base::Error() << "OPEN composite same-ID submission projection required";
+    }
+    if (mTracer) copy->traceTracker = mTracer->traceDerivedEvent(*copy, *event.traceTracker);
+    // The source/shared event, sent/wait packets and every peer are untouched.
+    // Allocation and stock action/index rebasing precede any InputState effect.
+    packet.eventEntry = std::move(copy);
+    packet.externalDesktopPointerOwnership = static_cast<const MotionEntry&>(*packet.eventEntry).externalDesktopPointerOwnership;
+    return {};
+}
+
+android::base::Result<std::unique_ptr<ExternalDesktopClosingHandle>> InputDispatcher::prepareExternalDesktopCloseLocked(
+        const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key,
+        ExternalDesktopPointerOwnership::Ids selected, const ExternalDesktopPhysicalPacketPtr& physical) {
+    if (!connection || !key.valid() || selected.none() || !physical) {
+        return android::base::Error() << "Exact closing owner/physical reservation absent";
+    }
+    auto result = std::unique_ptr<ExternalDesktopClosingHandle>(new ExternalDesktopClosingHandle);
+    for (size_t id = 0; id < ExternalDesktopPointerOwnership::kMaxIds; ++id) if (selected.test(id)) {
+        for (const auto& row : mExternalDesktopSubmissionLedger.mRows) {
+            if (!row || row->mConnection.lock() != connection || row->mKey != key ||
+                row->mId != static_cast<int32_t>(id) ||
+                row->mPhysical != physical->mPointers[id]) continue;
+            if (result->mRows[id] || row->mClosing) {
+                return android::base::Error() << "Ambiguous/stale closing reservation";
+            }
+            result->mRows[id] = row;
+        }
+        if (!result->mRows[id]) return android::base::Error() << "Unreserved closing pointer";
+    }
+    return result;
+}
+
+bool InputDispatcher::canSealExternalDesktopCloseLocked(const ExternalDesktopClosingHandle& handle) const {
+    if (handle.mSealed) return false;
+    bool any = false;
+    for (const auto& row : handle.mRows) if (row) {
+        any = true;
+        if (row->mClosing || row->mConnection.expired() ||
+            std::find(mExternalDesktopSubmissionLedger.mRows.begin(), mExternalDesktopSubmissionLedger.mRows.end(), row) ==
+                    mExternalDesktopSubmissionLedger.mRows.end()) return false;
+    }
+    return any;
+}
+
+void InputDispatcher::sealExternalDesktopCloseUncheckedLocked(ExternalDesktopClosingHandle& handle) noexcept {
+    for (auto& row : handle.mRows) if (row) row->mClosing = true;
+    handle.mSealed = true;
+    // NO erasure, identity reuse, UP/ACK/abort cleanup, or retired-claim output.
+}
+
+ExternalDesktopNativeIngressPtr InputDispatcher::allocateExternalDesktopIngressLocked(ExternalDesktopNativeIngress::Kind kind) {
+    if (!mExternalDesktopIngressAvailable || mExternalDesktopIngressOrdinal == std::numeric_limits<uint64_t>::max()) {
+        mExternalDesktopIngressAvailable = false; // sticky unavailable, never wrap or fabricate ordinal zero
+        return nullptr;
+    }
+    return ExternalDesktopNativeIngressPtr(new ExternalDesktopNativeIngress(mExternalDesktopIngressOwner, ++mExternalDesktopIngressOrdinal, kind));
+}
+#endif
+
 bool InputDispatcher::enqueueInboundEventLocked(std::unique_ptr<EventEntry> newEntry) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    if (newEntry->type == EventEntry::Type::MOTION) {
+        auto& motion = static_cast<MotionEntry&>(*newEntry);
+        if (!motion.externalDesktopNativeIngress) {
+            // Public MotionEvent injection cannot supply a native ticket. Do
+            // not relabel this path as an actual notify/reader observation.
+            motion.externalDesktopNativeIngress = allocateExternalDesktopIngressLocked(motion.isInjected() ?
+                    ExternalDesktopNativeIngress::Kind::INJECTED : ExternalDesktopNativeIngress::Kind::NATIVE_SYNTHETIC);
+        }
+    }
+#endif
     bool needWake = mInboundQueue.empty();
     mInboundQueue.push_back(std::move(newEntry));
     const EventEntry& entry = *(mInboundQueue.back());
@@ -1504,7 +2438,7 @@ bool InputDispatcher::enqueueInboundEventLocked(std::unique_ptr<EventEntry> newE
 void InputDispatcher::addRecentEventLocked(std::shared_ptr<const EventEntry> entry) {
     // Do not store sensor event in recent queue to avoid flooding the queue.
     if (entry->type != EventEntry::Type::SENSOR) {
-        mRecentQueue.push_back(entry);
+        mRecentQueue.push_back({entry->getDescription(), entry->eventTime});
     }
     if (mRecentQueue.size() > RECENT_QUEUE_MAX_SIZE) {
         mRecentQueue.pop_front();
@@ -1693,6 +2627,11 @@ void InputDispatcher::drainInboundQueueLocked() {
         mInboundQueue.pop_front();
         releaseInboundEventLocked(entry);
     }
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    while (!mExternalDesktopDeferredRaw.empty()) {
+        auto event=mExternalDesktopDeferredRaw.front().event;mExternalDesktopDeferredRaw.pop_front();releaseInboundEventLocked(event);
+    }
+#endif
     traceInboundQueueLengthLocked();
 }
 
@@ -1704,6 +2643,11 @@ void InputDispatcher::releasePendingEventLocked() {
 }
 
 void InputDispatcher::releaseInboundEventLocked(std::shared_ptr<const EventEntry> entry) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    if (mExternalDesktopResumingRaw && mExternalDesktopResumingRaw->event==entry) mExternalDesktopResumingRaw.reset();
+    if(entry->type==EventEntry::Type::MOTION &&
+            static_cast<const MotionEntry&>(*entry).externalDesktopPhysicalPacket)requestExternalDesktopRetirementLocked();
+#endif
     const std::shared_ptr<InjectionState>& injectionState = entry->injectionState;
     if (injectionState && injectionState->injectionResult == InputEventInjectionResult::PENDING) {
         LOG_IF(INFO, DEBUG_DISPATCH_CYCLE) << "Injected inbound event was dropped.";
@@ -1935,6 +2879,13 @@ std::vector<InputTarget> InputDispatcher::getInputTargetsFromWindowHandlesLocked
 
 bool InputDispatcher::dispatchKeyLocked(nsecs_t currentTime, std::shared_ptr<const KeyEntry> entry,
                                         DropReason* dropReason, nsecs_t& nextWakeupTime) {
+    if (entry->syntheticRepeat && entry->syntheticRepeatCanceledByDrop) {
+        // Explicit old-repeat discard, NOT a generic dropped physical key.
+        // Its saved recipient was already balanced; dropInboundEventLocked
+        // would broadly cancel unrelated same-device/display recipient keys.
+        *dropReason = DropReason::NOT_DROPPED;
+        return true;
+    }
     // Preprocessing.
     if (!entry->dispatchInProgress) {
         if (!entry->syntheticRepeat && entry->action == AKEY_EVENT_ACTION_DOWN &&
@@ -2542,6 +3493,13 @@ InputDispatcher::DispatcherTouchState::findTouchedWindowTargets(
         const sp<android::gui::WindowInfoHandle> dragWindow,
         std::function<void(const MotionEntry&)> addDragEvent, std::function<void()> dump) {
     ATRACE_CALL();
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    struct RestoreSelection {
+        const MotionEntry*& slot;const MotionEntry* previous;
+        ~RestoreSelection(){slot=previous;}
+    } restoreSelection{mExternalDesktopSelectionEntry,mExternalDesktopSelectionEntry};
+    mExternalDesktopSelectionEntry=&entry;
+#endif
 
     std::vector<InputTarget> targets;
     // For security reasons, we defer updating the touch state until we are sure that
@@ -3073,6 +4031,11 @@ void InputDispatcher::addWindowTargetLocked(const sp<WindowInfoHandle>& windowHa
                          });
 
     const WindowInfo* windowInfo = windowHandle->getInfo();
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // No private keyboard/focus contract is installed yet. A claimed clone
+    // cannot take the ordinary non-pointer path just because its stamp is absent.
+    if (mExternalDesktopStageOwner.ownsNativeWindow(*windowInfo)) return;
+#endif
 
     if (it == inputTargets.end()) {
         std::shared_ptr<Connection> connection =
@@ -3133,6 +4096,9 @@ void InputDispatcher::DispatcherTouchState::addPointerWindowTarget(
 
     const WindowInfo& windowInfo = *windowHandle->getInfo();
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    const bool created=it==inputTargets.end();
+#endif
     if (it == inputTargets.end()) {
         std::shared_ptr<Connection> connection = mConnectionManager.getConnection(windowInfo.token);
         if (connection == nullptr) {
@@ -3167,6 +4133,14 @@ void InputDispatcher::DispatcherTouchState::addPointerWindowTarget(
                  mWindowInfos.getCrossDisplayTransform(/*sourceDisplay=*/pointerDisplayId.value(),
                                                        /*destinationDisplay=*/windowInfo.displayId));
     }
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    if (mExternalDesktopSelection) {
+        if (const auto admitted=mExternalDesktopSelection(windowInfo,mExternalDesktopSelectionEntry,pointerIds,*it,transform,dispatchMode)) {
+            if (!*admitted && created) inputTargets.erase(it);
+            return; // selected owned refusal is NOT re-hit-tested/rerouted to a phone
+        }
+    }
+#endif
     Result<void> result = it->addPointers(pointerIds, transform);
     if (!result.ok()) {
         dump();
@@ -3505,7 +4479,11 @@ void InputDispatcher::prepareDispatchCycleLocked(nsecs_t currentTime,
             }
             enqueueDispatchEntryAndStartDispatchCycleLocked(currentTime, connection,
                                                             std::move(splitMotionEntry),
-                                                            inputTarget);
+                                                            inputTarget
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                                                            , std::static_pointer_cast<const MotionEntry>(eventEntry)
+#endif
+                                                            );
             return;
         }
     }
@@ -3517,7 +4495,11 @@ void InputDispatcher::prepareDispatchCycleLocked(nsecs_t currentTime,
 
 void InputDispatcher::enqueueDispatchEntryAndStartDispatchCycleLocked(
         nsecs_t currentTime, const std::shared_ptr<Connection>& connection,
-        std::shared_ptr<const EventEntry> eventEntry, const InputTarget& inputTarget) {
+        std::shared_ptr<const EventEntry> eventEntry, const InputTarget& inputTarget
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        , std::shared_ptr<const MotionEntry> physicalOrigin
+#endif
+        ) {
     ATRACE_NAME_IF(ATRACE_ENABLED(),
                    StringPrintf("enqueueDispatchEntryAndStartDispatchCycleLocked(inputChannel=%s, "
                                 "id=0x%" PRIx32 ")",
@@ -3525,7 +4507,11 @@ void InputDispatcher::enqueueDispatchEntryAndStartDispatchCycleLocked(
 
     const bool wasEmpty = connection->outboundQueue.empty();
 
-    enqueueDispatchEntryLocked(connection, eventEntry, inputTarget);
+    enqueueDispatchEntryLocked(connection, eventEntry, inputTarget
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                              , std::move(physicalOrigin)
+#endif
+                              );
 
     // If the outbound queue was previously empty, start the dispatch cycle going.
     if (wasEmpty && !connection->outboundQueue.empty()) {
@@ -3535,7 +4521,11 @@ void InputDispatcher::enqueueDispatchEntryAndStartDispatchCycleLocked(
 
 void InputDispatcher::enqueueDispatchEntryLocked(const std::shared_ptr<Connection>& connection,
                                                  std::shared_ptr<const EventEntry> eventEntry,
-                                                 const InputTarget& inputTarget) {
+                                                 const InputTarget& inputTarget
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                                                 , std::shared_ptr<const MotionEntry> physicalOrigin
+#endif
+                                                 ) {
     const bool isKeyOrMotion = eventEntry->type == EventEntry::Type::KEY ||
             eventEntry->type == EventEntry::Type::MOTION;
     if (isKeyOrMotion && !inputTarget.windowHandle && !connection->isFocusMonitor) {
@@ -3548,6 +4538,17 @@ void InputDispatcher::enqueueDispatchEntryLocked(const std::shared_ptr<Connectio
     std::unique_ptr<DispatchEntry> dispatchEntry =
             createDispatchEntry(mIdGenerator, inputTarget, eventEntry, inputTarget.flags,
                                 mWindowInfosVsyncId, mTracer.get());
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    if (!dispatchEntry) return; // Invalid private table: no fallback or state mutation.
+    if (eventEntry->type == EventEntry::Type::MOTION) {
+        dispatchEntry->externalDesktopPhysicalMotionOrigin = physicalOrigin ? std::move(physicalOrigin) :
+                std::static_pointer_cast<const MotionEntry>(eventEntry);
+        dispatchEntry->externalDesktopSubmissionReservation = inputTarget.getExternalDesktopSubmissionReservation();
+        auto admitted = filterExternalDesktopSubmissionLocked(connection, *dispatchEntry,
+                dispatchEntry->externalDesktopPhysicalMotionOrigin->externalDesktopPhysicalPacket);
+        if (!admitted.ok()) return;
+    }
+#endif
 
     // Use the eventEntry from dispatchEntry since the entry may have changed and can now be a
     // different EventEntry than what was passed in.
@@ -3586,7 +4587,11 @@ void InputDispatcher::enqueueDispatchEntryLocked(const std::shared_ptr<Connectio
                 }
                 if (resolvedAction == AMOTION_EVENT_ACTION_HOVER_MOVE &&
                     !connection->inputState.isHovering(motionEntry.deviceId, motionEntry.source,
-                                                       motionEntry.displayId)) {
+                                                       motionEntry.displayId
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                                                       , motionEntry.externalDesktopPointerOwnership
+#endif
+                                                       )) {
                     LOG_IF(INFO, DEBUG_DISPATCH_CYCLE)
                             << "channel '" << connection->getInputChannelName().c_str()
                             << "' ~ enqueueDispatchEntryLocked: filling in missing hover enter "
@@ -3624,6 +4629,9 @@ void InputDispatcher::enqueueDispatchEntryLocked(const std::shared_ptr<Connectio
                 }
 
                 if (shouldCreateNewMotionEntry) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                    ExternalDesktopPointerOwnershipPtr usingOwnership = motionEntry.externalDesktopPointerOwnership;
+#endif
                     std::optional<std::vector<PointerCoords>> usingCoords;
                     std::optional<std::vector<PointerProperties>> usingProperties;
                     if (resolvedAction == AMOTION_EVENT_ACTION_HOVER_EXIT ||
@@ -3633,14 +4641,24 @@ void InputDispatcher::enqueueDispatchEntryLocked(const std::shared_ptr<Connectio
                         // incorrect. These events should use the coordinates of the last dispatched
                         // ACTION_MOVE or HOVER_MOVE. We need to query InputState to get this data.
                         const bool hovering = resolvedAction == AMOTION_EVENT_ACTION_HOVER_EXIT;
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                        ExternalDesktopPointerOwnershipPtr mementoOwnership;
+#endif
                         std::optional<std::pair<std::vector<PointerProperties>,
                                                 std::vector<PointerCoords>>>
                                 pointerInfo =
                                         connection->inputState.getPointersOfLastEvent(motionEntry,
-                                                                                      hovering);
+                                                                                      hovering
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                                                                                      , &mementoOwnership
+#endif
+                                                                                      );
                         if (pointerInfo) {
                             usingProperties = pointerInfo->first;
                             usingCoords = pointerInfo->second;
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                            usingOwnership = std::move(mementoOwnership);
+#endif
                         }
                     }
                     {
@@ -3659,6 +4677,12 @@ void InputDispatcher::enqueueDispatchEntryLocked(const std::shared_ptr<Connectio
                                              usingProperties.value_or(
                                                      motionEntry.pointerProperties),
                                              usingCoords.value_or(motionEntry.pointerCoords));
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                        auto selected = ExternalDesktopPointerOwnership::select(usingOwnership,
+                                                                       newEntry->pointerProperties);
+                        if (!selected.ok()) return;
+                        newEntry->externalDesktopPointerOwnership = std::move(*selected);
+#endif
                         if (mTracer) {
                             ensureEventTraced(motionEntry);
                             newEntry->traceTracker =
@@ -3677,9 +4701,18 @@ void InputDispatcher::enqueueDispatchEntryLocked(const std::shared_ptr<Connectio
                     // Set the resolved motion entry in the DispatchEntry.
                     dispatchEntry->eventEntry = resolvedMotion;
                     eventEntry = resolvedMotion;
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                    dispatchEntry->externalDesktopPointerOwnership = resolvedMotion->externalDesktopPointerOwnership;
+#endif
                 }
             }
 
+            // Private refusal must precede stock conflicting-stream mutation.
+            // Ordinary dispatch and the strict trackMotion rules are unchanged.
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+            if (resolvedMotion->externalDesktopPointerOwnership &&
+                !connection->inputState.canTrackExternalDesktopMotion(*resolvedMotion)) return;
+#endif
             // Check if we need to cancel any of the ongoing gestures. We don't support multiple
             // devices being active at the same time in the same window, so if a new device is
             // active, cancel the gesture from the old device.
@@ -3697,6 +4730,10 @@ void InputDispatcher::enqueueDispatchEntryLocked(const std::shared_ptr<Connectio
                         createDispatchEntry(mIdGenerator, inputTarget, std::move(cancelEvent),
                                             ftl::Flags<InputTarget::Flags>(), mWindowInfosVsyncId,
                                             mTracer.get());
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                if (!cancelDispatchEntry) return;
+#endif
 
                 // Send these cancel events to the queue before sending the event from the new
                 // device.
@@ -3903,6 +4940,10 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
                                 connection->getInputChannelName().c_str()));
     LOG_IF(INFO, DEBUG_DISPATCH_CYCLE)
             << "channel '" << connection->getInputChannelName() << "' ~ startDispatchCycle";
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    connection->restoreExternalDesktopSuspendedPackets(); // original objects BEFORE terminal cancel planning
+    closeInactiveExternalDesktopSubmissionsLocked(connection); // may replace queue; take front only AFTER this
+#endif
 
     while (connection->status == Connection::Status::NORMAL && !connection->outboundQueue.empty()) {
         std::unique_ptr<DispatchEntry>& dispatchEntry = connection->outboundQueue.front();
@@ -3911,6 +4952,39 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
         dispatchEntry->timeoutTime = currentTime + timeout.count();
 
         // Publish the event.
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        const auto externalDesktopState=classifyExternalDesktopPublicationLocked(connection,*dispatchEntry);
+        if (externalDesktopState!=ExternalDesktopPublicationState::REFUSED &&
+                (externalDesktopState==ExternalDesktopPublicationState::SUSPENDED || connection->hasExternalDesktopSuspendedStream(*dispatchEntry))) {
+            if (connection->deferExternalDesktopFrontPacket()) continue;
+            refuseExternalDesktopSuspendedStreamLocked(connection,*dispatchEntry);
+            connection->restoreExternalDesktopSuspendedPackets();
+            closeInactiveExternalDesktopSubmissionsLocked(connection);
+            return; // real capacity refusal; terminal cancellation is never faked
+        }
+        if (externalDesktopState==ExternalDesktopPublicationState::REFUSED) {
+            // Route/lender/producer changes cannot publish old data. Close and
+            // rebuild from saved successful geometry, never current WindowInfo.
+            const auto before=dispatchEntry.get();
+            closeInactiveExternalDesktopSubmissionsLocked(connection);
+            if (connection->outboundQueue.empty()) return;
+            if (connection->outboundQueue.front().get()!=before) continue;
+            return; // unavailable tail/coverage stays blocked, not a fake cancellation
+        }
+        auto externalDesktopPublication = connection->externalDesktopPublishedMotion.prepare(*dispatchEntry);
+        if (!externalDesktopPublication.ok()) {
+            // No ordinary/phone fallback or unverified current geometry. The
+            // trusted selection issuer must reserve capacity before activation.
+            LOG(ERROR) << "Private publication refused: " << externalDesktopPublication.error().message();
+            return;
+        }
+        auto externalDesktopDeliveredMotion = connection->prepareExternalDesktopDeliveredMotion(*dispatchEntry);
+        auto externalDesktopSentTail = prepareExternalDesktopSentTailLocked(connection, *dispatchEntry);
+        if (!externalDesktopSentTail.ok()) {
+            LOG(ERROR) << "Private successful-send journal refused: " << externalDesktopSentTail.error().message();
+            return;
+        }
+#endif
         status_t status;
         const EventEntry& eventEntry = *(dispatchEntry->eventEntry);
         switch (eventEntry.type) {
@@ -4028,6 +5102,20 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
             return;
         }
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        // Ordinary publication is never refused by bounded checkpoint capacity.
+        // A successfully sent unrepresentable sample instead makes coverage
+        // unavailable, permanently for this Connection; private admission/replay
+        // must not infer an empty state or restore it from enqueue mementos.
+        LOG_ALWAYS_FATAL_IF(!connection->commitExternalDesktopDeliveredMotion(std::move(externalDesktopDeliveredMotion)),
+                            "Delivered motion checkpoint changed while dispatcher lock held");
+        LOG_ALWAYS_FATAL_IF(!connection->externalDesktopPublishedMotion.commit(std::move(*externalDesktopPublication)),
+                            "Private publication owner changed while dispatcher lock held");
+        LOG_ALWAYS_FATAL_IF(!connection->commitExternalDesktopSentTail(std::move(*externalDesktopSentTail)),
+                            "Successful-send journal changed while dispatcher lock held");
+        noteExternalDesktopSentLiveLocked(connection);
+#endif
+
         // Re-enqueue the event on the wait queue.
         const nsecs_t timeoutTime = dispatchEntry->timeoutTime;
         connection->waitQueue.emplace_back(std::move(dispatchEntry));
@@ -4107,6 +5195,14 @@ void InputDispatcher::abortBrokenDispatchCycleLocked(const std::shared_ptr<Conne
     traceOutboundQueueLength(*connection);
     drainDispatchQueue(connection->waitQueue);
     traceWaitQueueLength(*connection);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Abort discards server queues; it does NOT prove the client closed its
+    // socket or consumed every published packet. BROKEN/ZOMBIE queries cannot
+    // report drained; actual teardown must fence future claim retirement.
+    connection->externalDesktopPublishedMotion.clear();
+    connection->invalidateExternalDesktopDeliveredMotion();
+    drainDispatchQueue(connection->externalDesktopSuspendedQueue);
+#endif
 
     // The connection appears to be unrecoverably broken.
     // Ignore already broken or zombie connections.
@@ -4133,6 +5229,620 @@ void InputDispatcher::drainDispatchQueue(std::deque<std::unique_ptr<DispatchEntr
         queue.pop_front();
     }
 }
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+bool InputDispatcher::isExternalDesktopTransferCurrentLocked(
+        const ExternalDesktopTrustedTransfer& cap, const std::shared_ptr<Connection>& source,
+        const std::shared_ptr<Connection>& destination) const {
+    if (cap.mConsumed || !source || !destination || cap.mSource.lock() != source ||
+        cap.mDestination.lock() != destination || source->status != Connection::Status::NORMAL ||
+        destination->status != Connection::Status::NORMAL || !cap.mSubmission ||
+        !cap.mFrom.window || !cap.mFrom.presentation || !cap.mTo.window || !cap.mTo.presentation ||
+        !cap.mPhysicalOrigin || !cap.mResolvedOrigin || !cap.mDestinationTarget ||
+        cap.mSelected.none() || !cap.mOldKey.valid() || !cap.mNewKey.valid() ||
+        cap.mOldKey == cap.mNewKey || cap.mOldKey.domain != cap.mNewKey.domain ||
+        cap.mOldKey.generation != cap.mNewKey.generation ||
+        cap.mOldKey.streamInstance != cap.mNewKey.streamInstance ||
+        cap.mSourceRevision != source->externalDesktopPublishedMotion.revision() ||
+        cap.mDestinationRevision != destination->externalDesktopPublishedMotion.revision() ||
+        cap.mSourceDeliveredRevision != source->mExternalDesktopDeliveredMotionRevision ||
+        cap.mDestinationDeliveredRevision != destination->mExternalDesktopDeliveredMotionRevision ||
+        cap.mDestinationTarget->connection != destination ||
+        cap.mDestinationTarget->windowHandle != cap.mTo.handle ||
+        cap.mDestinationTarget->dispatchMode != InputTarget::DispatchMode::AS_IS) return false;
+    auto endpoint = [&](const auto& value, const auto& connection) {
+        base::ScopedLockAssertion assumeLocked(mLock);
+        if (!value.handle || *value.handle->getInfo() != value.immutableInfo ||
+            value.immutableInfo.token != connection->getToken() ||
+            mConnectionManager.getConnection(value.immutableInfo.token) != connection) return false;
+        const auto& handles = mWindowInfos.getWindowHandlesForDisplay(value.immutableInfo.displayId);
+        return std::find(handles.begin(), handles.end(), value.handle) != handles.end();
+    };
+    return endpoint(cap.mFrom, source) && endpoint(cap.mTo, destination);
+}
+
+android::base::Result<std::unique_ptr<InputDispatcher::ExternalDesktopPreparedTransfer>>
+InputDispatcher::prepareExternalDesktopTrustedTransferLocked(ExternalDesktopTrustedTransfer& cap) {
+    using Ids = ExternalDesktopPointerOwnership::Ids;
+    const auto source = cap.mSource.lock(), destination = cap.mDestination.lock();
+    if (!isExternalDesktopTransferCurrentLocked(cap, source, destination)) {
+        return android::base::Error() << "Missing exact trusted owner/endpoint/stream rebind capability";
+    }
+    std::optional<ExternalDesktopPublishedMotion::Snapshot> saved;
+    bool ambiguous = false;
+    source->externalDesktopPublishedMotion.forEach(cap.mOldKey, [&](const auto& snapshot, Ids ids) {
+        if (snapshot.deviceId != cap.mResolvedOrigin->deviceId || snapshot.source != cap.mResolvedOrigin->source ||
+            (!isMouseOrTouchpad(snapshot.source) && snapshot.displayId != cap.mResolvedOrigin->displayId)) {
+            ambiguous = true; return;
+        }
+        if ((ids & cap.mSelected).none()) return;
+        if (saved || (cap.mSelected & ~ids).any()) { ambiguous = true; return; }
+        saved = snapshot;
+    });
+    if (ambiguous || !saved || saved->traceOrigin != cap.mResolvedOrigin ||
+        saved->physicalOrigin != cap.mPhysicalOrigin || saved->windowId != cap.mFrom.immutableInfo.id ||
+        saved->targetUid != cap.mFrom.immutableInfo.ownerUid ||
+        (cap.mSelected & ~saved->liveIds).any()) {
+        return android::base::Error() << "Rebind is not the exact successful native source packet";
+    }
+    const auto& physical = *cap.mPhysicalOrigin;
+    auto validOrigin = [](const MotionEntry& event) {
+        Ids ids;
+        if (!ExternalDesktopPointerOwnership::idsOf(event.pointerProperties, ids) ||
+            event.pointerProperties.size() != event.pointerCoords.size() ||
+            event.getPointerCount() > MAX_POINTERS) return false;
+        for (const auto& point : event.pointerCoords) {
+            if (BitSet64::count(point.bits) > point.values.size()) return false;
+        }
+        const int32_t action = MotionEvent::getActionMasked(event.action);
+        if ((action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_UP) &&
+            event.getPointerCount() != 1) return false;
+        return (action != AMOTION_EVENT_ACTION_POINTER_DOWN && action != AMOTION_EVENT_ACTION_POINTER_UP) ||
+                (event.getPointerCount() > 1 && MotionEvent::getActionIndex(event.action) < event.getPointerCount());
+    };
+    if (!validOrigin(physical)) return android::base::Error() << "Native physical source shape invalid";
+    // Same display resolution as enqueue's actual AS_IS motion resolver. The
+    // trusted InputTarget owns any cross-display coordinate transform; no
+    // source normalized coordinates/current WindowInfo are used as raw XY.
+    const auto resolvedDisplay = physical.displayId.isValid() &&
+            physical.displayId != cap.mTo.immutableInfo.displayId &&
+            !cap.mTo.immutableInfo.inputConfig.test(gui::WindowInfo::InputConfig::DISPLAY_TOPOLOGY_AWARE) ?
+            cap.mTo.immutableInfo.displayId : physical.displayId;
+    const MotionEntry probe(physical.id, nullptr, physical.eventTime, physical.deviceId,
+            physical.source, resolvedDisplay, physical.policyFlags, physical.action,
+            physical.actionButton, physical.flags, physical.metaState, physical.buttonState,
+            physical.classification, physical.xPrecision, physical.yPrecision,
+            physical.xCursorPosition, physical.yCursorPosition, physical.downTime,
+            physical.pointerProperties, physical.pointerCoords);
+    const auto* sourceNative = source->externalDesktopNativePacketForReplay(*cap.mResolvedOrigin);
+    const auto* destinationNative = destination->externalDesktopNativePacketForReplay(probe);
+    const auto* destinationDelivered = destination->externalDesktopDeliveredMotionForReplay();
+    if (!destinationDelivered) {
+        return android::base::Error() << "Destination delivered coverage unavailable";
+    }
+    auto destinationPhysical = destinationDelivered->copyExternalDesktopPhysicalMotionSnapshotForOwner(
+            probe, saved->hovering);
+    if (!destinationPhysical.ok()) return android::base::Error() << destinationPhysical.error();
+    if (!sourceNative || sourceNative->physical != cap.mPhysicalOrigin || !destinationDelivered ||
+        (!destinationNative && destinationPhysical->has_value())) {
+        return android::base::Error() << "Trusted transfer would rewind/uncover successful native destination history";
+    }
+    const auto& sourceIngress = physical.externalDesktopNativeIngress;
+    const auto destinationIngress = destinationNative && destinationNative->physical ?
+            destinationNative->physical->externalDesktopNativeIngress : ExternalDesktopNativeIngressPtr{};
+    if (!mExternalDesktopIngressAvailable || !sourceIngress || sourceIngress->mOwner != mExternalDesktopIngressOwner ||
+        (sourceIngress->mKind != ExternalDesktopNativeIngress::Kind::NOTIFY_MOTION &&
+         sourceIngress->mKind != ExternalDesktopNativeIngress::Kind::TEST_DOUBLE) ||
+        (destinationNative && (!destinationIngress || destinationIngress->mOwner != mExternalDesktopIngressOwner ||
+            destinationIngress->mKind != sourceIngress->mKind ||
+            destinationIngress->mOrdinal > sourceIngress->mOrdinal ||
+            (destinationIngress->mOrdinal == sourceIngress->mOrdinal && destinationNative->physical != cap.mPhysicalOrigin) ||
+            destinationNative->resolved->eventTime > physical.eventTime))) {
+        return android::base::Error() << "Native ingress cannot prove source at least as new as delivered recipient";
+    }
+    Ids nativeIds;
+    if (!ExternalDesktopPointerOwnership::idsOf(physical.pointerProperties, nativeIds) ||
+        physical.pointerProperties.size() != physical.pointerCoords.size() ||
+        (cap.mSelected & ~nativeIds).any()) {
+        return android::base::Error() << "Successful native physical source does not cover selected IDs";
+    }
+    for (const auto& point : physical.pointerCoords) {
+        if (BitSet64::count(point.bits) > point.values.size()) {
+            return android::base::Error() << "Physical coordinate axis capacity exceeded";
+        }
+    }
+    // No scalar alias lets one presentation steal an already-owned ID/key in
+    // another Connection. Same-Connection removes only the selected old IDs.
+    const auto oldDestinationReferences = destination->externalDesktopStreamReferences(cap.mOldKey);
+    if (source != destination && (!oldDestinationReferences.valid ||
+        destination->inputState.hasExternalDesktopStream(cap.mOldKey) ||
+        oldDestinationReferences.queuedPackets != 0 || oldDestinationReferences.sentPackets != 0 ||
+        destination->externalDesktopPublishedMotion.livePointers(cap.mOldKey) != 0)) {
+        return android::base::Error() << "Old ownership also exists in destination";
+    }
+    auto result = std::make_unique<ExternalDesktopPreparedTransfer>();
+    result->capability = &cap; result->source = source; result->destination = destination;
+    auto closing = prepareExternalDesktopCloseLocked(source, cap.mOldKey, cap.mSelected,
+            cap.mPhysicalOrigin->externalDesktopPhysicalPacket);
+    if (!closing.ok()) return android::base::Error() << closing.error();
+    result->closing = std::move(*closing);
+    auto from = source->prepareExternalDesktopQueueChange(cap.mOldKey, true, cap.mSelected);
+    if (!from.ok()) return android::base::Error() << from.error();
+    result->sourcePlan = std::move(*from);
+    if (source != destination) {
+        auto to = destination->prepareExternalDesktopQueueChange(cap.mOldKey, true);
+        if (!to.ok()) return android::base::Error() << to.error();
+        result->destinationPlan = std::move(*to);
+    }
+    auto& targetPlan = source == destination ? *result->sourcePlan : *result->destinationPlan;
+    const auto* delivered = destination->externalDesktopDeliveredMotionForReplay();
+    if (!delivered) return android::base::Error() << "Destination delivered coverage unavailable";
+    auto preview = delivered->copyExternalDesktopMotionProjection();
+    if (!preview.ok()) return android::base::Error() << preview.error();
+    auto samePhysical = [&](const MotionEntry& event) {
+        return event.deviceId == physical.deviceId && event.source == physical.source &&
+                (isMouseOrTouchpad(event.source) || event.displayId == physical.displayId ||
+                 event.displayId == cap.mTo.immutableInfo.displayId);
+    };
+    struct Sample final {
+        std::shared_ptr<const MotionEntry> physical;
+        const DispatchEntry* destination = nullptr;
+        bool source = false;
+        std::array<std::optional<size_t>, 2> predecessor{};
+    };
+    std::vector<Sample> samples;
+    samples.reserve(source->outboundQueue.size() + destination->outboundQueue.size());
+    auto addSample = [&](const DispatchEntry& packet, bool isDestination, bool isSource) -> android::base::Result<void> {
+        if (packet.eventEntry->type != EventEntry::Type::MOTION) return {};
+        const auto& event = static_cast<const MotionEntry&>(*packet.eventEntry);
+        if (!samePhysical(event)) return {};
+        Ids packetIds;
+        if (!ExternalDesktopPointerOwnership::idsOf(event.pointerProperties, packetIds)) {
+            return android::base::Error() << "Queued rebind roster invalid";
+        }
+        if (!isDestination) {
+            bool selected = false;
+            for (size_t id = 0; id < ExternalDesktopPointerOwnership::kMaxIds; ++id) {
+                selected |= cap.mSelected.test(id) && packetIds.test(id) &&
+                        ExternalDesktopPointerOwnership::keyAt(packet.externalDesktopPointerOwnership, static_cast<int32_t>(id)) == cap.mOldKey;
+            }
+            if (!selected) return {};
+        }
+        if (packet.externalDesktopHoverRetirement || !packet.externalDesktopPhysicalMotionOrigin) {
+            return android::base::Error() << "Queued native origin/order unavailable for trusted replay";
+        }
+        const auto origin = packet.externalDesktopPhysicalMotionOrigin;
+        if (!validOrigin(*origin) || origin->deviceId != event.deviceId || origin->source != event.source ||
+            origin->eventTime != event.eventTime) {
+            return android::base::Error() << "Queued target no longer matches native physical packet";
+        }
+        const auto& ingress = origin->externalDesktopNativeIngress;
+        if (!ingress || ingress->mOwner != mExternalDesktopIngressOwner || ingress->mKind != sourceIngress->mKind ||
+            (isSource && (ingress->mOrdinal < sourceIngress->mOrdinal || origin->eventTime < saved->eventTime))) {
+            return android::base::Error() << "Queued origin cannot be joined to this native ingress order";
+        }
+        const auto found = std::find_if(samples.begin(), samples.end(),
+                [&](const auto& sample) { return sample.physical == origin; });
+        if (found != samples.end()) {
+            if (isDestination && found->destination) return android::base::Error() << "Duplicate destination physical packet";
+            if (isDestination) found->destination = &packet;
+            found->source |= isSource;
+        } else samples.push_back({origin, isDestination ? &packet : nullptr, isSource, {}});
+        return {};
+    };
+    for (const auto& packet : source->outboundQueue) {
+        auto added = addSample(*packet, source == destination, true);
+        if (!added.ok()) return android::base::Error() << added.error();
+    }
+    if (source != destination) for (const auto& packet : destination->outboundQueue) {
+        auto added = addSample(*packet, true, false);
+        if (!added.ok()) return android::base::Error() << added.error();
+    }
+    // Join native ingress and both actual queue orders. Timestamps/event IDs
+    // are not ordinals. Distinct origins cannot share one ticket ordinal.
+    const std::array<const Connection*, 2> queueOwners{source.get(), destination.get()};
+    for (size_t owner = 0; owner < queueOwners.size(); ++owner) {
+        std::optional<size_t> previous;
+        for (const auto& packet : queueOwners[owner]->outboundQueue) {
+            const auto found = std::find_if(samples.begin(), samples.end(), [&](const auto& sample) {
+                return sample.physical == packet->externalDesktopPhysicalMotionOrigin;
+            });
+            if (found == samples.end()) continue;
+            const size_t index = static_cast<size_t>(found - samples.begin());
+            if (previous && *previous != index) found->predecessor[owner] = previous;
+            previous = index;
+        }
+    }
+    std::vector<Sample> ordered; ordered.reserve(samples.size());
+    std::vector<bool> emitted(samples.size());
+    while (ordered.size() != samples.size()) {
+        std::optional<size_t> selected;
+        bool tie = false;
+        for (size_t i = 0; i < samples.size(); ++i) {
+            if (emitted[i] || std::any_of(samples[i].predecessor.begin(), samples[i].predecessor.end(),
+                    [&](const auto& p) { return p && !emitted[*p]; })) continue;
+            if (!selected || samples[i].physical->externalDesktopNativeIngress->mOrdinal <
+                    samples[*selected].physical->externalDesktopNativeIngress->mOrdinal) {
+                selected = i; tie = false;
+            } else if (samples[i].physical->externalDesktopNativeIngress->mOrdinal ==
+                       samples[*selected].physical->externalDesktopNativeIngress->mOrdinal) tie = true;
+        }
+        if (!selected || tie || (!ordered.empty() &&
+                samples[*selected].physical->externalDesktopNativeIngress->mOrdinal <
+                        ordered.back().physical->externalDesktopNativeIngress->mOrdinal)) {
+            return android::base::Error() << "Native source/destination queue order cannot be joined exactly";
+        }
+        emitted[*selected] = true;
+        ordered.push_back(std::move(samples[*selected]));
+    }
+    samples = std::move(ordered);
+    if (samples.size() + targetPlan.mQueue.size() + cap.mSelected.count() > Connection::kExternalDesktopMaxPreparedQueuePackets) {
+        return android::base::Error() << "Bounded transfer queue reservation unavailable";
+    }
+    std::deque<std::unique_ptr<DispatchEntry>> queue;
+    std::vector<size_t> reuse;
+    reuse.reserve(samples.size() + targetPlan.mQueue.size() + cap.mSelected.count());
+    targetPlan.mDerived.reserve(targetPlan.mDerived.size() + samples.size() + cap.mSelected.count());
+    auto append = [&](std::unique_ptr<DispatchEntry> packet, size_t index,
+                      const DispatchEntry* borrowed) -> android::base::Result<void> {
+        const auto& value = packet ? *packet : *borrowed;
+        if (value.eventEntry->type == EventEntry::Type::MOTION) {
+            const auto& event = static_cast<const MotionEntry&>(*value.eventEntry);
+            auto next = value.externalDesktopRebindArrival ? (*preview)->prepareExternalDesktopRebindArrival(value) :
+                    value.externalDesktopHoverRetirement ? (*preview)->prepareExternalDesktopHoverRetirement(value) :
+                    (*preview)->prepareExternalDesktopPublishedMotion(event, value.resolvedMotionFlags);
+            if (!next.ok()) return android::base::Error() << next.error();
+            preview = std::move(next);
+        }
+        queue.push_back(std::move(packet)); reuse.push_back(index);
+        return {};
+    };
+    Ids transferred;
+    const auto& target = *cap.mDestinationTarget;
+    auto emit = [&](const std::shared_ptr<const MotionEntry>& origin, Ids keep,
+                    int32_t action, nsecs_t downTime,
+                    const ExternalDesktopPointerOwnershipPtr& previousOwners,
+                    Ids added = Ids{}) -> android::base::Result<void> {
+        base::ScopedLockAssertion assumeLocked(mLock);
+        Ids available;
+        if (!ExternalDesktopPointerOwnership::idsOf(origin->pointerProperties, available) ||
+            (keep & ~available).any() || keep.none() ||
+            keep.count() > MAX_POINTERS ||
+            origin->pointerCoords.size() != origin->pointerProperties.size() ||
+            (!target.useDefaultPointerTransform() && (keep & ~target.getPointerIds()).any())) {
+            return android::base::Error() << "Trusted destination/native origin does not cover peer roster";
+        }
+        for (const auto& point : origin->pointerCoords) {
+            if (BitSet64::count(point.bits) > point.values.size()) return android::base::Error() << "Native origin axes invalid";
+        }
+        auto finiteTransform = [](const ui::Transform& transform) {
+            const auto matrix = transform.asMatrix4();
+            for (size_t column = 0; column < 4; ++column) for (size_t row = 0; row < 4; ++row) {
+                if (!std::isfinite(matrix[column][row])) return false;
+            }
+            return std::isfinite(transform.det()) && transform.det() != 0;
+        };
+        if (!std::isfinite(target.globalScaleFactor) || target.globalScaleFactor <= 0 ||
+            !finiteTransform(target.rawTransform)) {
+            return android::base::Error() << "Trusted destination scale/raw projection unavailable";
+        }
+        for (size_t id = 0; id < ExternalDesktopPointerOwnership::kMaxIds; ++id) if (keep.test(id)) {
+            const auto& transform = target.useDefaultPointerTransform() ? target.getDefaultPointerTransform() :
+                    target.getTransformForPointer(static_cast<int32_t>(id));
+            if (!finiteTransform(transform)) return android::base::Error() << "Destination pointer projection singular/nonfinite";
+        }
+        std::vector<PointerProperties> properties;
+        std::vector<PointerCoords> coords;
+        std::array<ExternalDesktopPointerOwnership::Row, ExternalDesktopPointerOwnership::kMaxIds> rows;
+        size_t count = 0;
+        for (size_t i = 0; i < origin->pointerProperties.size(); ++i) {
+            const auto property = origin->pointerProperties[i];
+            if (!keep.test(property.id)) continue;
+            const auto owner = transferred.test(property.id) ? std::make_optional(cap.mNewKey) :
+                    ExternalDesktopPointerOwnership::keyAt(previousOwners, property.id);
+            if (ExternalDesktopPointerOwnership::keyAt(target.getExternalDesktopPointerOwnership(), property.id) != owner) {
+                return android::base::Error() << "Trusted target retags a nonselected peer or lacks new lifetime";
+            }
+            properties.push_back(property); coords.push_back(origin->pointerCoords[i]);
+            rows[count++] = {property.id, owner};
+        }
+        auto owners = ExternalDesktopPointerOwnership::create(std::span<const ExternalDesktopPointerOwnership::Row>(rows.data(), count));
+        if (!owners.ok()) return android::base::Error() << owners.error();
+        auto event = std::make_shared<MotionEntry>(mIdGenerator.nextId(), added.any() ? nullptr : origin->injectionState,
+                origin->eventTime, origin->deviceId, origin->source, resolvedDisplay, origin->policyFlags,
+                action, added.any() ? 0 : origin->actionButton, origin->flags, origin->metaState, origin->buttonState,
+                origin->classification, origin->xPrecision, origin->yPrecision, origin->xCursorPosition,
+                origin->yCursorPosition, downTime, properties, coords);
+        event->externalDesktopPointerOwnership = std::move(*owners);
+        auto packet = createDispatchEntry(mIdGenerator, target, event, target.flags,
+                                          cap.mDestinationVsyncId, nullptr);
+        if (!packet) return android::base::Error() << "Actual destination dispatch projection refused";
+        packet->externalDesktopPhysicalMotionOrigin = origin;
+        packet->externalDesktopSubmissionReservation = target.getExternalDesktopSubmissionReservation();
+        const auto projectedEvent = packet->eventEntry;
+        auto reserved = filterExternalDesktopSubmissionLocked(destination, *packet, origin->externalDesktopPhysicalPacket);
+        if (!reserved.ok() || packet->eventEntry != projectedEvent) {
+            return android::base::Error() << "Trusted destination exact reservation unavailable";
+        }
+        // These are the same security bits applied by enqueue's AS_IS resolver.
+        // Never carry source-window obscuration or guess ZERO_COORDS geometry.
+        auto flags = event->flags;
+        if (target.flags.test(InputTarget::Flags::WINDOW_IS_OBSCURED)) flags |= MotionFlag::WINDOW_IS_OBSCURED;
+        if (target.flags.test(InputTarget::Flags::WINDOW_IS_PARTIALLY_OBSCURED)) flags |= MotionFlag::WINDOW_IS_PARTIALLY_OBSCURED;
+        if (target.flags.test(InputTarget::Flags::NO_FOCUS_CHANGE)) flags |= MotionFlag::NO_FOCUS_CHANGE;
+        packet->resolvedMotionFlags = flags;
+        if (mTracer && !origin->traceTracker) return android::base::Error() << "Missing actual native trace origin";
+        // createDispatchEntry may normalize into a second owned MotionEntry.
+        auto resolved = std::const_pointer_cast<MotionEntry>(std::static_pointer_cast<const MotionEntry>(packet->eventEntry));
+        if (added.any()) {
+            packet->externalDesktopRebindArrival = ExternalDesktopRebindArrivalPtr(new ExternalDesktopRebindArrival(
+                    source, destination, cap.mSubmission, cap.mOldKey, cap.mNewKey,
+                    keep & ~added, added, previousOwners, resolved, origin, packet->seq,
+                    &destination->externalDesktopPublishedMotion, 0, packet->transform, packet->rawTransform,
+                    packet->globalScaleFactor, packet->targetFlags, packet->resolvedMotionFlags,
+                    packet->targetUid, packet->vsyncId, packet->windowId));
+        }
+        targetPlan.mDerived.push_back({resolved, origin, true});
+        return append(std::move(packet), Connection::kExternalDesktopMaxPreparedQueuePackets, nullptr);
+    };
+    bool arrived = false;
+    auto arrive = [&]() -> android::base::Result<void> {
+        if (arrived) return {};
+        auto before = (*preview)->copyExternalDesktopPhysicalMotionSnapshotForOwner(probe, saved->hovering);
+        if (!before.ok()) return android::base::Error() << before.error();
+        const auto& snapshot = *before;
+        ExternalDesktopPointerOwnershipPtr peers = snapshot ? snapshot->externalDesktopPointerOwnership : nullptr;
+        Ids ids;
+        if (snapshot && !ExternalDesktopPointerOwnership::idsOf(snapshot->pointerProperties, ids)) return android::base::Error() << "Destination peer IDs invalid";
+        if ((ids & cap.mSelected).any()) return android::base::Error() << "Destination already owns a selected pointer ID";
+        nsecs_t downTime = saved->hovering ? saved->downTime :
+                (snapshot ? snapshot->downTime : saved->eventTime);
+        if (downTime < 0) return android::base::Error() << "Destination peer downTime unavailable";
+        if (saved->hovering) {
+            const bool empty = ids.none();
+            transferred = cap.mSelected;
+            ids |= transferred;
+            auto status = emit(cap.mPhysicalOrigin, ids, empty ? AMOTION_EVENT_ACTION_HOVER_ENTER :
+                    AMOTION_EVENT_ACTION_HOVER_MOVE, downTime, peers, transferred);
+            if (!status.ok()) return android::base::Error() << status.error();
+            arrived = true;
+            return {};
+        }
+        for (const auto& property : physical.pointerProperties) {
+            if (!cap.mSelected.test(property.id)) continue;
+            const bool first = ids.none(); ids.set(property.id); transferred.set(property.id);
+            size_t index = 0;
+            for (const auto& p : physical.pointerProperties) {
+                if (!ids.test(p.id)) continue;
+                if (p.id == property.id) break;
+                ++index;
+            }
+            const int32_t action = first ? AMOTION_EVENT_ACTION_DOWN : AMOTION_EVENT_ACTION_POINTER_DOWN |
+                    (static_cast<int32_t>(index) << AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+            Ids added; added.set(property.id);
+            auto status = emit(cap.mPhysicalOrigin, ids, action, downTime, peers, added);
+            if (!status.ok()) return android::base::Error() << status.error();
+            peers = target.getExternalDesktopPointerOwnership();
+        }
+        arrived = true; return {};
+    };
+    size_t sampleIndex = 0;
+    auto replaySample = [&](const Sample& sample) -> android::base::Result<void> {
+        if (sample.physical->externalDesktopNativeIngress->mOrdinal < sourceIngress->mOrdinal) {
+            // A real recipient backlog older than the successful source must
+            // stay BEFORE arrival. Reusing its exact packet/context preserves
+            // peer actions, keys and geometry; do not merge source XY into it.
+            if (arrived || sample.source || !sample.destination) {
+                return android::base::Error() << "Older native recipient prefix cannot follow a handoff";
+            }
+            const auto found = std::find_if(destination->outboundQueue.begin(), destination->outboundQueue.end(),
+                    [&](const auto& packet) { return packet.get() == sample.destination; });
+            if (found == destination->outboundQueue.end()) return android::base::Error() << "Recipient prefix changed";
+            return append(nullptr, static_cast<size_t>(found - destination->outboundQueue.begin()), sample.destination);
+        }
+        auto started = arrive(); if (!started.ok()) return android::base::Error() << started.error();
+        auto previous = (*preview)->copyExternalDesktopPhysicalMotionSnapshotForOwner(probe, saved->hovering);
+        if (!previous.ok()) return android::base::Error() << previous.error();
+        const auto& snapshot = *previous;
+        ExternalDesktopPointerOwnershipPtr owners = snapshot ? snapshot->externalDesktopPointerOwnership : nullptr;
+        Ids ids;
+        if (snapshot && !ExternalDesktopPointerOwnership::idsOf(snapshot->pointerProperties, ids)) return android::base::Error() << "Replay peer IDs invalid";
+        Ids rawIds;
+        if (!ExternalDesktopPointerOwnership::idsOf(sample.physical->pointerProperties, rawIds)) return android::base::Error() << "Queued native origin IDs invalid";
+        if (sample.destination) {
+            const auto& old = static_cast<const MotionEntry&>(*sample.destination->eventEntry);
+            Ids oldIds; if (!ExternalDesktopPointerOwnership::idsOf(old.pointerProperties, oldIds)) return android::base::Error() << "Destination original IDs invalid";
+            auto oldProjection = MotionEvent::split(sample.physical->action, sample.physical->flags, 0,
+                    sample.physical->pointerProperties, sample.physical->pointerCoords, oldIds,
+                    [&]() { return sample.physical->getDescription(); });
+            if (!oldProjection.ok() || std::get<0>(*oldProjection) != old.action) {
+                return android::base::Error() << "Queued destination has an unrepresented resolved transition";
+            }
+            ids |= oldIds;
+            // Newly queued ordinary/private peers retain their original owner.
+            std::array<ExternalDesktopPointerOwnership::Row, ExternalDesktopPointerOwnership::kMaxIds> rows;
+            size_t count = 0;
+            for (size_t id = 0; id < ExternalDesktopPointerOwnership::kMaxIds; ++id) if (ids.test(id)) {
+                rows[count++] = {static_cast<int32_t>(id), oldIds.test(id) && !cap.mSelected.test(id) ?
+                    ExternalDesktopPointerOwnership::keyAt(old.externalDesktopPointerOwnership, static_cast<int32_t>(id)) :
+                    ExternalDesktopPointerOwnership::keyAt(owners, static_cast<int32_t>(id))};
+            }
+            auto merged = ExternalDesktopPointerOwnership::create(std::span<const ExternalDesktopPointerOwnership::Row>(rows.data(), count));
+            if (!merged.ok()) return android::base::Error() << merged.error();
+            owners = std::move(*merged);
+        }
+        ids |= transferred;
+        if ((ids & ~rawIds).any()) return android::base::Error() << "Physical origin lost a surviving destination pointer";
+        if (ids.none()) return {};
+        auto split = MotionEvent::split(sample.physical->action, sample.physical->flags, 0,
+                sample.physical->pointerProperties, sample.physical->pointerCoords, ids,
+                [&]() { return sample.physical->getDescription(); });
+        if (!split.ok()) return android::base::Error() << split.error();
+        const auto& props = std::get<1>(*split);
+        const int32_t action = std::get<0>(*split);
+        auto status = emit(sample.physical, ids, action,
+                saved->hovering ? saved->downTime :
+                        (snapshot ? snapshot->downTime : saved->eventTime), owners);
+        if (!status.ok()) return android::base::Error() << status.error();
+        const int32_t masked = MotionEvent::getActionMasked(action);
+        if (masked == AMOTION_EVENT_ACTION_UP || masked == AMOTION_EVENT_ACTION_CANCEL ||
+            masked == AMOTION_EVENT_ACTION_HOVER_EXIT) transferred.reset();
+        else if (masked == AMOTION_EVENT_ACTION_POINTER_UP) transferred.reset(props[MotionEvent::getActionIndex(action)].id);
+        return {};
+    };
+    for (size_t i = 0; i < targetPlan.mQueue.size(); ++i) {
+        auto& replacement = targetPlan.mQueue[i];
+        const DispatchEntry* packet = replacement ? replacement.get() : destination->outboundQueue[targetPlan.mReuse[i]].get();
+        const bool motion = packet->eventEntry->type == EventEntry::Type::MOTION;
+        const auto* event = motion ? static_cast<const MotionEntry*>(packet->eventEntry.get()) : nullptr;
+        const bool cancellation = std::find(targetPlan.mCancellations.begin(), targetPlan.mCancellations.end(), packet) != targetPlan.mCancellations.end();
+        if (event && samePhysical(*event) && !cancellation) {
+            if (!packet->externalDesktopPhysicalMotionOrigin || !packet->externalDesktopPhysicalMotionOrigin->externalDesktopNativeIngress) {
+                return android::base::Error() << "Target queue lost its native ingress witness";
+            }
+            while (sampleIndex < samples.size() && samples[sampleIndex].physical->externalDesktopNativeIngress->mOrdinal <=
+                    packet->externalDesktopPhysicalMotionOrigin->externalDesktopNativeIngress->mOrdinal) {
+                auto status = replaySample(samples[sampleIndex++]);
+                if (!status.ok()) return android::base::Error() << status.error();
+            }
+            continue; // replaced using exact native origin, not edited shared data
+        }
+        auto status = append(std::move(replacement), targetPlan.mReuse[i], packet);
+        if (!status.ok()) return android::base::Error() << status.error();
+    }
+    while (sampleIndex < samples.size()) {
+        auto status = replaySample(samples[sampleIndex++]);
+        if (!status.ok()) return android::base::Error() << status.error();
+    }
+    auto started = arrive(); if (!started.ok()) return android::base::Error() << started.error();
+    targetPlan.mQueue = std::move(queue); targetPlan.mReuse = std::move(reuse);
+    std::erase_if(targetPlan.mDerived, [&](const auto& binding) {
+        return std::none_of(targetPlan.mQueue.begin(), targetPlan.mQueue.end(), [&](const auto& packet) {
+            return packet && packet->eventEntry.get() == binding.event.get();
+        });
+    });
+    auto valid = destination->replayExternalDesktopPreparedQueue(targetPlan);
+    if (!valid.ok()) return android::base::Error() << valid.error();
+    if (!source->canCommitExternalDesktopUnsentRemoval(*result->sourcePlan) ||
+        (result->destinationPlan && !destination->canCommitExternalDesktopUnsentRemoval(*result->destinationPlan)) ||
+        !isExternalDesktopTransferCurrentLocked(cap, source, destination) ||
+        !result->closing || !canSealExternalDesktopCloseLocked(*result->closing)) {
+        return android::base::Error() << "Transfer owner changed during preparation";
+    }
+    return result;
+}
+
+android::base::Result<void> InputDispatcher::commitExternalDesktopTrustedTransferLocked(ExternalDesktopPreparedTransfer& plan) {
+    auto* cap = plan.capability;
+    if (!cap || !isExternalDesktopTransferCurrentLocked(*cap, plan.source, plan.destination) ||
+        !plan.sourcePlan || !plan.closing || !canSealExternalDesktopCloseLocked(*plan.closing) ||
+        !plan.source->canCommitExternalDesktopUnsentRemoval(*plan.sourcePlan) ||
+        (plan.source != plan.destination && (!plan.destinationPlan ||
+            !plan.destination->canCommitExternalDesktopUnsentRemoval(*plan.destinationPlan)))) {
+        return android::base::Error() << "Stale trusted two-owner queue transaction";
+    }
+    const std::array<Connection::ExternalDesktopPreparedUnsentRemoval*, 2> values{
+            plan.sourcePlan.get(), plan.destinationPlan.get()};
+    // Check every fallible trace prerequisite BEFORE either real owner mutates.
+    if (mTracer) for (auto* value : values) if (value) for (const auto& binding : value->mDerived) {
+        if (!binding.original || !binding.original->traceTracker) return android::base::Error() << "Missing immutable transfer trace provenance";
+    }
+    // Stock transfer creates a NEW synthetic trace context: a completed native
+    // source cookie cannot acquire a new UID/privacy target through a derived
+    // cookie. Keep native physical provenance separately, and use the existing
+    // actual synthetic-event tracer for these newly generated destination rows.
+    ScopedSyntheticEventTracer transferTrace(mTracer);
+    if (mTracer) mTracer->dispatchToTargetHint(*transferTrace.getTracker(), *cap->mDestinationTarget);
+    if (mTracer) for (auto* value : values) if (value) for (auto& binding : value->mDerived) {
+        binding.event->traceTracker = mTracer->traceDerivedEvent(*binding.event,
+                binding.transferSynthesized ? *transferTrace.getTracker() : *binding.original->traceTracker);
+    }
+    // Both plans were checked under one dispatcher lock. These commits contain
+    // only swaps/moves; there is no second fallible half after the first swap.
+    // Seal the exact owned selected rows FIRST: stale inbound/target work can
+    // never resurrect them after the atomic cancellation/arrival queue swap.
+    sealExternalDesktopCloseUncheckedLocked(*plan.closing);
+    plan.source->commitExternalDesktopPreparedQueueUnchecked(*plan.sourcePlan);
+    if (plan.destinationPlan) plan.destination->commitExternalDesktopPreparedQueueUnchecked(*plan.destinationPlan);
+    cap->mConsumed = true;
+    for (auto* value : values) if (value) for (const auto* packet : value->mFreshPackets) {
+        if (packet->hasForegroundTarget()) incrementPendingForegroundDispatches(*packet->eventEntry);
+    }
+    for (auto* value : values) if (value) for (auto& packet : value->mQueue) {
+        if (packet) releaseDispatchEntry(std::move(packet));
+    }
+    traceOutboundQueueLength(*plan.source);
+    if (plan.source != plan.destination) traceOutboundQueueLength(*plan.destination);
+    plan.capability = nullptr;
+    // QUEUED only. Sent/wait entries, delivered evidence, ACK tails, physical
+    // release/retirement proofs remain deliberately unavailable. Closing rows
+    // are retained; ordinary geometry refresh cannot reopen their identity.
+    return {};
+}
+
+android::base::Result<void> InputDispatcher::removeExternalDesktopUnpublishedStreamLocked(
+        const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key) {
+    return commitExternalDesktopQueueChangeLocked(connection, key, /*cancelCurrent=*/false);
+}
+
+android::base::Result<void> InputDispatcher::queueExternalDesktopSavedCancellationLocked(
+        const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key) {
+    return commitExternalDesktopQueueChangeLocked(connection, key, /*cancelCurrent=*/true);
+}
+
+android::base::Result<void> InputDispatcher::commitExternalDesktopQueueChangeLocked(
+        const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key,
+        bool cancelCurrent,std::shared_ptr<const ExternalDesktopClosingHandle> closing) {
+    if (!connection) return android::base::Error() << "Missing native connection owner";
+    auto prepared = cancelCurrent ? connection->prepareExternalDesktopSavedCancellation(key) :
+                                    connection->prepareExternalDesktopUnsentRemoval(key);
+    if (!prepared.ok()) return android::base::Error() << prepared.error();
+    auto& value = **prepared;
+    if (!connection->canCommitExternalDesktopUnsentRemoval(value)) {
+        return android::base::Error() << "Stale native queue preparation";
+    }
+    // Derive only NEW owned events from the original immutable trace envelope.
+    // Target/privacy hints already belong to that exact queued target. Never
+    // invent a new WindowInfo/current-geometry hint or mutate a shared cookie.
+    if (mTracer) {
+        for (const auto& binding : value.mDerived) {
+            if (!binding.original->traceTracker) {
+                return android::base::Error() << "Missing original native trace witness";
+            }
+        }
+        for (auto& binding : value.mDerived) {
+            binding.event->traceTracker = mTracer->traceDerivedEvent(
+                    *binding.event, *binding.original->traceTracker);
+        }
+    }
+    if (closing) {
+        if (!cancelCurrent || !closing->mSealed) return android::base::Error()<<"Unsealed closing tail";
+        for (auto* packet:value.mFreshPackets) {
+            if (std::find(value.mCancellations.begin(),value.mCancellations.end(),packet)==value.mCancellations.end()) continue;
+            // Capability binds THIS actual queued object/seq/immutable event.
+            packet->externalDesktopClosingTail=std::shared_ptr<const ExternalDesktopClosingTail>(new ExternalDesktopClosingTail(
+                packet,packet->seq,packet->eventEntry.get(),connection,closing));
+        }
+    }
+    if (!connection->commitExternalDesktopUnsentRemoval(value)) {
+        return android::base::Error() << "Queue/checkpoint changed before native commit";
+    }
+    // The old references are still retained under mLock. Add replacement
+    // foreground references BEFORE releasing originals, so a split cannot
+    // transiently signal injection completion. Unchanged queue entries move
+    // with their original seq/reference; sent/wait entries are never touched.
+    for (const auto* packet : value.mFreshPackets) {
+        if (packet->hasForegroundTarget()) incrementPendingForegroundDispatches(*packet->eventEntry);
+    }
+    for (auto& packet : value.mQueue) {
+        if (packet) releaseDispatchEntry(std::move(packet));
+    }
+    traceOutboundQueueLength(*connection);
+    // A saved cancel is only QUEUED here. No scheduling, successful delivery,
+    // ACK, teardown, fresh FD or retirement proof is synthesized.
+    return {};
+}
+#endif
 
 void InputDispatcher::releaseDispatchEntry(std::unique_ptr<DispatchEntry> dispatchEntry) {
     if (dispatchEntry->hasForegroundTarget()) {
@@ -4362,8 +6072,16 @@ void InputDispatcher::synthesizeCancellationEventsForConnectionLocked(
                          pointerIndex++) {
                         pointerIds.set(motionEntry.pointerProperties[pointerIndex].id);
                     }
-                    if (mDragState && mDragState->dragWindow->getToken() == token &&
-                        pointerIds.test(mDragState->pointerId)) {
+                    bool cancelDrag = mDragState && mDragState->dragWindow->getToken() == token &&
+                            pointerIds.test(mDragState->pointerId);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                    if (cancelDrag && options.externalDesktopStream) {
+                        cancelDrag = ExternalDesktopPointerOwnership::keyAt(motionEntry.externalDesktopPointerOwnership,
+                                                                   mDragState->pointerId) == options.externalDesktopStream &&
+                                (!options.pointerIds || options.pointerIds->test(mDragState->pointerId));
+                    }
+#endif
+                    if (cancelDrag) {
                         LOG(INFO) << __func__
                                   << ": Canceling drag and drop because the pointers for the drag "
                                      "window are being canceled.";
@@ -4507,6 +6225,13 @@ void InputDispatcher::synthesizePointerDownEventsForConnectionLocked(
 std::unique_ptr<MotionEntry> InputDispatcher::splitMotionEvent(
         const MotionEntry& originalMotionEntry, std::bitset<MAX_POINTER_ID + 1> pointerIds,
         nsecs_t splitDownTime) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    if (originalMotionEntry.externalDesktopPointerOwnership &&
+        (!originalMotionEntry.externalDesktopPointerOwnership->matches(originalMotionEntry.pointerProperties) ||
+         originalMotionEntry.pointerCoords.size() != originalMotionEntry.pointerProperties.size())) {
+        return nullptr;
+    }
+#endif
     const auto& result =
             MotionEvent::split(originalMotionEntry.action, originalMotionEntry.flags,
                                /*historySize=*/0, originalMotionEntry.pointerProperties,
@@ -4564,6 +6289,12 @@ std::unique_ptr<MotionEntry> InputDispatcher::splitMotionEvent(
                                           originalMotionEntry.xCursorPosition,
                                           originalMotionEntry.yCursorPosition, splitDownTime,
                                           pointerProperties, pointerCoords);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    auto selected = ExternalDesktopPointerOwnership::select(originalMotionEntry.externalDesktopPointerOwnership,
+                                                   pointerProperties);
+    if (!selected.ok()) return nullptr;
+    splitMotionEntry->externalDesktopPointerOwnership = std::move(*selected);
+#endif
     if (mTracer) {
         splitMotionEntry->traceTracker =
                 mTracer->traceDerivedEvent(*splitMotionEntry, *originalMotionEntry.traceTracker);
@@ -4753,6 +6484,37 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs& args) {
     uint32_t policyFlags = args.policyFlags;
     policyFlags |= POLICY_FLAG_TRUSTED;
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Declared BEFORE every raw/callback owner: on ALL exits, including a
+    // consuming filter, they are destroyed before the final completion wake.
+    // The guard is local to this live notify call; the shared counter never
+    // captures a dispatcher pointer which could outlive the dispatcher.
+    const auto retirementFinished = android::base::make_scope_guard(
+            [this] { finishExternalDesktopNotifyCallback(); });
+    std::unique_ptr<ExternalDesktopCallbackInFlight> callbackInFlight;
+    ExternalDesktopNativeIngressPtr nativeIngress;
+    ExternalDesktopPhysicalPacketPtr nativePhysical;
+    {
+        std::scoped_lock ingressLock(mLock);
+        // Observe native entry BEFORE external policy/filter callbacks can
+        // delay it. Return order/time/event IDs never replace this ticket.
+        nativeIngress = allocateExternalDesktopIngressLocked(ExternalDesktopNativeIngress::Kind::NOTIFY_MOTION);
+        const auto& callbacks = mExternalDesktopSubmissionLedger.mCallbacks;
+        if (callbacks->load() >= ExternalDesktopSubmissionLedger::kMaxPhysicalPointers) {
+            mExternalDesktopSubmissionLedger.mCoverageAvailable = false;
+        } else {
+            callbackInFlight.reset(new ExternalDesktopCallbackInFlight(callbacks));
+        }
+        // Validated raw notify, BEFORE either external callback can delay it.
+        // Policy filtering/injection never advances this physical state.
+        const MotionEntry raw(args.id, nullptr, args.eventTime, args.deviceId, args.source,
+                args.displayId, policyFlags, args.action, args.actionButton,
+                ftl::Flags<MotionFlag>(args.flags), args.metaState, args.buttonState,
+                args.classification, args.xPrecision, args.yPrecision, args.xCursorPosition,
+                args.yCursorPosition, args.downTime, args.pointerProperties, args.pointerCoords);
+        nativePhysical = observeExternalDesktopPhysicalMotionLocked(raw);
+    }
+#endif
     android::base::Timer t;
     mPolicy.interceptMotionBeforeQueueing(args.displayId, args.source, args.action, args.eventTime,
                                           policyFlags);
@@ -4806,6 +6568,10 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs& args) {
                                               args.xCursorPosition, args.yCursorPosition,
                                               args.downTime, args.pointerProperties,
                                               args.pointerCoords);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        newEntry->externalDesktopNativeIngress = std::move(nativeIngress);
+        newEntry->externalDesktopPhysicalPacket = std::move(nativePhysical);
+#endif
         if (mTracer) {
             newEntry->traceTracker = mTracer->traceInboundEvent(*newEntry);
         }
@@ -4881,6 +6647,9 @@ void InputDispatcher::notifyDeviceReset(const NotifyDeviceResetArgs& args) {
     bool needWake = false;
     { // acquire lock
         std::scoped_lock _l(mLock);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        observeExternalDesktopPhysicalResetLocked(args.deviceId);
+#endif
 
         std::unique_ptr<DeviceResetEntry> newEntry =
                 std::make_unique<DeviceResetEntry>(args.id, args.eventTime, args.deviceId);
@@ -5562,7 +7331,8 @@ sp<WindowInfoHandle> InputDispatcher::DispatcherWindowInfo::findWindowHandleOnDi
 
 bool InputDispatcher::DispatcherTouchState::canWindowReceiveMotion(
         const sp<android::gui::WindowInfoHandle>& window,
-        const android::inputdispatcher::MotionEntry& motionEntry) const {
+        const android::inputdispatcher::MotionEntry& motionEntry,
+        std::optional<size_t> pointerIndex) const {
     const WindowInfo& info = *window->getInfo();
 
     if (info.touchOcclusionMode == TouchOcclusionMode::USE_OPACITY && info.alpha < 0.5f) {
@@ -5600,7 +7370,7 @@ bool InputDispatcher::DispatcherTouchState::canWindowReceiveMotion(
     }
 
     // Drop events that can't be trusted due to occlusion
-    const auto [x, y] = resolveTouchedPosition(motionEntry);
+    const auto [x, y] = resolveTouchedPosition(motionEntry,pointerIndex);
     DispatcherWindowInfo::TouchOcclusionInfo occlusionInfo =
             mWindowInfos.computeTouchOcclusionInfo(window, x, y);
     if (!mWindowInfos.isTouchTrusted(occlusionInfo)) {
@@ -5684,6 +7454,93 @@ void InputDispatcher::updateWindowHandlesForDisplayLocked(
     mWindowInfos.setWindowHandlesForDisplay(displayId, std::move(newHandles));
 }
 
+bool InputDispatcher::cancelKeysForDroppedWindowLocked(
+        const std::shared_ptr<Connection>& savedConnection, const sp<WindowInfoHandle>& savedWindow,
+        const sp<IBinder>& savedToken, int32_t savedWindowId, ui::LogicalDisplayId displayId,
+        bool wasFocusedDisplay) {
+    // updateWindowHandlesForDisplayLocked mutates matching old handles in place.
+    // Rejoin the pre-update value identity, exact handle AND registered channel;
+    // no missing/foreign recipient may fall back to whichever window now focuses.
+    if (!savedConnection || !savedWindow || !savedToken ||
+            savedConnection->status != Connection::Status::NORMAL ||
+            savedConnection->getToken() != savedToken || savedWindow->getToken() != savedToken ||
+            savedWindow->getId() != savedWindowId || savedWindow->getInfo()->displayId != displayId ||
+            !savedWindow->getInfo()->inputConfig.test(WindowInfo::InputConfig::DROP_INPUT) ||
+            getFocusedWindowHandleLocked(displayId) != savedWindow ||
+            mFocusResolver.getFocusedWindowToken(displayId) != savedToken ||
+            mConnectionManager.getConnection(savedToken) != savedConnection) return false;
+
+    ScopedSyntheticEventTracer traceContext(mTracer);
+    std::vector<std::unique_ptr<EventEntry>> keys;
+    auto selectKeys = [&](ui::LogicalDisplayId keyDisplay) {
+        CancellationOptions options(CancellationOptions::Mode::CANCEL_NON_POINTER_EVENTS,
+                                    "focused window started dropping input", savedWindow,
+                                    traceContext.getTracker());
+        options.displayId = keyDisplay;
+        auto candidates = savedConnection->inputState.synthesizeCancellationEvents(now(), options);
+        for (auto& candidate : candidates) {
+            // CANCEL_NON_POINTER_EVENTS can also select non-pointer MOTION.
+            // This terminal-only path MUST NOT admit those (or caller entries).
+            if (candidate->type == EventEntry::Type::KEY) keys.push_back(std::move(candidate));
+        }
+    };
+    selectKeys(displayId);
+    // INVALID is the event's original display, not the WindowInfo display. It
+    // belongs here only if this was the globally focused display before update.
+    if (wasFocusedDisplay) selectKeys(ui::LogicalDisplayId::INVALID);
+
+    const bool wasEmpty = savedConnection->outboundQueue.empty();
+    for (auto& entry : keys) {
+        auto& key = static_cast<KeyEntry&>(*entry);
+        LOG_ALWAYS_FATAL_IF(key.action != AKEY_EVENT_ACTION_UP ||
+                            !(key.flags & AKEY_EVENT_FLAG_CANCELED));
+        auto sameHeldKey = [&](const KeyEntry& other) {
+            return other.deviceId == key.deviceId && other.source == key.source &&
+                    other.displayId == key.displayId && other.keyCode == key.keyCode &&
+                    other.scanCode == key.scanCode && other.downTime == key.downTime;
+        };
+        auto markOldDowns = [&](auto& queue) {
+            for (auto& packet : queue) {
+                if (packet->windowId != savedWindowId || packet->eventEntry->type != EventEntry::Type::KEY) continue;
+                const auto& old = static_cast<const KeyEntry&>(*packet->eventEntry);
+                if (old.action == AKEY_EVENT_ACTION_DOWN && sameHeldKey(old)) packet->keyCanceledByDrop = true;
+            }
+        };
+        markOldDowns(savedConnection->outboundQueue);
+        markOldDowns(savedConnection->waitQueue);
+        auto retireUnselectedRepeat = [&](const std::shared_ptr<const EventEntry>& event) {
+            if (!event || event->type != EventEntry::Type::KEY) return;
+            const auto& pending = static_cast<const KeyEntry&>(*event);
+            if (pending.syntheticRepeat && pending.action == AKEY_EVENT_ACTION_DOWN && sameHeldKey(pending)) {
+                pending.syntheticRepeatCanceledByDrop = true;
+            }
+        };
+        // These queues precede target selection/publication. A generated repeat
+        // can be pending while intercept policy releases mLock; resetKeyRepeat
+        // alone cannot withdraw that existing event. Never mutate already-sent
+        // EventEntry peers: selected packets use their local marker above.
+        retireUnselectedRepeat(mPendingEvent);
+        for (const auto& pending : mInboundQueue) retireUnselectedRepeat(pending);
+        if (const auto& repeat = mKeyRepeatState.lastKeyEntry;
+                repeat && sameHeldKey(*repeat)) {
+            resetKeyRepeatLocked();
+        }
+        if (mTracer) key.traceTracker = mTracer->traceDerivedEvent(key, *traceContext.getTracker());
+        // This is a synthesized UP for an existing recipient memento, not new
+        // key admission. addWindowTargetLocked's claimed-window refusal stays
+        // unchanged for every ordinary/new key and every other cancellation.
+        auto target = createInputTarget(savedConnection, savedWindow, InputTarget::DispatchMode::AS_IS,
+                                        /*targetFlags=*/{},
+                                        mWindowInfos.getRawTransform(*savedWindow->getInfo()), key.downTime);
+        if (mTracer) mTracer->dispatchToTargetHint(*traceContext.getTracker(), target);
+        enqueueDispatchEntryLocked(savedConnection, std::move(entry), target);
+    }
+    if (wasEmpty && !savedConnection->outboundQueue.empty()) {
+        startDispatchCycleLocked(now(), savedConnection);
+    }
+    return true; // selection/enqueue only, NEVER publication/FINISHED or release
+}
+
 /**
  * Called from InputManagerService, update window handle list by displayId that can receive input.
  * A window handle contains information about InputChannel, Touch Region, Types, Focused,...
@@ -5741,6 +7598,15 @@ void InputDispatcher::setInputWindowsLocked(
     const std::vector<sp<WindowInfoHandle>> oldWindowHandles =
             mWindowInfos.getWindowHandlesForDisplay(displayId);
     const sp<WindowInfoHandle> removedFocusedWindowHandle = getFocusedWindowHandleLocked(displayId);
+    // Preserve values BEFORE updateWindowHandlesForDisplayLocked rewrites the
+    // existing handle's WindowInfo. A strong old handle alone is not old state.
+    const sp<IBinder> oldFocusedToken = removedFocusedWindowHandle ?
+            removedFocusedWindowHandle->getToken() : nullptr;
+    const int32_t oldFocusedId = removedFocusedWindowHandle ? removedFocusedWindowHandle->getId() : -1;
+    const bool oldFocusAcceptedInput = removedFocusedWindowHandle &&
+            !removedFocusedWindowHandle->getInfo()->inputConfig.test(WindowInfo::InputConfig::DROP_INPUT);
+    const auto oldFocusedConnection = mConnectionManager.getConnection(oldFocusedToken);
+    const bool wasFocusedDisplay = mFocusedDisplayId == displayId;
 
     updateWindowHandlesForDisplayLocked(windowInfoHandles, displayId);
 
@@ -5751,6 +7617,10 @@ void InputDispatcher::setInputWindowsLocked(
             mFocusResolver.setInputWindows(displayId, windowHandles);
     if (changes) {
         onFocusChangedLocked(*changes, traceContext.getTracker(), removedFocusedWindowHandle);
+    } else if (oldFocusAcceptedInput && removedFocusedWindowHandle->getInfo()->inputConfig.test(
+                                                WindowInfo::InputConfig::DROP_INPUT)) {
+        cancelKeysForDroppedWindowLocked(oldFocusedConnection, removedFocusedWindowHandle,
+                                         oldFocusedToken, oldFocusedId, displayId, wasFocusedDisplay);
     }
 
     const std::list<CancellationOptions> cancellations =
@@ -6160,6 +8030,21 @@ InputDispatcher::DispatcherTouchState::transferTouchGesture(
         return std::nullopt;
     }
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // BEFORE removeWindowByToken/addOrUpdateWindow or wallpaper mutation.
+    // PhaseA has no trusted private ownership-rebind/transfer producer.
+    const bool fromWallpaper = touchedWindow.targetFlags.test(InputTarget::Flags::FOREGROUND) &&
+            fromWindowHandle->getInfo()->inputConfig.test(WindowInfo::InputConfig::DUPLICATE_TOUCH_TO_WALLPAPER);
+    const bool toWallpaper = canReceiveForegroundTouches(*toWindowHandle->getInfo()) &&
+            toWindowHandle->getInfo()->inputConfig.test(WindowInfo::InputConfig::DUPLICATE_TOUCH_TO_WALLPAPER);
+    const sp<WindowInfoHandle> oldWallpaper = fromWallpaper ? state.getWallpaperWindow(deviceId) : nullptr;
+    const sp<WindowInfoHandle> newWallpaper = toWallpaper ? mWindowInfos.findWallpaperWindowBelow(toWindowHandle) : nullptr;
+    for (const auto& window : {fromWindowHandle, toWindowHandle, oldWallpaper, newWallpaper}) {
+        const auto connection = window ? mConnectionManager.getConnection(window->getToken()) : nullptr;
+        if (connection && connection->inputState.hasExternalDesktopPointerOwnership()) return std::nullopt;
+    }
+#endif
+
     LOG_IF(INFO, DEBUG_FOCUS) << __func__ << ": fromWindowHandle=" << fromWindowHandle->getName()
                               << ", toWindowHandle=" << toWindowHandle->getName();
 
@@ -6189,7 +8074,8 @@ InputDispatcher::DispatcherTouchState::transferTouchGesture(
     std::list<CancellationOptions> cancellations;
     std::list<PointerDownArgs> pointerDowns;
     if (fromConnection != nullptr && toConnection != nullptr) {
-        fromConnection->inputState.mergePointerStateTo(toConnection->inputState);
+        LOG_ALWAYS_FATAL_IF(!fromConnection->inputState.mergePointerStateTo(toConnection->inputState),
+                            "Private transfer escaped pre-mutation validation");
         cancellations.emplace_back(CancellationOptions::Mode::CANCEL_POINTER_EVENTS,
                                    "transferring touch from this window to another window",
                                    fromWindowHandle, traceTracker);
@@ -6367,10 +8253,10 @@ void InputDispatcher::dumpDispatchStateLocked(std::string& dump) const {
     // Dump recently dispatched or dropped events from oldest to newest.
     if (!mRecentQueue.empty()) {
         dump += StringPrintf(INDENT "RecentQueue: length=%zu\n", mRecentQueue.size());
-        for (const std::shared_ptr<const EventEntry>& entry : mRecentQueue) {
+        for (const auto& entry : mRecentQueue) {
             dump += INDENT2;
-            dump += entry->getDescription();
-            dump += StringPrintf(", age=%" PRId64 "ms\n", ns2ms(currentTime - entry->eventTime));
+            dump += entry.description;
+            dump += StringPrintf(", age=%" PRId64 "ms\n", ns2ms(currentTime - entry.eventTime));
         }
     } else {
         dump += INDENT "RecentQueue: <empty>\n";
@@ -6743,6 +8629,13 @@ void InputDispatcher::doDispatchCycleFinishedCommand(nsecs_t finishTime,
     auto entryIt = std::find_if(connection->waitQueue.begin(), connection->waitQueue.end(),
                                 [seq](auto& e) { return e->seq == seq; });
     if (entryIt != connection->waitQueue.end()) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        // This exact packet still belongs to waitQueue after any policy unlock.
+        // An unknown/duplicate ACK or a Timeline cannot consume another tail.
+        if (!connection->acknowledgeExternalDesktopSentTail(**entryIt)) {
+            mExternalDesktopSubmissionLedger.mCoverageAvailable = false;
+        }
+#endif
         std::unique_ptr<DispatchEntry> dispatchEntry = std::move(*entryIt);
         connection->waitQueue.erase(entryIt);
 
@@ -6771,6 +8664,12 @@ void InputDispatcher::doDispatchCycleFinishedCommand(nsecs_t finishTime,
             }
         }
         releaseDispatchEntry(std::move(dispatchEntry));
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        // This actual FINISHED packet was identity-checked, removed and
+        // released above. Check ordinary peers too: their terminal raw packet
+        // can retain the same physical identity. Unknown ACKs never prune.
+        if (connection->pruneExternalDesktopQuiescentReplay()) requestExternalDesktopRetirementLocked();
+#endif
     }
 
     // Start the next dispatch cycle for this connection.
@@ -6897,6 +8796,10 @@ void InputDispatcher::doInterceptKeyBeforeDispatchingCommand(const sp<IBinder>& 
         }
     } // acquire lock
 
+    // Policy may have PARKed and then cleared DROP during this unlock. Do not
+    // let its later result revive an already-balanced, pre-routing old repeat.
+    if (entry.syntheticRepeat && entry.syntheticRepeatCanceledByDrop) return;
+
     if (std::holds_alternative<KeyEntry::InterceptKeyResult>(interceptResult)) {
         entry.interceptKeyResult = std::get<KeyEntry::InterceptKeyResult>(interceptResult);
         return;
@@ -6983,8 +8886,23 @@ std::unique_ptr<const KeyEntry> InputDispatcher::afterKeyEventLockedInterruptabl
     std::shared_ptr<const EventEntry> eventEntry = dispatchEntry->eventEntry;
     const bool hasForegroundTarget = dispatchEntry->hasForegroundTarget();
     const KeyEntry& keyEntry = static_cast<const KeyEntry&>(*(eventEntry));
+    const uint32_t seq = dispatchEntry->seq;
+    const auto windowId = dispatchEntry->windowId;
+    const DispatchEntry* const packetIdentity = dispatchEntry; // compare only after unlock
+    const sp<IBinder> connectionToken = connection->getToken();
+    const bool canceledByDrop = dispatchEntry->keyCanceledByDrop;
     // To prevent misuse, ensure dispatchEntry is no longer valid.
     dispatchEntry = nullptr;
+    if (canceledByDrop) return {};
+    auto stillSameUncanceledPacket = [&]() REQUIRES(mLock) {
+        if (connection->status != Connection::Status::NORMAL ||
+                mConnectionManager.getConnection(connectionToken) != connection) return false;
+        const auto current = std::find_if(connection->waitQueue.begin(), connection->waitQueue.end(),
+                                         [seq](const auto& packet) { return packet->seq == seq; });
+        return current != connection->waitQueue.end() && current->get() == packetIdentity &&
+                (*current)->eventEntry == eventEntry && (*current)->windowId == windowId &&
+                !(*current)->keyCanceledByDrop;
+    };
     if (keyEntry.flags & AKEY_EVENT_FLAG_FALLBACK) {
         if (!handled) {
             // Report the key as unhandled, since the fallback was not handled.
@@ -7025,6 +8943,10 @@ std::unique_ptr<const KeyEntry> InputDispatcher::afterKeyEventLockedInterruptabl
             }
 
             mLock.lock();
+
+            // Policy may synchronously replace/remove this packet or PARK its
+            // recipient. Never dereference the pre-unlock raw DispatchEntry.
+            if (!stillSameUncanceledPacket()) return {};
 
             // Cancel the fallback key, but only if we still have a window for the channel.
             // It could have been removed during the policy call.
@@ -7082,6 +9004,10 @@ std::unique_ptr<const KeyEntry> InputDispatcher::afterKeyEventLockedInterruptabl
             connection->inputState.removeFallbackKey(originalKeyCode);
             return {};
         }
+
+        // A same-focus DROP during the policy callback must not relatch a
+        // fallback after its original recipient was already terminal-balanced.
+        if (!stillSameUncanceledPacket()) return {};
 
         // Latch the fallback keycode for this key on an initial down.
         // The fallback keycode cannot change at any other point in the lifecycle.
@@ -7280,7 +9206,20 @@ void InputDispatcher::onFocusChangedLocked(
         CancellationOptions options(CancellationOptions::Mode::CANCEL_NON_POINTER_EVENTS,
                                    "focus left window", resolvedWindow, traceTracker);
         synthesizeCancellationEventsForWindowLocked(options);
-        enqueueFocusEventLocked(changes.oldFocus, /*hasFocus=*/false, changes.reason);
+        // Focus notifications describe a window's connection, not a display.
+        // A cross-display update can focus this same token on the destination
+        // before retiring its source. Keep the source cleanup, but do not send
+        // a late loss that would undo the destination's already-queued gain.
+        bool focusedElsewhere = false;
+        mWindowInfos.forEachDisplayId([&](ui::LogicalDisplayId displayId) REQUIRES(mLock) {
+            if (displayId != changes.displayId &&
+                mFocusResolver.getFocusedWindowToken(displayId) == changes.oldFocus) {
+                focusedElsewhere = true;
+            }
+        });
+        if (!focusedElsewhere) {
+            enqueueFocusEventLocked(changes.oldFocus, /*hasFocus=*/false, changes.reason);
+        }
     }
     if (changes.newFocus) {
         resetNoFocusedWindowTimeoutLocked();
@@ -7350,6 +9289,10 @@ void InputDispatcher::clearPointerCaptureLocked() {
 void InputDispatcher::displayRemoved(ui::LogicalDisplayId displayId) {
     { // acquire lock
         std::scoped_lock _l(mLock);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        mExternalDesktopStageOwner.invalidateNativeRoutes();
+        flushInactiveExternalDesktopSubmissionsLocked();
+#endif
         // Set an empty list to remove all handles from the specific display.
         setInputWindowsLocked(/*windowInfoHandles=*/{}, displayId);
         setFocusedApplicationLocked(displayId, nullptr);
@@ -7376,7 +9319,203 @@ void InputDispatcher::displayRemoved(ui::LogicalDisplayId displayId) {
     mLooper->wake();
 }
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+bool InputDispatcher::prepareExternalDesktopStageIntent(const ExternalDesktopStageLeaseView& view,
+        ExternalDesktopStageEpochTicket ticket,const WsIntent& intent,std::vector<WsPresentation>& geometry) {
+    if (!geometry.empty()) return false;
+    std::scoped_lock lock(mLock);
+    const auto& reserved=mExternalDesktopStageOwner.mNativeReservation;
+    if (!reserved || reserved->owner!=ticket.owner || reserved->epoch!=ticket.epoch ||
+            reserved->generation!=ticket.generation) return false;
+    // Synchronous real Rust call only. All JNI arrays were copied BEFORE this
+    // lock; there is no WM/Java/Binder/SurfaceComposerClient call under mLock.
+    if (!mExternalDesktopStageOwner.admitNativeIntent(view,intent) || !mExternalDesktopStageOwner.mNativeIntentFrame) return false;
+    geometry=mExternalDesktopStageOwner.mNativeIntentFrame->presentations;
+    return true; // owned values only, no borrowed authority or StageKey escapes
+}
+
+bool InputDispatcher::refreshExternalDesktopStageClaims(const ExternalDesktopStageLeaseView& view,
+        ExternalDesktopStageEpochTicket ticket, const std::shared_ptr<const ExternalDesktopStageRoster>& roster,
+        uint64_t batch) {
+    std::scoped_lock lock(mLock);
+    return mExternalDesktopStageOwner.refreshNativeClaims(view, ticket, roster, batch);
+}
+
+bool InputDispatcher::renewExternalDesktopStageIntent(const ExternalDesktopStageLeaseView& view,ExternalDesktopStageEpochTicket ticket,
+        const std::shared_ptr<const ExternalDesktopStageRoster>& roster,const WsLive& observed,ExternalDesktopStageEpochTicket* out) {
+    bool accepted;
+    {
+        std::scoped_lock lock(mLock);
+        const auto& current=mExternalDesktopStageOwner.mWmsRoster;
+        if (!roster || !roster->references || !current || !current->references ||
+                !current->references->same(*roster->references) ||
+                current->nativeOwnerIdentity!=roster->nativeOwnerIdentity ||
+                !mExternalDesktopStageOwner.validRosterObservations(view,*roster)) return false;
+        // JNI copies the CURRENT actual WMS sample before mLock. This invokes
+        // only real lender/core/EpochOwner; no Binder/SF/Java callback here.
+        accepted=mExternalDesktopStageOwner.renewNativeIntent(view,ticket,observed,out);
+        flushInactiveExternalDesktopSubmissionsLocked(); // SUSPENDED is not canceled; actual terminal loss is
+    }
+    mLooper->wake(); // schedule the real suspended cutoff even if no more input/batch arrives
+    return accepted;
+}
+
+bool InputDispatcher::observeExternalDesktopStageRenewalBinding(const ExternalDesktopStageLeaseView& view,ExternalDesktopStageEpochTicket ticket,
+        const std::shared_ptr<const ExternalDesktopStageRoster>& roster,
+        const std::vector<std::shared_ptr<const ExternalDesktopTaskRootObservation>>& roots,
+        const std::vector<ExternalDesktopStageSubmissionObservation>& submissions) {
+    std::shared_ptr<const ExternalDesktopStageRoster> displacedRoster;
+    std::shared_ptr<const ExternalDesktopTaskRootCohort> displacedRoots,displacedHistory;
+    bool accepted;
+    {
+        std::scoped_lock lock(mLock);
+        accepted=mExternalDesktopStageOwner.observeNativeRenewalBinding(view,ticket,roster,roots,submissions,
+                displacedRoster,displacedRoots,displacedHistory);
+        flushInactiveExternalDesktopSubmissionsLocked();
+    }
+    mLooper->wake();
+    // Actual old JNI/SC witnesses drop only after unlocking; the receipt owns
+    // nonresource identities/weak controls, never a resource-bearing sentinel.
+    displacedRoster.reset();displacedRoots.reset();displacedHistory.reset();return accepted;
+}
+
+int32_t InputDispatcher::progressExternalDesktopStageEpoch(const ExternalDesktopStageLeaseView& view,ExternalDesktopStageEpochTicket ticket,
+        const std::shared_ptr<const ExternalDesktopStageRoster>& roster,uint64_t batch,const WsLive& observed) {
+    std::optional<ExternalDesktopStageOwner::RootOperation> action; // drops real SC refs OUTSIDE mLock
+    int32_t status;
+    {
+        std::scoped_lock lock(mLock);
+        status=mExternalDesktopStageOwner.progressNativeEpoch(view,ticket,roster,batch,observed,action);
+    }
+    if (!action) return status;
+    // The real per-event default-deny/stream stamping/tail adapter is still a
+    // required part of this integration. Until wired, never clear the owned
+    // restrictive component merely because producer/Rust prerequisites pass.
+    constexpr bool dispatchAndTailContractInstalled=false;
+    if (action->operation==2 && !dispatchAndTailContractInstalled) {
+        std::scoped_lock lock(mLock);
+        mExternalDesktopStageOwner.finishRootOperation(view,*action,false);return 0;
+    }
+    // REAL synchronous protected SF-mainthread call, deliberately after the
+    // lock scope. No AuthorityBorrow/native handle is retained in the action.
+    const auto& key=action->key;
+    const status_t applied=action->client->transitionExternalDesktopRootStates(action->roots,action->origins,
+        action->revisions,action->operation,key.generation,key.atlas,key.geometry,key.epoch,action->presentations);
+    {
+        std::scoped_lock lock(mLock);
+        if (!mExternalDesktopStageOwner.finishRootOperation(view,*action,applied==NO_ERROR)) return 0;
+    }
+    return 1; // SF command return is NOT B0/B1/B2 or APPLIED; wait for a new full callback
+}
+
+bool InputDispatcher::lendExternalDesktopStageAuthority(const ExternalDesktopStageLeaseView& view) {
+    std::scoped_lock lock(mLock);
+    // Lock order: WMS -> dispatcher -> existing Rust UI_CLAIMS. The Rust
+    // callback performs no JNI/WM call and acquires no additional mutex.
+    return mExternalDesktopStageOwner.borrowAuthority(view);
+}
+
+bool InputDispatcher::reserveExternalDesktopStageSubmission(const ExternalDesktopStageLeaseView& view,
+                                                 ExternalDesktopStageEpochTicket* out) {
+    std::shared_ptr<const ExternalDesktopStageRoster> displaced;
+    std::shared_ptr<const ExternalDesktopTaskRootCohort> roots;
+    bool accepted;
+    {
+        std::scoped_lock lock(mLock);
+        accepted=mExternalDesktopStageOwner.reserveSubmission(view,out,&displaced,&roots);
+    }
+    displaced.reset(); roots.reset(); return accepted;
+}
+
+bool InputDispatcher::observeExternalDesktopStageRoster(const ExternalDesktopStageLeaseView& view,
+        ExternalDesktopStageEpochTicket ticket, int64_t token, int64_t serial,
+        const std::shared_ptr<const ExternalDesktopStageRoster>& roster, int32_t operation) {
+    std::shared_ptr<const ExternalDesktopStageRoster> displaced;
+    std::shared_ptr<const ExternalDesktopTaskRootCohort> displacedRoots;
+    bool accepted;
+    {
+        std::scoped_lock lock(mLock);
+        // Same WMS -> dispatcher -> Rust-claims order; callback has no JNI/WM.
+        accepted = !mExternalDesktopStageOwner.isNativeRenewalTicket(ticket) && mExternalDesktopStageOwner.observeRoster(view, ticket, token, serial, roster,
+                                                 operation, displaced, &displacedRoots);
+    }
+    // SurfaceControl destruction can flush Binder commands; JavaVM/global-ref
+    // cleanup may attach this thread. Neither occurs under mLock/UI_CLAIMS.
+    displaced.reset(); displacedRoots.reset();
+    return accepted;
+}
+
+bool InputDispatcher::observeExternalDesktopStageRoots(const ExternalDesktopStageLeaseView& view,
+        ExternalDesktopStageEpochTicket ticket,
+        const std::vector<std::shared_ptr<const ExternalDesktopTaskRootObservation>>& roots,
+        const std::shared_ptr<const ExternalDesktopStageRoster>& expectedRoster) {
+    std::shared_ptr<const ExternalDesktopTaskRootCohort> displaced,displacedHistory;
+    bool accepted=false;
+    {
+        std::scoped_lock lock(mLock);
+        accepted=!mExternalDesktopStageOwner.isNativeRenewalTicket(ticket) &&
+                mExternalDesktopStageOwner.observeRoots(view,ticket,roots,displaced,displacedHistory,expectedRoster);
+    }
+    // Real JNI/SC root history final references drop only after dispatcher unlock.
+    displaced.reset();displacedHistory.reset();return accepted;
+}
+
+bool InputDispatcher::beginExternalDesktopStageSubmission(const ExternalDesktopStageLeaseView& view,
+                                               ExternalDesktopStageEpochTicket ticket,
+                                               int64_t token, int64_t serial) {
+    std::scoped_lock lock(mLock);
+    return mExternalDesktopStageOwner.beginSubmission(view, ticket, token, serial);
+}
+
+bool InputDispatcher::noteExternalDesktopStageSubmission(const ExternalDesktopStageLeaseView& view,
+                                              ExternalDesktopStageEpochTicket ticket,
+                                              int64_t token, int64_t serial, bool input) {
+    std::scoped_lock lock(mLock);
+    return mExternalDesktopStageOwner.noteSubmission(view, ticket, token, serial, input);
+}
+
+bool InputDispatcher::closeExternalDesktopStageSubmission(ExternalDesktopStageEpochTicket ticket) {
+    std::shared_ptr<const ExternalDesktopStageRoster> displaced;
+    std::shared_ptr<const ExternalDesktopTaskRootCohort> displacedRoots;
+    bool closed;
+    {
+        std::scoped_lock lock(mLock);
+        closed = mExternalDesktopStageOwner.closeSubmission(ticket);
+        // Exact terminal request disposes matching observations even when Rust
+        // already closed/superseded this ticket. No claim/lifetime proof inferred.
+        displacedRoots = mExternalDesktopStageOwner.takeRootObservations(ticket);
+        displaced = mExternalDesktopStageOwner.takeRosterObservation(ticket);
+        mExternalDesktopStageOwner.invalidateRootObservations(ticket);
+        flushInactiveExternalDesktopSubmissionsLocked();
+    }
+    displaced.reset(); displacedRoots.reset();
+    return closed;
+}
+
+bool InputDispatcher::invalidateExternalDesktopStageSubmission(ExternalDesktopStageEpochTicket ticket,
+                                                    int64_t token, int64_t serial) {
+    std::shared_ptr<const ExternalDesktopStageRoster> displaced;
+    std::shared_ptr<const ExternalDesktopTaskRootCohort> displacedRoots;
+    bool invalidated;
+    {
+        std::scoped_lock lock(mLock);
+        invalidated = mExternalDesktopStageOwner.invalidateSubmission(ticket, token, serial);
+        // Rejected stale/equal serial, unknown display or foreign owner must
+        // not mutate even the CURRENT observation. Exact close is different.
+        if (invalidated) displacedRoots = mExternalDesktopStageOwner.takeRootObservations(ticket);
+        if (invalidated) displaced = mExternalDesktopStageOwner.takeRosterObservation(ticket);
+        if (invalidated) mExternalDesktopStageOwner.invalidateRootObservations(ticket);
+        if (invalidated) flushInactiveExternalDesktopSubmissionsLocked();
+    }
+    displaced.reset(); displacedRoots.reset();
+    return invalidated;
+}
+#endif
+
 void InputDispatcher::onWindowInfosChanged(const gui::WindowInfosUpdate& update) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    std::optional<ExternalDesktopStageOwner::BatchWakeup> stageWakeup;
+#endif
     if (auto result = validateWindowInfosUpdate(update); !result.ok()) {
         {
             // acquire lock
@@ -7396,6 +9535,11 @@ void InputDispatcher::onWindowInfosChanged(const gui::WindowInfosUpdate& update)
     { // acquire lock
         std::scoped_lock _l(mLock);
 
+        // Old native producers suspend BEFORE setInputWindowsLocked can
+        // synthesize anything from the new installed maps. No SC/Binder IPC.
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        mExternalDesktopStageOwner.suspendNativeRoutes();
+#endif
         // Ensure that we have an entry created for all existing displays so that if a displayId has
         // no windows, we can tell that the windows were removed from the display.
         mWindowInfos.forEachDisplayId(
@@ -7408,7 +9552,31 @@ void InputDispatcher::onWindowInfosChanged(const gui::WindowInfosUpdate& update)
         }
 
         mWindowInfosVsyncId = update.vsyncId;
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        // ONE complete RAW callback, including rows filtered from installed
+        // maps. All displays (including newly empty ones) are installed first.
+        // No WM/Binder call, fake Live/view, admission or policy runs here.
+        size_t installedWindows = 0;
+        size_t installedDisplayMaps = 0;
+        mWindowInfos.forEachDisplayId([&](ui::LogicalDisplayId displayId) REQUIRES(mLock) {
+            installedWindows += mWindowInfos.getWindowHandlesForDisplay(displayId).size();
+            ++installedDisplayMaps;
+        });
+        mExternalDesktopStageOwner.receiveFullBatch(update, installedWindows, installedDisplayMaps);
+        flushInactiveExternalDesktopSubmissionsLocked();
+        stageWakeup = mExternalDesktopStageOwner.batchWakeup();
+        requestExternalDesktopRetirementLocked();
+#endif
     }
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // JNI/Java may post to WM, but NEVER while mLock is held. This selector
+    // cannot certify a frame, retain a native handle or reconstruct authority.
+    if (stageWakeup) {
+        mPolicy.notifyExternalDesktopStageBatchObserved(static_cast<int64_t>(stageWakeup->ticket.owner),
+                stageWakeup->ticket.epoch, stageWakeup->ticket.generation,
+                static_cast<int64_t>(stageWakeup->batch));
+    }
+#endif
     // Wake up poll loop since it may need to make new input dispatching choices.
     mLooper->wake();
 }
@@ -7541,7 +9709,8 @@ InputDispatcher::DispatcherTouchState::transferWallpaperTouch(
         if (wallpaperConnection != nullptr) {
             std::shared_ptr<Connection> toConnection =
                     mConnectionManager.getConnection(toWindowHandle->getToken());
-            toConnection->inputState.mergePointerStateTo(wallpaperConnection->inputState);
+            LOG_ALWAYS_FATAL_IF(!toConnection->inputState.mergePointerStateTo(wallpaperConnection->inputState),
+                                "Private wallpaper transfer escaped pre-mutation validation");
             pointerDowns.emplace_back(downTimeInTarget, wallpaperConnection, wallpaperFlags);
         }
         pointerDowns.emplace_back(downTimeInTarget, wallpaperConnection, wallpaperFlags);
@@ -7744,8 +9913,16 @@ void InputDispatcher::DispatcherWindowInfo::setDisplayTopology(
 }
 
 InputDispatcher::DispatcherTouchState::DispatcherTouchState(const DispatcherWindowInfo& windowInfos,
-                                                            const ConnectionManager& connections)
-      : mWindowInfos(windowInfos), mConnectionManager(connections) {}
+                                                            const ConnectionManager& connections
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                                                            ,ExternalDesktopSelection selection
+#endif
+                                                            )
+      :
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        mExternalDesktopSelection(std::move(selection)),
+#endif
+        mWindowInfos(windowInfos), mConnectionManager(connections) {}
 
 ftl::Flags<InputTarget::Flags> InputDispatcher::DispatcherTouchState::getTargetFlags(
         const sp<WindowInfoHandle>& targetWindow, vec2 targetPosition, bool isSplit) {

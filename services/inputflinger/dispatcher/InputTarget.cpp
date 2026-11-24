@@ -39,6 +39,39 @@ InputTarget::InputTarget(const std::shared_ptr<Connection>& connection, ftl::Fla
 
 Result<void> InputTarget::addPointers(std::bitset<MAX_POINTER_ID + 1> newPointerIds,
                                       const ui::Transform& transform) {
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    return addPointersWithOwnership(newPointerIds, transform, nullptr);
+#else
+    return addPointersImpl(newPointerIds, transform);
+#endif
+}
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+Result<void> InputTarget::addPointersWithOwnership(
+        std::bitset<MAX_POINTER_ID + 1> newPointerIds, const ui::Transform& transform,
+        const ExternalDesktopPointerOwnershipPtr& ownership) {
+    auto oldIds = getPointerIds();
+    auto incomingIds = newPointerIds;
+    if (mExternalDesktopPointerOwnership && oldIds.none() && newPointerIds.any()) {
+        return Error() << "Cannot aggregate into an implicit private default-pointer target";
+    }
+    if (ownership && incomingIds.none()) incomingIds = ownership->ids();
+    if ((mExternalDesktopPointerOwnership && newPointerIds.none()) ||
+        (ownership && oldIds.none() && !mPointerTransforms.empty())) {
+        return Error() << "Missing complete ownership for an existing default-pointer target";
+    }
+    auto merged = ExternalDesktopPointerOwnership::merge(mExternalDesktopPointerOwnership, oldIds,
+                                               ownership, incomingIds);
+    if (!merged.ok()) return Error() << merged.error().message();
+    // Validate all identity rows BEFORE ordinary transform aggregation mutates.
+    auto result = addPointersImpl(newPointerIds, transform);
+    if (result.ok()) mExternalDesktopPointerOwnership = std::move(*merged);
+    return result;
+}
+#endif
+
+Result<void> InputTarget::addPointersImpl(std::bitset<MAX_POINTER_ID + 1> newPointerIds,
+                                          const ui::Transform& transform) {
     // The pointerIds can be empty, but still a valid InputTarget. This can happen when there is no
     // valid pointer property from the input event.
     if (newPointerIds.none()) {

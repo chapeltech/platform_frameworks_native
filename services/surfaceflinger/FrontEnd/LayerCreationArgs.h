@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include "../NativeLifetimeToken.h"
 
 constexpr uint32_t UNASSIGNED_LAYER_ID = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t INTERNAL_LAYER_PREFIX = 1u << 31;
@@ -60,6 +61,15 @@ struct LayerCreationArgs {
     bool addToRoot = true;
     wp<IBinder> parentHandle = nullptr;
     wp<IBinder> mirrorLayerHandle = nullptr;
+    // Creation-only PRIVATE server fields. Neither is accepted from generic
+    // createSurface metadata, layer_state_t, flags, a parcel or trace replay.
+    bool createExternalDesktopOwnedInputBlock = false;
+    sp<IBinder> externalDesktopOwnedInputBlockOrigin; // empty SF-created NONRESOURCE Binder
+    // One real SF creation owns this NONRESOURCE aggregate. Copies of these
+    // args/state do not count as Layer/Snapshot resource leases. fromOtherArgs
+    // calls a fresh constructor and therefore creates a distinct aggregate.
+    sp<NativeLifetimeToken> nativeResourceGroup =
+            sp<NativeLifetimeToken>::make(gui::NativeLifetimeKind::RootResourceGroup);
     ui::LayerStack layerStackToMirror = ui::UNASSIGNED_LAYER_STACK;
     std::optional<DisplayId> displayIdToMirror{};
     uint32_t parentId = UNASSIGNED_LAYER_ID;

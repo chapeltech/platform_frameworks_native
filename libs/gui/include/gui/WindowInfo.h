@@ -16,6 +16,11 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <vector>
+
 #include <android/gui/TouchOcclusionMode.h>
 #include <android/os/InputConfig.h>
 #include <binder/Parcel.h>
@@ -229,6 +234,35 @@ struct WindowInfo : public Parcelable {
     // Transform applied to get to the layer stack space of the cloned window for input.
     // Maps display coordinates of the clone window to the layer stack space of the cloned window.
     std::optional<ui::Transform> cloneLayerStackTransform;
+
+    // Informational SF traversal identity, not input authority or a snapshot lifetime token.
+    // SF overwrites requested values. Originals have no lineage; clones retain the complete
+    // outermost-to-innermost mirror path, never only its first or last root.
+    struct CloneLineage {
+        uint32_t sourceLayerId;
+        std::vector<uint32_t> mirrorRootIds;
+        bool operator==(const CloneLineage&) const = default;
+    };
+    // Both LayerHierarchy and LayerSnapshotBuilder reject traversal depth greater than 50.
+    static constexpr size_t kMaxCloneLineageDepth = 50;
+    std::optional<CloneLineage> cloneLineage;
+
+    // Private, informational staged-atlas metadata. Neither field grants input authority.
+    // No producer/consumer or unclipped-region selection is enabled by this transport.
+    struct StageTag {
+        int64_t authorityGeneration;
+        int64_t atlasRevision;
+        int64_t geometryRevision;
+        int64_t epoch;
+        uint64_t presentationKey;
+        bool operator==(const StageTag&) const = default;
+    };
+    std::optional<StageTag> stageTag;
+    // Absent differs from present-empty. Input-local on request, like touchableRegion;
+    // any future SF transformation/consumer must be separately implemented and admitted.
+    static constexpr size_t kMaxPreViewportRegionRects = 1024;
+    static constexpr int32_t kMaxStagedAtlasCoordinate = 32768;
+    std::optional<Region> preViewportTouchableRegion;
 
     /*
      * This is filled in by the WM relative to the frame and then translated

@@ -56,6 +56,16 @@ public:
     void applyTransactions(const std::vector<QueuedTransactionState>&,
                            bool ignoreUnknownLayers = false);
 
+    // Caller authenticated kernel UID+SID and resolved actual LayerHandles.
+    // Validate the WHOLE cohort before mutation; success is not a SF fence.
+    bool setExternalDesktopOwnedInputBlocks(const std::vector<uint32_t>& roots,
+            const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+            int64_t epoch, bool blocked);
+    bool transitionExternalDesktopRootStates(const std::vector<uint32_t>& roots,
+            const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+            int32_t operation, int64_t generation, int64_t atlas, int64_t geometry,
+            int64_t epoch, const std::vector<int64_t>& presentations);
+
     // Ignore unknown handles when iteroping with legacy front end. In the old world, we
     // would create child layers which are not necessary with the new front end. This means
     // we will get notified for handle changes that don't exist in the new front end.

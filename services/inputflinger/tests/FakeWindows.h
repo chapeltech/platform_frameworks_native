@@ -383,9 +383,9 @@ public:
         return receive();
     }
 
-    inline void finishEvent(uint32_t sequenceNum) {
+    inline void finishEvent(uint32_t sequenceNum, bool handled = true) {
         ASSERT_NE(mInputReceiver, nullptr) << "Invalid receive event on window with no receiver";
-        mInputReceiver->finishEvent(sequenceNum);
+        mInputReceiver->finishEvent(sequenceNum, handled);
     }
 
     inline void sendTimeline(int32_t inputEventId,

@@ -23,6 +23,8 @@
 #include <bitset>
 #include "Connection.h"
 #include "InputTargetFlags.h"
+#include "ExternalDesktopPointerOwnership.h"
+#include "ExternalDesktopSubmissionLedger.h"
 
 namespace android::inputdispatcher {
 
@@ -93,6 +95,19 @@ public:
 
     android::base::Result<void> addPointers(std::bitset<MAX_POINTER_ID + 1> pointerIds,
                                             const ui::Transform& transform);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Private TCB transport seam; no production issuer/caller is wired here.
+    // Table rows are complete for these IDs, including ordinary/null siblings.
+    android::base::Result<void> addPointersWithOwnership(
+            std::bitset<MAX_POINTER_ID + 1> pointerIds, const ui::Transform& transform,
+            const ExternalDesktopPointerOwnershipPtr& ownership);
+    const ExternalDesktopPointerOwnershipPtr& getExternalDesktopPointerOwnership() const {
+        return mExternalDesktopPointerOwnership;
+    }
+    const ExternalDesktopSubmissionReservationPtr& getExternalDesktopSubmissionReservation() const {
+        return mExternalDesktopSubmissionReservation;
+    }
+#endif
     void setDefaultPointerTransform(const ui::Transform& transform);
 
     /**
@@ -116,6 +131,16 @@ public:
     std::string getPointerInfoString() const;
 
 private:
+    android::base::Result<void> addPointersImpl(std::bitset<MAX_POINTER_ID + 1> pointerIds,
+                                               const ui::Transform& transform);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    ExternalDesktopPointerOwnershipPtr mExternalDesktopPointerOwnership;
+    friend class InputDispatcher;
+    friend class InputDispatcherTest;
+    // Only the future trusted issuer or an explicit fixture can supply this
+    // opaque reservation. A scalar pointer ownership table is not admission.
+    ExternalDesktopSubmissionReservationPtr mExternalDesktopSubmissionReservation;
+#endif
     template <typename K, typename V>
     using ArrayMap = std::vector<std::pair<K, V>>;
     using PointerIds = std::bitset<MAX_POINTER_ID + 1>;

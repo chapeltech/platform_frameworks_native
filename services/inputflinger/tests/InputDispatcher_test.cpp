@@ -44,10 +44,18 @@
 #include <utils/Timers.h>
 
 #include <cinttypes>
+#include <atomic>
 #include <compare>
+#include <functional>
+#include <initializer_list>
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+#include <bit>
+#include <gui/SurfaceComposerClient.h>
+#include <utils/SystemClock.h>
+#endif
 
 #include "ProtoLog.h"
 #include "perfetto/tracing/backend_type.h"
@@ -177,11 +185,1300 @@ std::unique_ptr<KeyCharacterMap> loadKeyCharacterMap(const char* name) {
 
 // --- InputDispatcherTest ---
 
+// Explicit policy boundary DOUBLE only; Dispatcher/queue/cancellation methods
+// remain actual production bodies, including in nonexperimental builds.
+class SavedKeyBalancePolicy : public FakeInputDispatcherPolicy {
+public:
+    std::function<void(const KeyEvent&)> beforeDispatch;
+    std::variant<nsecs_t, KeyEntry::InterceptKeyResult> interceptKeyBeforeDispatching(
+            const sp<IBinder>& token, const KeyEvent& event, uint32_t flags) override {
+        if (beforeDispatch) beforeDispatch(event);
+        return FakeInputDispatcherPolicy::interceptKeyBeforeDispatching(token, event, flags);
+    }
+};
+
 class InputDispatcherTest : public testing::Test {
 protected:
     std::unique_ptr<FakeInputDispatcherPolicy> mFakePolicy;
     std::unique_ptr<InputDispatcher> mDispatcher;
     std::shared_ptr<input_trace::VerifyingTrace> mVerifyingTrace;
+    virtual std::unique_ptr<FakeInputDispatcherPolicy> makePolicyForTest() {
+        return std::make_unique<FakeInputDispatcherPolicy>();
+    }
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    ExternalDesktopStageOwner::Receipt stageReceipt() const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mExternalDesktopStageOwner.receipt();
+    }
+    const void* stageContextIdentity() const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mExternalDesktopStageOwner.mContext.get();
+    }
+    const void* independentStageContext(const ExternalDesktopStageOwner& owner) const {
+        return owner.mContext.get();
+    }
+    ExternalDesktopStageEpochOwner* epochChildForBookkeepingTest(ExternalDesktopStageOwner& owner) const {
+        // Exact production Rust child, deterministic clock only. No fake Live,
+        // lease issuer or claim that this bypass is a production authority path.
+        owner.mEpochOwner.reset(external_desktop_input_epoch_create(100));
+        return owner.mEpochOwner.get();
+    }
+    const gui::WindowInfosUpdate* completeStageEvidence(const ExternalDesktopStageOwner& owner) const {
+        // Test-only access, under the same serialized calls as receiveFullBatch.
+        // Not an active-state/publication or object-lifetime API.
+        return owner.mCompleteBatch ? &*owner.mCompleteBatch : nullptr;
+    }
+    bool validStageRoster(const ExternalDesktopStageOwner& owner, const ExternalDesktopStageLeaseView& view,
+                          const ExternalDesktopStageRoster& roster) const {
+        return owner.validRosterObservations(view, roster);
+    }
+    bool stageMutexAvailable() const {
+        if (!mDispatcher->mLock.try_lock()) return false;
+        mDispatcher->mLock.unlock();
+        return true;
+    }
+    ExternalDesktopStageEpochTicket seedStageRosterForDisposalTest(
+            const std::shared_ptr<const ExternalDesktopStageRoster>& roster, int64_t serial = 1) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto& owner = mDispatcher->mExternalDesktopStageOwner;
+        auto* child = epochChildForBookkeepingTest(owner);
+        const std::array<int64_t, 14> words{42, 10, 2, 1, 0, 100, 2, 0, 0, 1024, 768, 160, 1, 42};
+        ExternalDesktopStageLeaseView view{};
+        view.expected_client_uid = 10152; view.user = 0; view.generation = 42;
+        view.topology_snapshot = {words.data(), words.size()};
+        ExternalDesktopStageEpochTicket ticket{};
+        if (external_desktop_input_epoch_reserve(child, 101, &view, &ticket) != 1 ||
+                external_desktop_input_epoch_begin(child, &view, ticket, 100, serial) != 1) return {};
+        // ONLY disposal setup, not a production lease/publication. Real Rust
+        // bookkeeping is used; no Authority/Live/claim is created by this test.
+        owner.mWmsRoster = roster;
+        owner.mWmsRosterTicket = ticket;
+        return ticket;
+    }
+    const ExternalDesktopStageRoster* stageRosterObservationIdentity() const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mExternalDesktopStageOwner.mWmsRoster.get();
+    }
+    void seedStageRosterForTeardownTest(ExternalDesktopStageOwner& owner,
+            const std::shared_ptr<const ExternalDesktopStageRoster>& roster) {
+        // Reference-destruction setup ONLY. No epoch/lease/active state inferred.
+        owner.mWmsRoster = roster;
+    }
+    bool closeStageBookkeepingForDisposalTest(ExternalDesktopStageEpochTicket ticket) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mExternalDesktopStageOwner.closeSubmission(ticket);
+    }
+    // Trusted object-reference storage substep ONLY. These controls do NOT
+    // manufacture WMS authority, Java identity, geometry, a RootClaim or Live.
+    static ExternalDesktopStageLeaseView sourceViewForTest(const std::array<int64_t, 1>& expires) {
+        static constexpr std::array<int64_t, 14> words{42, 10, 2, 1, 0, 100, 2, 0, 0, 1024, 768, 160, 1, 42};
+        ExternalDesktopStageLeaseView view{};
+        view.expected_client_uid = 10152; view.user = 0; view.generation = 42;
+        view.observed_at = android::elapsedRealtime();
+        view.topology_snapshot = {words.data(), words.size()};
+        view.expires_by_display = {expires.data(), expires.size()};
+        return view;
+    }
+    ExternalDesktopStageEpochTicket sourceTicketForTest(ExternalDesktopStageOwner& owner, const ExternalDesktopStageLeaseView& view) {
+        auto* child = epochChildForBookkeepingTest(owner);
+        ExternalDesktopStageEpochTicket result{};
+        EXPECT_EQ(external_desktop_input_epoch_reserve(child, 101, &view, &result), 1);
+        return result;
+    }
+    bool commitSourceObjectsForTest(ExternalDesktopStageOwner& owner, const ExternalDesktopStageLeaseView& view,
+            ExternalDesktopStageEpochTicket ticket, const ExternalDesktopStageRoster& roster) {
+        auto prepared = owner.mSourceLifetimes.prepare(view, ticket, roster);
+        return prepared && owner.mSourceLifetimes.commit(std::move(*prepared));
+    }
+    auto prepareSourceObjectsForTest(ExternalDesktopStageOwner& owner, const ExternalDesktopStageLeaseView& view,
+            ExternalDesktopStageEpochTicket ticket, const ExternalDesktopStageRoster& roster) {
+        return owner.mSourceLifetimes.prepare(view, ticket, roster);
+    }
+    bool commitPreparedSourceForTest(ExternalDesktopStageOwner& owner, ExternalDesktopSourceLifetimes::Prepared&& prepared) {
+        return owner.mSourceLifetimes.commit(std::move(prepared));
+    }
+    std::vector<uint64_t> sourcePresentationKeysForTest(const ExternalDesktopStageOwner& owner) const {
+        std::vector<uint64_t> result;
+        if (const auto& current = owner.mSourceLifetimes.current())
+            for (const auto& binding : current->windows) result.push_back(binding.presentation);
+        return result;
+    }
+    static sp<SurfaceControl> sourceSurfaceForTest(const sp<SurfaceComposerClient>& client, const char* name) {
+        return client->createSurface(String8(name), 0, 0, PIXEL_FORMAT_UNKNOWN,
+                                     ISurfaceComposerClient::eFXSurfaceContainer);
+    }
+    static ExternalDesktopStageRoster sourceRosterForTest(const sp<SurfaceControl>& task,
+            const std::vector<sp<SurfaceControl>>& windows, const ExternalDesktopStageObject& nativeOwner,
+            const ExternalDesktopStageObject& taskObject, const std::vector<ExternalDesktopStageObject>& windowObjects,
+            const std::shared_ptr<const ExternalDesktopStageRosterReferences>& references) {
+        ExternalDesktopStageRoster result; result.nativeOwnerIdentity = nativeOwner; result.references = references;
+        result.tasks.push_back({100, 10152, 0, windows.size(), task, task->getLayerId(), 1000, taskObject});
+        const auto channel = sp<BBinder>::make(), client = sp<BBinder>::make();
+        for (size_t i = 0; i < windows.size(); ++i) result.windows.push_back({windows[i], channel, client,
+            windows[i]->getLayerId(), i == 0 ? 1 : 1000, 1, 0x2000, 0, 63, taskObject, windowObjects[i]});
+        return result;
+    }
+    static gui::WindowInfosUpdate sourceOriginalBatchForTest(const ExternalDesktopStageRoster& roster) {
+        gui::WindowInfosUpdate result;
+        for (const auto& row : roster.windows) {
+            gui::WindowInfo info; info.alpha = 1.0f; info.id = row.layerId;
+            info.token = row.channel; info.windowToken = row.client;
+            info.ownerUid = gui::Uid{10152}; info.displayId = ui::LogicalDisplayId{2};
+            result.windowInfos.push_back(info);
+        }
+        return result;
+    }
+    auto sourceJoinForTest(const ExternalDesktopStageOwner& owner) const {
+        const auto& current = owner.mSourceLifetimes.current();
+        return current ? current->join : ExternalDesktopSourceLifetimes::Join::NO_ROSTER;
+    }
+    std::vector<uint64_t> sourceChildKeysForTest(const ExternalDesktopStageOwner& owner) const {
+        std::vector<uint64_t> result;
+        if (const auto& current = owner.mSourceLifetimes.current())
+            for (const auto& binding : current->children) result.push_back(owner.mSourceLifetimes.mChildren[binding.physical].key);
+        return result;
+    }
+    std::vector<uint64_t> sourceWindowKeysForTest(const ExternalDesktopStageOwner& owner) const {
+        std::vector<uint64_t> result;
+        if (const auto& current = owner.mSourceLifetimes.current())
+            for (const auto& binding : current->windows) result.push_back(owner.mSourceLifetimes.mWindows[binding.physical].key);
+        return result;
+    }
+    size_t retainedSourceChildrenForTest(const ExternalDesktopStageOwner& owner) const { return owner.mSourceLifetimes.retainedChildren(); }
+    size_t retainedSourceWindowsForTest(const ExternalDesktopStageOwner& owner) const { return owner.mSourceLifetimes.retainedWindows(); }
+    uint64_t sourceHighKeyForTest(const ExternalDesktopStageOwner& owner) const { return owner.mSourceLifetimes.highKey(); }
+    void sourceCapacityForTest(ExternalDesktopStageOwner& owner, size_t limit) { owner.mSourceLifetimes.mChildLimit = limit; }
+    void sourceExhaustForTest(ExternalDesktopStageOwner& owner) { owner.mSourceLifetimes.mHighKey = UINT64_MAX; }
+    auto prepareStructuralForTest(ExternalDesktopStageOwner& owner, std::vector<ExternalDesktopRootJoinReceipt>& rows) {
+        return owner.mSourceLifetimes.prepareStructural(rows);
+    }
+    bool commitStructuralForTest(ExternalDesktopStageOwner& owner, ExternalDesktopSourceLifetimes::PreparedStructural&& rows) {
+        return owner.mSourceLifetimes.commitStructural(std::move(rows));
+    }
+    size_t retainedStructuralForTest(const ExternalDesktopStageOwner& owner) const {
+        return owner.mSourceLifetimes.mStructural.size();
+    }
+    uint64_t sourceBatchForTest(const ExternalDesktopStageOwner& owner) const {
+        return owner.mReceipt.observations;
+    }
+    int64_t sourceArrivalForTest(const ExternalDesktopStageOwner& owner) const {
+        const auto& current=owner.mSourceLifetimes.current();
+        return current ? current->observedAt : -1;
+    }
+    void observeCachedBatchForTest(ExternalDesktopStageOwner& owner) {
+        owner.observeCurrentBatch(false); // exact production cached-observation body
+    }
+    std::map<const IBinder*,sp<IBinder>> mTEST_DOUBLE_structuralSnapshots;
+    std::vector<ExternalDesktopRootJoinReceipt> TEST_DOUBLE_structuralRows(
+            uint64_t sequence, const sp<IBinder>& identity, const sp<IBinder>& root) {
+        ExternalDesktopRootJoinReceipt row; row.state=ExternalDesktopRootJoin::CLONES_OBSERVED; row.batch=sequence;
+        row.coherentSourceFacts=true; // EXPLICIT allocator DOUBLE; no real SF/factory evidence.
+        auto& snapshot=mTEST_DOUBLE_structuralSnapshots[identity.get()];
+        if (!snapshot) snapshot=sp<BBinder>::make();
+        row.structuralSources.push_back({1,9000,identity,{}, {root},0,snapshot});
+        return {row}; // allocator fixture ONLY, NOT SF proof/claim issuance
+    }
+    // PhaseA fixture-owned values ONLY. No production issuer/claims/activation,
+    // publication success or release-tail proof is manufactured by these helpers.
+    static ExternalDesktopPointerStreamKey streamKey(uint64_t instance = 7) {
+        return {100, 42, 1000, 2000, instance};
+    }
+    static ExternalDesktopPointerOwnershipPtr streamOwners(
+            std::initializer_list<ExternalDesktopPointerOwnership::Row> rows) {
+        auto value = ExternalDesktopPointerOwnership::create(std::span(rows.begin(), rows.size()));
+        EXPECT_TRUE(value.ok());
+        return value.ok() ? *value : nullptr;
+    }
+    static void expectStreamOwner(const ExternalDesktopPointerOwnershipPtr& table, int32_t id,
+                                  std::optional<ExternalDesktopPointerStreamKey> expected) {
+        SCOPED_TRACE(testing::Message() << "pointerId=" << id);
+        const auto actual = ExternalDesktopPointerOwnership::keyAt(table, id);
+        ASSERT_EQ(actual.has_value(), expected.has_value());
+        if (!actual) return;
+        EXPECT_EQ(actual->domain, expected->domain);
+        EXPECT_EQ(actual->generation, expected->generation);
+        EXPECT_EQ(actual->windowLifetime, expected->windowLifetime);
+        EXPECT_EQ(actual->presentationLifetime, expected->presentationLifetime);
+        EXPECT_EQ(actual->streamInstance, expected->streamInstance);
+    }
+    static std::shared_ptr<MotionEntry> streamMotion(
+            int32_t action, std::initializer_list<int32_t> ids,
+            ExternalDesktopPointerOwnershipPtr ownership = nullptr, uint32_t source = AINPUT_SOURCE_TOUCHSCREEN,
+            ui::LogicalDisplayId display = DISPLAY_ID, DeviceId device = DEVICE_ID) {
+        std::vector<PointerProperties> properties;
+        std::vector<PointerCoords> coords;
+        for (const auto id : ids) {
+            properties.push_back(PointerProperties{id, source == AINPUT_SOURCE_MOUSE ?
+                                                        ToolType::MOUSE : ToolType::FINGER});
+            PointerCoords point{};
+            point.clear();
+            EXPECT_EQ(OK, point.setAxisValue(AMOTION_EVENT_AXIS_X, static_cast<float>(id * 10 + 1)));
+            EXPECT_EQ(OK, point.setAxisValue(AMOTION_EVENT_AXIS_Y, static_cast<float>(id * 10 + 2)));
+            coords.push_back(point);
+        }
+        auto event = std::make_shared<MotionEntry>(
+                InputEvent::nextId(), nullptr, ARBITRARY_TIME, device, source, display,
+                POLICY_FLAG_TRUSTED | POLICY_FLAG_PASS_TO_USER, action, 0, ftl::Flags<MotionFlag>{},
+                AMETA_NONE, 0, MotionClassification::NONE, 1, 1, 0, 0, ARBITRARY_TIME,
+                properties, coords);
+        event->externalDesktopPointerOwnership = std::move(ownership);
+        return event;
+    }
+    void setStreamFirstNewForTest(InputState& state, int32_t index) {
+        ASSERT_EQ(state.mMotionMementos.size(), 1u);
+        state.mMotionMementos.front().firstNewPointerIdx = index;
+    }
+    int32_t streamFirstNewForTest(const InputState& state) const {
+        EXPECT_EQ(state.mMotionMementos.size(), 1u);
+        return state.mMotionMementos.empty() ? -99 : state.mMotionMementos.front().firstNewPointerIdx;
+    }
+    std::shared_ptr<Connection> streamConnection(const sp<FakeWindowHandle>& window) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mConnectionManager.getConnection(window->getToken());
+    }
+    // Read-only enqueue projection, NOT proof that a key reached the client.
+    // The balancing tests establish delivery separately using the real socket.
+    std::vector<int32_t> enqueuedKeyCodesForBalanceTest(
+            const std::shared_ptr<Connection>& connection) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        std::vector<int32_t> result;
+        for (const auto& key : connection->inputState.mKeyMementos) result.push_back(key.keyCode);
+        return result;
+    }
+    std::optional<int32_t> fallbackKeyForBalanceTest(
+            const std::shared_ptr<Connection>& connection, int32_t original) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return connection->inputState.getFallbackKey(original);
+    }
+    sp<IBinder> focusedTokenForBalanceTest(ui::LogicalDisplayId display) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mFocusResolver.getFocusedWindowToken(display);
+    }
+    auto repeatForBalanceTest() const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return std::make_pair(mDispatcher->mKeyRepeatState.lastKeyEntry,
+                              mDispatcher->mKeyRepeatState.nextRepeatTime);
+    }
+    std::shared_ptr<Connection> balanceConnectionForToken(const sp<IBinder>& token) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mConnectionManager.getConnection(token);
+    }
+    std::optional<std::pair<std::shared_ptr<const EventEntry>, bool>>
+    waitedKeyForBalanceTest(const std::shared_ptr<Connection>& connection, uint32_t seq) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        const auto packet = std::find_if(connection->waitQueue.begin(), connection->waitQueue.end(),
+                                         [seq](const auto& entry) { return entry->seq == seq; });
+        if (packet == connection->waitQueue.end()) return std::nullopt;
+        return std::make_pair((*packet)->eventEntry, (*packet)->keyCanceledByDrop);
+    }
+    bool ownedWindowForBalanceTest(const sp<FakeWindowHandle>& window) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mExternalDesktopStageOwner.ownsNativeWindow(*window->getInfo());
+    }
+    bool trySavedRecipientForBalanceTest(const sp<FakeWindowHandle>& window,
+            const std::shared_ptr<Connection>& connection, const sp<IBinder>& expectedToken,
+            int32_t expectedId, ui::LogicalDisplayId display, bool foreignHandle = false) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        const sp<WindowInfoHandle> saved = foreignHandle ? sp<WindowInfoHandle>(window) :
+                mDispatcher->getFocusedWindowHandleLocked(SECOND_DISPLAY_ID);
+        return mDispatcher->cancelKeysForDroppedWindowLocked(connection, saved, expectedToken,
+                                                              expectedId, display, true);
+    }
+    void consumePublishedKeyForBalanceTest(const sp<FakeWindowHandle>& window, bool handled,
+                                          const testing::Matcher<KeyEvent>& matcher) {
+        const auto connection = streamConnection(window);
+        ASSERT_NE(connection, nullptr);
+        auto [seq, event] = window->receiveEvent();
+        ASSERT_TRUE(seq.has_value());
+        ASSERT_NE(event, nullptr);
+        ASSERT_EQ(event->getType(), InputEventType::KEY);
+        EXPECT_THAT(static_cast<const KeyEvent&>(*event), matcher);
+        // Real InputConsumer FINISHED, then observe this exact waitQueue seq
+        // leave normally. Never seed a memento, publish flag, or synthetic ACK.
+        window->finishEvent(*seq, handled);
+        ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    }
+    // Explicit fixture reservation, NOT the absent StageOwner production
+    // factory. These identities contain no channel/SC/Binder/Java resource.
+    InputTarget reserveSubmissionDoubleLocked(const InputTarget& target, const MotionEntry& physical)
+            REQUIRES(mDispatcher->mLock) {
+        InputTarget result = target;
+        // Match createDispatchEntry: cancellation belongs to its exact old
+        // origin even when the current target names a successor generation.
+        const int32_t action = MotionEvent::getActionMasked(physical.action);
+        const bool cancellation = action == AMOTION_EVENT_ACTION_CANCEL ||
+                action == AMOTION_EVENT_ACTION_HOVER_EXIT ||
+                physical.flags.test(MotionFlag::CANCELED);
+        const auto ownership = physical.externalDesktopPointerOwnership && cancellation ?
+                physical.externalDesktopPointerOwnership : target.getExternalDesktopPointerOwnership() ?
+                        target.getExternalDesktopPointerOwnership() : physical.externalDesktopPointerOwnership;
+        if (!ownership) return result;
+        auto reservation = std::shared_ptr<ExternalDesktopSubmissionReservation>(new ExternalDesktopSubmissionReservation);
+        auto& ledger = mDispatcher->mExternalDesktopSubmissionLedger;
+        for (size_t id = 0; id < ExternalDesktopPointerOwnership::kMaxIds; ++id) {
+            const auto key = ownership->key(static_cast<int32_t>(id));
+            if (!key || !physical.externalDesktopPhysicalPacket || !physical.externalDesktopPhysicalPacket->mPointers[id]) continue;
+            for (const auto& row : ledger.mRows) {
+                if (row && row->mConnection.lock() == target.connection && row->mKey == *key &&
+                    row->mId == static_cast<int32_t>(id) &&
+                    row->mPhysical == physical.externalDesktopPhysicalPacket->mPointers[id]) {
+                    reservation->mRows[id] = row; break;
+                }
+            }
+            if (reservation->mRows[id]) continue; // a closed row is NEVER reopened
+            if (!ledger.mCoverageAvailable || ledger.mRowsUsed == ledger.mRows.size()) {
+                ledger.mCoverageAvailable = false; continue;
+            }
+            auto identity = [] { return std::shared_ptr<const ExternalDesktopSubmissionIdentity>(new ExternalDesktopSubmissionIdentity); };
+            auto row = std::shared_ptr<ExternalDesktopSubmissionRow>(new ExternalDesktopSubmissionRow(target.connection,
+                    identity(), identity(), identity(), physical.externalDesktopPhysicalPacket->mPointers[id], *key,
+                    static_cast<int32_t>(id), target.connection->mExternalDesktopPublisherDestruction.mState));
+            ledger.mRows[ledger.mRowsUsed++] = row;
+            reservation->mRows[id] = std::move(row);
+        }
+        result.mExternalDesktopSubmissionReservation = std::move(reservation);
+        return result;
+    }
+    InputTarget reserveSubmissionForTest(const InputTarget& target, const std::shared_ptr<MotionEntry>& physical) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        stampMotionIngressDoubleLocked(physical);
+        return reserveSubmissionDoubleLocked(target, *physical);
+    }
+    // Explicit ledger fixture only: no queue commit, producer fence or teardown.
+    bool sealPhysicalSubmissionDoubleForTest(const std::shared_ptr<Connection>& connection,
+                                             const ExternalDesktopPointerStreamKey& key,
+                                             ExternalDesktopPointerOwnership::Ids selected,
+                                             const std::shared_ptr<MotionEntry>& physical) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        stampMotionIngressDoubleLocked(physical);
+        auto closing = mDispatcher->prepareExternalDesktopCloseLocked(connection, key, selected,
+                physical->externalDesktopPhysicalPacket);
+        if (!closing.ok() || !mDispatcher->canSealExternalDesktopCloseLocked(**closing)) return false;
+        mDispatcher->sealExternalDesktopCloseUncheckedLocked(**closing);
+        return true;
+    }
+    std::pair<size_t, size_t> submissionRowsForTest(const std::shared_ptr<Connection>& connection,
+                                                  const ExternalDesktopPointerStreamKey& key) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        std::pair<size_t, size_t> result{};
+        for (const auto& row : mDispatcher->mExternalDesktopSubmissionLedger.mRows) {
+            if (row && row->mConnection.lock() == connection && row->mKey == key) {
+                ++result.first; result.second += row->mClosing;
+            }
+        }
+        return result;
+    }
+    std::array<size_t, 3> submissionLedgerCountsForTest() const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        const auto& ledger = mDispatcher->mExternalDesktopSubmissionLedger;
+        return {ledger.mRowsUsed, ledger.mCallbacks->load(), ledger.mCoverageAvailable ? 1u : 0u};
+    }
+    // Actual factory/route bodies; no WMS/Core authority DOUBLE is supplied.
+    // Thus ordinary succeeds and every claimed/unpublished path must refuse.
+    void routeFactoryDefaultDenyForTest(const sp<FakeWindowHandle>& window) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto connection=mDispatcher->mConnectionManager.getConnection(window->getToken());
+        ASSERT_NE(connection,nullptr);
+        InputTarget target{connection};target.windowHandle=window;
+        gui::WindowInfo ordinary=*window->getInfo();
+        InputTarget defaultTarget{connection};defaultTarget.windowHandle=window;
+        ui::Transform defaultTransform;defaultTransform.set(2.f,0.f,0.f,3.f);
+        EXPECT_TRUE(mDispatcher->stampExternalDesktopTargetLocked(ordinary,nullptr,{},defaultTarget,defaultTransform));
+        EXPECT_TRUE(defaultTarget.getPointerIds().none());
+        EXPECT_EQ(defaultTarget.getDefaultPointerTransform(),defaultTransform);
+        EXPECT_EQ(defaultTarget.getExternalDesktopPointerOwnership(),nullptr);
+        EXPECT_EQ(mDispatcher->mExternalDesktopSubmissionLedger.mRowsUsed,0u);
+        EXPECT_TRUE(mDispatcher->stampExternalDesktopTargetLocked(ordinary,nullptr,std::bitset<32>(2),target,ui::Transform()));
+        EXPECT_EQ(target.getPointerIds(),std::bitset<32>(2));
+        EXPECT_EQ(target.getExternalDesktopPointerOwnership(),nullptr);
+        EXPECT_EQ(mDispatcher->mExternalDesktopSubmissionLedger.mRowsUsed,0u);
+        auto forged=ordinary;
+        forged.stageTag=gui::WindowInfo::StageTag{42,7,9,1,77};
+        EXPECT_FALSE(mDispatcher->stampExternalDesktopTargetLocked(forged,nullptr,std::bitset<32>(1),target,ui::Transform()));
+        EXPECT_EQ(target.getPointerIds(),std::bitset<32>(2)); // ordinary shared-channel peer survives
+        EXPECT_EQ(mDispatcher->mExternalDesktopSubmissionLedger.mRowsUsed,0u);
+        ExternalDesktopNativeClaims::Row historical;historical.value.kind=WS_WINDOW_CLAIM;
+        historical.value.window_id=ordinary.id;historical.value.key=1;historical.value.lifetime=123;
+        mDispatcher->mExternalDesktopStageOwner.mNativeClaims.mRows.push_back(std::move(historical));
+        EXPECT_FALSE(mDispatcher->stampExternalDesktopTargetLocked(ordinary,nullptr,std::bitset<32>(1),target,ui::Transform()));
+        EXPECT_EQ(target.getPointerIds(),std::bitset<32>(2)); // historical ID is never sentinel0
+        auto foreign=ordinary;foreign.id-=111;
+        foreign.cloneLineage=gui::WindowInfo::CloneLineage{111,{999}};
+        ExternalDesktopNativeClaims::Row root;root.value.kind=WS_ROOT_CLAIM;root.value.root_id=999;
+        mDispatcher->mExternalDesktopStageOwner.mNativeClaims.mRows.push_back(std::move(root));
+        EXPECT_FALSE(mDispatcher->stampExternalDesktopTargetLocked(foreign,nullptr,std::bitset<32>(1),target,ui::Transform()));
+        EXPECT_EQ(target.getPointerIds(),std::bitset<32>(2));
+    }
+    void rawMouseHoverMoveProvenanceForTest() {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto raw=streamMotion(ACTION_HOVER_MOVE,{0},nullptr,AINPUT_SOURCE_MOUSE);
+        raw->externalDesktopNativeIngress=mDispatcher->allocateExternalDesktopIngressLocked(ExternalDesktopNativeIngress::Kind::NOTIFY_MOTION);
+        const auto first=mDispatcher->observeExternalDesktopPhysicalMotionLocked(*raw);
+        ASSERT_NE(first,nullptr);ASSERT_NE(first->mPointers[0],nullptr);
+        EXPECT_EQ(raw->action,ACTION_HOVER_MOVE); // no invented Reader ENTER
+        EXPECT_EQ(first->mPointers[0]->mKind,ExternalDesktopPhysicalPointer::Kind::READER);
+        EXPECT_TRUE(first->mPointers[0]->mHover);EXPECT_FALSE(first->mPointers[0]->mActualUp);
+        const auto second=mDispatcher->observeExternalDesktopPhysicalMotionLocked(*raw);
+        ASSERT_NE(second,nullptr);EXPECT_EQ(second->mPointers[0],first->mPointers[0]);
+        EXPECT_EQ(mDispatcher->mExternalDesktopSubmissionLedger.mRowsUsed,0u); // raw hover is not an owned route
+    }
+    void physicalOwnerCensusForTest() {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto raw = streamMotion(ACTION_HOVER_MOVE, {0}, nullptr, AINPUT_SOURCE_MOUSE);
+        auto first = mDispatcher->observeExternalDesktopPhysicalMotionLocked(*raw);
+        auto second = mDispatcher->observeExternalDesktopPhysicalMotionLocked(*raw);
+        ASSERT_NE(first, nullptr); ASSERT_NE(second, nullptr);
+        ASSERT_EQ(first->mPointers[0], second->mPointers[0]);
+        auto& ledger = mDispatcher->mExternalDesktopSubmissionLedger;
+        // Explicit nonresource row fixture, NOT a real claim/Stage issuer.
+        // Query the exact const-qualified row member used by the production
+        // consumer: converting the raw packet's shared_ptr<Physical> to
+        // shared_ptr<const Physical> would itself add an unknown strong owner.
+        ledger.mRows[0] = std::shared_ptr<ExternalDesktopSubmissionRow>(new ExternalDesktopSubmissionRow(
+                {}, {}, {}, {}, first->mPointers[0], streamKey(), 0));
+        ledger.mRowsUsed = 1;
+        const auto& physical = ledger.mRows[0]->mPhysical;
+        auto expectComplete = [&]() REQUIRES(mDispatcher->mLock) {
+            const auto value = mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical);
+            ASSERT_TRUE(value.has_value());
+            EXPECT_EQ(value->submissionRows, 1u);
+            EXPECT_EQ(value->activeSlots, 1u);
+            EXPECT_EQ(value->packetSlots, 2u);
+            EXPECT_EQ(value->total(), 4u);
+        };
+        expectComplete();
+        {
+            const auto unknownOwner = physical;
+            EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+            ledger.mRows[1] = ledger.mRows[0]; // alias, NOT a second physical owner
+            EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+            ledger.mRows[1].reset();
+        }
+        expectComplete();
+        {
+            const auto unknownOwner = physical;
+            const auto unrelatedOwner = std::make_shared<int>(43);
+            auto cold = std::shared_ptr<ExternalDesktopPhysicalPacket>(new ExternalDesktopPhysicalPacket);
+            cold->mPointers[0] = std::shared_ptr<ExternalDesktopPhysicalPointer>(
+                    unrelatedOwner, first->mPointers[0].get());
+            ledger.mPhysicalPackets.back() = cold;
+            // This indexed member has the right address but owns only int43.
+            EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+            ledger.mPhysicalPackets.back().reset();
+        }
+        expectComplete();
+        {
+            auto active = std::find_if(ledger.mActivePhysical.begin(), ledger.mActivePhysical.end(),
+                                      [&](const auto& value) { return value == physical; });
+            ASSERT_NE(active, ledger.mActivePhysical.end());
+            const auto savedActive = *active; // unknown genuine owner after slot replacement
+            const auto unrelatedOwner = std::make_shared<int>(44);
+            *active = std::shared_ptr<ExternalDesktopPhysicalPointer>(unrelatedOwner, savedActive.get());
+            EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+            *active = savedActive;
+        }
+        expectComplete();
+        {
+            const auto unknownOwner = physical;
+            const auto unrelatedOwner = std::make_shared<int>(42);
+            const std::shared_ptr<const ExternalDesktopPhysicalPointer> sameAddressForeignOwner(
+                    unrelatedOwner, physical.get());
+            ASSERT_EQ(sameAddressForeignOwner.get(), physical.get());
+            ASSERT_TRUE(sameAddressForeignOwner.owner_before(physical) ||
+                        physical.owner_before(sameAddressForeignOwner));
+            // Distinct row, same address but NOT a physical owning reference.
+            // Raw-address counting would hide the real unknownOwner above.
+            ledger.mRows[1] = std::shared_ptr<ExternalDesktopSubmissionRow>(new ExternalDesktopSubmissionRow(
+                    {}, {}, {}, {}, sameAddressForeignOwner, streamKey(), 0));
+            EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+            ledger.mRows[1].reset();
+        }
+        expectComplete();
+        {
+            // An unindexed cold packet owns a real physical reference even
+            // though it holds no submission row. It must remain unexplained.
+            auto cold = std::shared_ptr<ExternalDesktopPhysicalPacket>(new ExternalDesktopPhysicalPacket);
+            cold->mPointers[0] = first->mPointers[0];
+            EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+            ledger.mPhysicalPackets.back() = cold; // explicit index fixture boundary
+            const auto withCold = mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical);
+            ASSERT_TRUE(withCold.has_value());
+            EXPECT_EQ(withCold->packetSlots, 3u);
+            EXPECT_EQ(withCold->total(), 5u);
+            ledger.mPhysicalPackets.back().reset();
+            EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+        }
+        expectComplete();
+        {
+            ExternalDesktopCallbackInFlight actualCounter(ledger.mCallbacks);
+            EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+        }
+        expectComplete();
+        const auto savedWeak = ledger.mPhysicalPackets.front();
+        ledger.mPhysicalPackets.front().reset();
+        EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+        ledger.mPhysicalPackets.front() = savedWeak;
+        ledger.mPhysicalPackets.back() = first; // explicit duplicate-index negative
+        EXPECT_FALSE(mDispatcher->censusExternalDesktopPhysicalOwnersLocked(physical));
+        ledger.mPhysicalPackets.back().reset();
+        expectComplete();
+        // A successful owner census must NOT rewrite real raw lifecycle facts.
+        EXPECT_FALSE(first->mPointers[0]->mReaderHoverExit);
+        EXPECT_FALSE(first->mPointers[0]->mActualUp);
+        EXPECT_FALSE(first->mPointers[0]->mReaderCancel);
+        EXPECT_EQ(ledger.mRowsUsed, 1u); // only the explicit cold row fixture
+    }
+    void physicalPacketCensusCapacityForTest() {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto raw = streamMotion(ACTION_HOVER_MOVE, {0}, nullptr, AINPUT_SOURCE_MOUSE);
+        auto& ledger = mDispatcher->mExternalDesktopSubmissionLedger;
+        std::vector<ExternalDesktopPhysicalPacketPtr> packets;
+        packets.reserve(ExternalDesktopSubmissionLedger::kMaxPhysicalPackets);
+        for (size_t i = 0; i < ExternalDesktopSubmissionLedger::kMaxPhysicalPackets; ++i) {
+            packets.push_back(mDispatcher->observeExternalDesktopPhysicalMotionLocked(*raw));
+            ASSERT_NE(packets.back(), nullptr);
+        }
+        ASSERT_TRUE(ledger.mCoverageAvailable);
+        const auto expired = std::weak_ptr<const ExternalDesktopPhysicalPacket>(packets.back());
+        packets.back().reset();
+        ASSERT_TRUE(expired.expired()); // genuinely dead packet, not weak-cache eviction
+        packets.back() = mDispatcher->observeExternalDesktopPhysicalMotionLocked(*raw);
+        ASSERT_NE(packets.back(), nullptr);
+        EXPECT_TRUE(ledger.mCoverageAvailable);
+        const auto active = ledger.mActivePhysical;
+        EXPECT_EQ(mDispatcher->observeExternalDesktopPhysicalMotionLocked(*raw), nullptr);
+        EXPECT_FALSE(ledger.mCoverageAvailable);
+        EXPECT_EQ(ledger.mActivePhysical, active); // overflow cannot replace active lifetimes
+        for (const auto& packet : packets) EXPECT_NE(packet, nullptr);
+        packets.clear();
+        EXPECT_EQ(mDispatcher->observeExternalDesktopPhysicalMotionLocked(*raw), nullptr);
+        EXPECT_FALSE(ledger.mCoverageAvailable); // sticky refusal, never pretend complete coverage
+        EXPECT_EQ(ledger.mRowsUsed, 0u);
+    }
+    size_t sentTailJournalForTest(const std::shared_ptr<Connection>& connection,
+                                 const ExternalDesktopPointerStreamKey& key) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        size_t sent = 0;
+        for (const auto& row : mDispatcher->mExternalDesktopSubmissionLedger.mRows) {
+            if (row && row->mConnection.lock() == connection && row->mKey == key) sent += row->mTail->mSent;
+        }
+        return sent;
+    }
+    void publisherLocalFdOrderingForTest() {
+        std::unique_ptr<InputChannel> server, client;
+        ASSERT_EQ(OK, InputChannel::openInputChannelPair("local-fd-order", server, client));
+        IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+        auto connection = std::make_shared<Connection>(std::move(server), false, generator);
+        const auto state = connection->mExternalDesktopPublisherDestruction.mState;
+        EXPECT_FALSE(state->mLocalFdDestroyed.load(std::memory_order_acquire));
+        EXPECT_EQ(client->receiveMessage().error().code(), WOULD_BLOCK);
+        connection.reset(); // entire publisher/unique channel/base fd, THEN sentinel
+        EXPECT_TRUE(state->mLocalFdDestroyed.load(std::memory_order_acquire));
+        auto response = client->receiveMessage();
+        ASSERT_FALSE(response.ok());
+        EXPECT_EQ(response.error().code(), DEAD_OBJECT); // actual socket peer is gone
+    }
+    void routeProducerClosureForTest(const sp<FakeWindowHandle>& window) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto connection=mDispatcher->mConnectionManager.getConnection(window->getToken());
+        ASSERT_NE(connection,nullptr);
+        const auto key=streamKey();
+        auto event=streamMotion(ACTION_CANCEL,{0});event->externalDesktopPointerOwnership=streamOwners({{0,key}});
+        stampMotionIngressDoubleLocked(event); // explicitly NOT a Reader/authority witness
+        auto producer=std::shared_ptr<ExternalDesktopSubmissionIdentity>(new ExternalDesktopSubmissionIdentity);
+        auto identity=[] {return std::shared_ptr<const ExternalDesktopSubmissionIdentity>(new ExternalDesktopSubmissionIdentity);};
+        auto row=std::shared_ptr<ExternalDesktopSubmissionRow>(new ExternalDesktopSubmissionRow(connection,identity(),identity(),producer,
+            event->externalDesktopPhysicalPacket->mPointers[0],key,0,connection->mExternalDesktopPublisherDestruction.mState));
+        auto& ledger=mDispatcher->mExternalDesktopSubmissionLedger;
+        ledger.mRows[ledger.mRowsUsed++]=row;
+        auto reservation=std::shared_ptr<ExternalDesktopSubmissionReservation>(new ExternalDesktopSubmissionReservation);
+        reservation->mRows[0]=row;
+        DispatchEntry cancel(event,{},ui::Transform(),ui::Transform(),1.f,window->getInfo()->ownerUid,0,window->getInfo()->id);
+        cancel.externalDesktopPointerOwnership=event->externalDesktopPointerOwnership;
+        cancel.externalDesktopSubmissionReservation=reservation;
+        cancel.externalDesktopPhysicalMotionOrigin=event;
+        EXPECT_FALSE(mDispatcher->validExternalDesktopPublicationLocked(connection,cancel)); // CANCEL alone is not a closing capability
+        // Only invalidation behavior is seeded here, not a valid publication.
+        auto publication=std::make_unique<ExternalDesktopStageOwner::NativeRoutePublication>();publication->producer=producer;
+        mDispatcher->mExternalDesktopStageOwner.mRoutePublication=std::move(publication);
+        mDispatcher->mExternalDesktopStageOwner.invalidateNativeRoutes();
+        EXPECT_EQ(producer->mState,ExternalDesktopSubmissionIdentity::State::INERT);
+        mDispatcher->closeInactiveExternalDesktopSubmissionsLocked(connection);
+        EXPECT_TRUE(row->mClosing);EXPECT_EQ(ledger.mRowsUsed,1u);EXPECT_EQ(ledger.mRows[0],row);
+        EXPECT_FALSE(mDispatcher->validExternalDesktopPublicationLocked(connection,cancel)); // same packet cannot revive after close
+        auto replacement=std::make_unique<ExternalDesktopStageOwner::NativeRoutePublication>();
+        replacement->producer=std::shared_ptr<ExternalDesktopSubmissionIdentity>(new ExternalDesktopSubmissionIdentity);
+        mDispatcher->mExternalDesktopStageOwner.mRoutePublication=std::move(replacement);
+        EXPECT_EQ(producer->mState,ExternalDesktopSubmissionIdentity::State::INERT);EXPECT_TRUE(row->mClosing);
+        EXPECT_FALSE(mDispatcher->validExternalDesktopPublicationLocked(connection,cancel)); // fresh producer does not relabel held pointer
+        EXPECT_EQ(ledger.mRowsUsed,1u);EXPECT_EQ(ledger.mRows[0],row); // not UP/ACK/retirement
+        mDispatcher->mExternalDesktopStageOwner.invalidateNativeRoutes();
+    }
+    std::shared_ptr<const ExternalDesktopPhysicalPointer> physicalPointerForTest(
+            const std::shared_ptr<Connection>& connection, const MotionEntry& query, int32_t id) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        const auto* packet = connection->externalDesktopNativePacketForReplay(query);
+        return packet && packet->physical && packet->physical->externalDesktopPhysicalPacket ?
+                packet->physical->externalDesktopPhysicalPacket->mPointers[id] : nullptr;
+    }
+    std::array<bool, 6> physicalFactsForTest(const std::shared_ptr<const ExternalDesktopPhysicalPointer>& pointer) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return pointer ? std::array<bool, 6>{pointer->mKind == ExternalDesktopPhysicalPointer::Kind::READER,
+                pointer->mActualUp, pointer->mReaderCancel, pointer->mDeviceReset,
+                pointer->mReaderHoverExit, pointer->mButtonRelease} : std::array<bool, 6>{};
+    }
+    void callbackInFlightContractForTest() {
+        std::shared_ptr<std::atomic<size_t>> counter;
+        {
+            std::scoped_lock lock(mDispatcher->mLock);
+            counter = mDispatcher->mExternalDesktopSubmissionLedger.mCallbacks;
+            EXPECT_EQ(counter->load(), 0u);
+        }
+        {
+            ExternalDesktopCallbackInFlight first(counter);
+            EXPECT_EQ(counter->load(), 1u);
+            {
+                ExternalDesktopCallbackInFlight second(counter);
+                EXPECT_EQ(counter->load(), 2u);
+            }
+            EXPECT_EQ(counter->load(), 1u);
+        }
+        EXPECT_EQ(counter->load(), 0u);
+    }
+    std::unique_ptr<DispatchEntry> enqueueStreamForTest(
+            const std::shared_ptr<MotionEntry>& event, const InputTarget& target) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        stampMotionIngressDoubleLocked(event);
+        if (mDispatcher->mTracer && !event->traceTracker) {
+            event->traceTracker = mDispatcher->mTracer->traceInboundEvent(*event);
+        }
+        const size_t before = target.connection->outboundQueue.size();
+        const auto reservedTarget = reserveSubmissionDoubleLocked(target, *event);
+        mDispatcher->enqueueDispatchEntryLocked(target.connection, event, reservedTarget);
+        if (target.connection->outboundQueue.size() != before + 1) return nullptr;
+        auto result = std::move(target.connection->outboundQueue.back());
+        target.connection->outboundQueue.pop_back();
+        // Deliberately do NOT publish/ACK. This checks the actual enqueue/copy
+        // owner, not PhaseB last-published state or a simulated release fence.
+        return result;
+    }
+    std::unique_ptr<MotionEntry> splitStreamForTest(MotionEntry& event,
+                                                   std::bitset<MAX_POINTER_ID + 1> ids) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        if (mDispatcher->mTracer && !event.traceTracker) {
+            event.traceTracker = mDispatcher->mTracer->traceInboundEvent(event);
+        }
+        return mDispatcher->splitMotionEvent(event, ids, ARBITRARY_TIME);
+    }
+    void clearStreamStateForTest(const std::shared_ptr<Connection>& connection) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        connection->inputState.clear();
+    }
+    bool seedStreamStateForTest(const std::shared_ptr<Connection>& connection,
+                                const MotionEntry& event) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        connection->inputState.clear();
+        return connection->inputState.trackMotion(event, event.flags);
+    }
+    std::string streamTouchStateForTest() const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->mTouchStates.dump();
+    }
+    static std::unique_ptr<DispatchEntry> publicationPacket(
+            const std::shared_ptr<MotionEntry>& event, float translate = 0) {
+        ui::Transform transform;
+        transform.set(translate, -translate);
+        return std::make_unique<DispatchEntry>(event, ftl::Flags<InputTarget::Flags>{},
+                                               transform, transform, 2.0f, gui::Uid{1000},
+                                               29, 41);
+    }
+    bool publishStreamForTest(const std::shared_ptr<MotionEntry>& event, const InputTarget& target) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        stampMotionIngressDoubleLocked(event);
+        const nsecs_t processingTime = systemTime(SYSTEM_TIME_MONOTONIC);
+        const bool ownsProcessing = mDispatcher->mTracer && !event->traceTracker;
+        if (mDispatcher->mTracer && !event->traceTracker) {
+            event->traceTracker = mDispatcher->mTracer->traceInboundEvent(*event);
+        }
+        if (mDispatcher->mTracer) {
+            mDispatcher->mTracer->dispatchToTargetHint(*event->traceTracker, target);
+        }
+        const size_t before = target.connection->outboundQueue.size();
+        const auto reservedTarget = reserveSubmissionDoubleLocked(target, *event);
+        mDispatcher->enqueueDispatchEntryLocked(target.connection, event, reservedTarget);
+        const bool enqueued = target.connection->outboundQueue.size() == before + 1;
+        if (enqueued) {
+            mDispatcher->startDispatchCycleLocked(processingTime, target.connection);
+        }
+        // Match stock processing: collect all target hints before dispatch,
+        // then flush this newly-created inbound trace before the client reads.
+        // An existing/derived tracker remains its original owner's completion.
+        if (ownsProcessing) {
+            mDispatcher->mTracer->eventProcessingComplete(*event->traceTracker, processingTime);
+        }
+        return enqueued;
+    }
+    bool waitForPublicationAckForTest(const std::shared_ptr<Connection>& connection, uint32_t seq) {
+        const auto deadline = std::chrono::steady_clock::now() + 100ms;
+        do {
+            {
+                std::scoped_lock lock(mDispatcher->mLock);
+                if (!connection || connection->status != Connection::Status::NORMAL) return false;
+                const auto pending = std::find_if(connection->waitQueue.begin(),
+                        connection->waitQueue.end(), [seq](const auto& entry) { return entry->seq == seq; });
+                if (pending == connection->waitQueue.end()) return true;
+            }
+            // ACK reception/stock finish-command owns removal. Never hold mLock
+            // while waiting, erase a packet, fake an ACK or await unrelated UP.
+            std::this_thread::sleep_for(1ms);
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    }
+    Connection::ExternalDesktopStreamReferences publicationReferencesForTest(
+            const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return connection->externalDesktopStreamReferences(key);
+    }
+    void abortPublicationForTest(const std::shared_ptr<Connection>& connection) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        mDispatcher->abortBrokenDispatchCycleLocked(connection, false);
+    }
+    std::optional<float> publishedXForTest(const std::shared_ptr<Connection>& connection,
+                                          const ExternalDesktopPointerStreamKey& key) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        std::optional<float> result;
+        connection->externalDesktopPublishedMotion.forEach(key, [&](const auto& saved, const auto&) {
+            EXPECT_FALSE(result.has_value());
+            result = saved.coords[0].getX();
+        });
+        return result;
+    }
+    bool retryBlockedPublicationForTest(const std::shared_ptr<Connection>& connection) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        mDispatcher->startDispatchCycleLocked(systemTime(SYSTEM_TIME_MONOTONIC), connection);
+        // For this valid one-pointer/one-memento packet, prepare must succeed.
+        // A NORMAL connection with a nonempty wait and outbound queue after
+        // startDispatch returns has hit the actual publisher WOULD_BLOCK path.
+        return connection->status == Connection::Status::NORMAL &&
+                !connection->waitQueue.empty() && !connection->outboundQueue.empty() &&
+                connection->externalDesktopPublishedMotion.prepare(*connection->outboundQueue.front()).ok();
+    }
+    bool deliveredMotionCoverageForTest(const std::shared_ptr<Connection>& connection) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return connection->externalDesktopDeliveredMotionForReplay() != nullptr;
+    }
+    std::optional<std::pair<std::vector<PointerProperties>, std::vector<PointerCoords>>>
+    deliveredMotionForTest(const std::shared_ptr<Connection>& connection,
+                           const MotionEntry& query, bool hover = false) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        const InputState* delivered = connection->externalDesktopDeliveredMotionForReplay();
+        return delivered ? delivered->getPointersOfLastEvent(query, hover) : std::nullopt;
+    }
+    size_t enqueuedPointerCountForTest(const std::shared_ptr<Connection>& connection,
+                                      const MotionEntry& query) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        const auto state = connection->inputState.copyExternalDesktopPhysicalMotionSnapshotForOwner(query, false);
+        EXPECT_TRUE(state.ok());
+        return state.ok() && state->has_value() ? (*state)->pointerProperties.size() : 0;
+    }
+    void deliveredPreparationContractForTest(const std::shared_ptr<Connection>& first,
+                                            const std::shared_ptr<Connection>& second) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto down = publicationPacket(streamMotion(ACTION_DOWN, {0}));
+        auto prepared = first->prepareExternalDesktopDeliveredMotion(*down);
+        EXPECT_FALSE(second->commitExternalDesktopDeliveredMotion(std::move(prepared)));
+        EXPECT_TRUE(first->commitExternalDesktopDeliveredMotion(std::move(prepared)));
+        EXPECT_FALSE(first->commitExternalDesktopDeliveredMotion(std::move(prepared)));
+        auto moving = publicationPacket(streamMotion(ACTION_MOVE, {0}));
+        auto stale = first->prepareExternalDesktopDeliveredMotion(*moving);
+        auto current = first->prepareExternalDesktopDeliveredMotion(*moving);
+        EXPECT_TRUE(first->commitExternalDesktopDeliveredMotion(std::move(current)));
+        EXPECT_FALSE(first->commitExternalDesktopDeliveredMotion(std::move(stale)));
+    }
+    void exhaustPublicationRevisionForTest(ExternalDesktopPublishedMotion& state) {
+        state.mRevision = std::numeric_limits<uint64_t>::max();
+    }
+
+    // Retention-only fixture rows: no Reader/SF/authority or live admission is
+    // issued here. Real immutable row/reservation/closing types own the refs.
+    struct SnapshotRowForTest { int32_t slot, id; ExternalDesktopPointerStreamKey key; };
+    std::shared_ptr<ExternalDesktopSubmissionReservation> snapshotRowsForTest(
+            std::initializer_list<SnapshotRowForTest> rows) {
+        auto out = std::shared_ptr<ExternalDesktopSubmissionReservation>(new ExternalDesktopSubmissionReservation);
+        for (const auto& row : rows) {
+            out->mRows[row.slot] = std::shared_ptr<ExternalDesktopSubmissionRow>(
+                    new ExternalDesktopSubmissionRow({}, {}, {}, {}, {}, row.key, row.id));
+        }
+        return out;
+    }
+    std::weak_ptr<ExternalDesktopSubmissionRow> snapshotRowForTest(
+            const ExternalDesktopSubmissionReservationPtr& owner, size_t id) const {
+        if (!owner) return {};
+        return owner->mRows[id];
+    }
+    std::shared_ptr<ExternalDesktopClosingHandle> snapshotClosingOwnerForTest(
+            const ExternalDesktopSubmissionReservationPtr& owner) const {
+        auto closing = std::shared_ptr<ExternalDesktopClosingHandle>(new ExternalDesktopClosingHandle);
+        closing->mRows = owner->mRows; // a cold reference owner, NOT an authorized close/publication
+        return closing;
+    }
+    bool bindSnapshotHoverForTest(ExternalDesktopPublishedMotion& state, DispatchEntry& packet,
+                                 const ExternalDesktopPointerOwnershipPtr& removed,
+                                 const std::shared_ptr<Connection>& connection) const {
+        return state.bindHoverRetirement(packet, removed, connection, state).ok();
+    }
+
+    // Exercise the REAL enqueue/queue owner without automatically publishing.
+    // Only fixture-created private keys enter this cold, default-off seam.
+    bool queueUnsentForTest(const std::shared_ptr<Connection>& connection,
+                            const sp<FakeWindowHandle>& window,
+                            const std::shared_ptr<MotionEntry>& event, bool foreground = false) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        stampMotionIngressDoubleLocked(event);
+        ExternalDesktopPointerOwnership::Ids ids;
+        if (!ExternalDesktopPointerOwnership::idsOf(event->pointerProperties, ids)) return false;
+        InputTarget target{connection};
+        if (foreground) target.flags |= InputTarget::Flags::FOREGROUND;
+        target.windowHandle = window;
+        ui::Transform geometry;
+        geometry.set(31.0f, -17.0f);
+        if (!target.addPointersWithOwnership(ids, geometry, event->externalDesktopPointerOwnership).ok()) return false;
+        const bool ownsTrace = mDispatcher->mTracer && !event->traceTracker;
+        if (ownsTrace) {
+            event->traceTracker = mDispatcher->mTracer->traceInboundEvent(*event);
+            mDispatcher->mTracer->dispatchToTargetHint(*event->traceTracker, target);
+        }
+        const size_t before = connection->outboundQueue.size();
+        const auto reservedTarget = reserveSubmissionDoubleLocked(target, *event);
+        mDispatcher->enqueueDispatchEntryLocked(connection, event, reservedTarget);
+        if (ownsTrace) mDispatcher->mTracer->eventProcessingComplete(
+                *event->traceTracker, systemTime(SYSTEM_TIME_MONOTONIC));
+        return connection->outboundQueue.size() == before + 1;
+    }
+    std::optional<uint32_t> queueUnsentKeyForTest(const std::shared_ptr<Connection>& connection,
+                                                const sp<FakeWindowHandle>& window) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto event = std::make_shared<KeyEntry>(InputEvent::nextId(), nullptr, ARBITRARY_TIME,
+                DEVICE_ID, AINPUT_SOURCE_KEYBOARD, DISPLAY_ID, POLICY_FLAG_TRUSTED,
+                AKEY_EVENT_ACTION_DOWN, 0, AKEYCODE_A, KEY_A, AMETA_NONE, 0, ARBITRARY_TIME);
+        InputTarget target{connection}; target.windowHandle = window;
+        if (mDispatcher->mTracer) {
+            event->traceTracker = mDispatcher->mTracer->traceInboundEvent(*event);
+            mDispatcher->mTracer->dispatchToTargetHint(*event->traceTracker, target);
+        }
+        const size_t before = connection->outboundQueue.size();
+        mDispatcher->enqueueDispatchEntryLocked(connection, event, target);
+        if (mDispatcher->mTracer) mDispatcher->mTracer->eventProcessingComplete(
+                *event->traceTracker, systemTime(SYSTEM_TIME_MONOTONIC));
+        if (connection->outboundQueue.size() != before + 1) return std::nullopt;
+        return connection->outboundQueue.back()->seq;
+    }
+    bool removeUnsentForTest(const std::shared_ptr<Connection>& connection,
+                             const ExternalDesktopPointerStreamKey& key) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->removeExternalDesktopUnpublishedStreamLocked(connection, key).ok();
+    }
+    std::vector<uint32_t> unsentSequencesForTest(const std::shared_ptr<Connection>& connection,
+                                               bool sent = false) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        std::vector<uint32_t> result;
+        for (const auto& packet : sent ? connection->waitQueue : connection->outboundQueue) result.push_back(packet->seq);
+        return result;
+    }
+    std::vector<std::shared_ptr<const MotionEntry>> unsentMotionsForTest(
+            const std::shared_ptr<Connection>& connection) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        std::vector<std::shared_ptr<const MotionEntry>> result;
+        for (const auto& packet : connection->outboundQueue) {
+            if (packet->eventEntry->type == EventEntry::Type::MOTION) {
+                result.push_back(std::static_pointer_cast<const MotionEntry>(packet->eventEntry));
+            }
+        }
+        return result;
+    }
+    // Only these unsent fixtures publish several MOVE packets before receiving.
+    // Stock InputConsumer may return them as historical samples in one event.
+    // Keep the normal receiver/batching and trace EVERY original packet rather
+    // than comparing a history-bearing event to one dispatch trace record.
+    class UnsentSampleTrace {
+    public:
+        UnsentSampleTrace(InputDispatcherTest& fixture, const FakeWindowHandle& window,
+                          const std::vector<std::shared_ptr<const MotionEntry>>& packets)
+              : mFixture(fixture),
+                mWindowId(window.getId()),
+                mPackets(packets),
+                mPrevious(std::move(FakeWindowHandle::sOnEventReceivedCallback)) {
+            EXPECT_FALSE(mPackets.empty());
+            EXPECT_LE(mPackets.size(), 4u);
+            FakeWindowHandle::sOnEventReceivedCallback =
+                    [this](const auto& event, const auto& info) { onReceived(event, info); };
+        }
+        ~UnsentSampleTrace() {
+            FakeWindowHandle::sOnEventReceivedCallback = std::move(mPrevious);
+        }
+        UnsentSampleTrace(const UnsentSampleTrace&) = delete;
+        UnsentSampleTrace& operator=(const UnsentSampleTrace&) = delete;
+
+        size_t sampleCount() const { return mSamples; }
+        size_t receivedEvents() const { return mReceivedEvents; }
+        size_t historicalSamples() const { return mHistoricalSamples; }
+
+    private:
+        void onReceived(const std::unique_ptr<InputEvent>& event, const WindowInfo& info) {
+            if (!event || info.id != mWindowId || event->getType() != InputEventType::MOTION) {
+                if (mPrevious) mPrevious(event, info);
+                return;
+            }
+            const auto& motion = static_cast<const MotionEvent&>(*event);
+            const size_t count = motion.getHistorySize() + 1;
+            ASSERT_LE(mSamples, mPackets.size());
+            ASSERT_LE(count, mPackets.size() - mSamples);
+            for (size_t sample = 0; sample < count; ++sample) {
+                const auto& packet = *mPackets[mSamples + sample];
+                SCOPED_TRACE(testing::Message() << "originalPacket=" << mSamples + sample);
+                EXPECT_EQ(motion.getAction(), packet.action);
+                EXPECT_EQ(motion.getDownTime(), packet.downTime);
+                EXPECT_EQ(motion.getDeviceId(), packet.deviceId);
+                EXPECT_EQ(motion.getSource(), packet.source);
+                EXPECT_EQ(motion.getDisplayId(), packet.displayId);
+                EXPECT_EQ(motion.getSampleEventTimes()[sample], packet.eventTime);
+                ASSERT_EQ(motion.getPointerCount(), packet.pointerProperties.size());
+                for (size_t pointer = 0; pointer < motion.getPointerCount(); ++pointer) {
+                    EXPECT_EQ(*motion.getPointerProperties(pointer), packet.pointerProperties[pointer]);
+                    EXPECT_EQ(motion.getSamplePointerCoords()[sample * motion.getPointerCount() + pointer],
+                              packet.pointerCoords[pointer]);
+                    EXPECT_FLOAT_EQ(motion.getHistoricalX(pointer, sample),
+                                    packet.pointerCoords[pointer].getX() + 31.0f);
+                    EXPECT_FLOAT_EQ(motion.getHistoricalY(pointer, sample),
+                                    packet.pointerCoords[pointer].getY() - 17.0f);
+                }
+                // addSample retains only the final event ID, not historical IDs.
+                // The historical ID here is the saved EXACT post-rewrite packet
+                // oracle; all other fields come from this received sample.
+                MotionEvent single;
+                single.initialize(packet.id, motion.getDeviceId(), motion.getSource(),
+                                  motion.getDisplayId(), motion.getHmac(), motion.getAction(),
+                                  motion.getActionButton(), motion.getFlags(), motion.getEdgeFlags(),
+                                  motion.getMetaState(), motion.getButtonState(),
+                                  motion.getClassification(), motion.getTransform(),
+                                  motion.getXPrecision(), motion.getYPrecision(),
+                                  motion.getRawXCursorPosition(), motion.getRawYCursorPosition(),
+                                  motion.getRawTransform(), motion.getDownTime(),
+                                  motion.getSampleEventTimes()[sample], motion.getPointerCount(),
+                                  motion.getPointerProperties(),
+                                  motion.getSamplePointerCoords() + sample * motion.getPointerCount());
+                mFixture.mVerifyingTrace->expectMotionDispatchTraced(single, info.id);
+            }
+            EXPECT_EQ(motion.getId(), mPackets[mSamples + count - 1]->id);
+            mSamples += count;
+            ++mReceivedEvents;
+            mHistoricalSamples += motion.getHistorySize();
+        }
+
+        InputDispatcherTest& mFixture;
+        const int32_t mWindowId;
+        const std::vector<std::shared_ptr<const MotionEntry>>& mPackets;
+        decltype(FakeWindowHandle::sOnEventReceivedCallback) mPrevious;
+        size_t mSamples = 0;
+        size_t mReceivedEvents = 0;
+        size_t mHistoricalSamples = 0;
+    };
+    void publishRemainingUnsentForTest(const std::shared_ptr<Connection>& connection) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        mDispatcher->startDispatchCycleLocked(systemTime(SYSTEM_TIME_MONOTONIC), connection);
+    }
+    void unsentStaleOwnerContractsForTest(const std::shared_ptr<Connection>& first,
+                                         const std::shared_ptr<Connection>& second,
+                                         const ExternalDesktopPointerStreamKey& key) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto prepared = first->prepareExternalDesktopUnsentRemoval(key);
+        ASSERT_TRUE(prepared.ok());
+        EXPECT_FALSE(second->commitExternalDesktopUnsentRemoval(**prepared));
+        // A same-queue but changed advanced motion projection also fences an
+        // old preparation. Never overwrite a transfer/clear performed later.
+        first->inputState.clear();
+        EXPECT_FALSE(first->commitExternalDesktopUnsentRemoval(**prepared));
+    }
+    void loseUnsentCoverageForTest(const std::shared_ptr<Connection>& connection) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        connection->invalidateExternalDesktopDeliveredMotion();
+    }
+    int32_t unsentInjectionReferencesForTest(const std::shared_ptr<InjectionState>& state) const {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return state->pendingForegroundDispatches;
+    }
+    bool queueSavedCancellationForTest(const std::shared_ptr<Connection>& connection,
+                                       const ExternalDesktopPointerStreamKey& key) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        return mDispatcher->queueExternalDesktopSavedCancellationLocked(connection, key).ok();
+    }
+    // Explicit PUBLIC TEST DOUBLE only: these fake referents do NOT issue
+    // claims/streams or model the future production StageOwner factory.
+    std::unique_ptr<ExternalDesktopTrustedTransfer> transferCapabilityDoubleForTest(
+            const sp<FakeWindowHandle>& from, const sp<FakeWindowHandle>& to,
+            const InputTarget& resolvedTarget, ExternalDesktopPointerOwnership::Ids selected,
+            const ExternalDesktopPointerStreamKey& oldKey, const ExternalDesktopPointerStreamKey& newKey) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto source = mDispatcher->mConnectionManager.getConnection(from->getToken());
+        auto destination = mDispatcher->mConnectionManager.getConnection(to->getToken());
+        if (!source || !destination) return nullptr;
+        auto endpoint = [&](const sp<FakeWindowHandle>& requested) {
+            base::ScopedLockAssertion assumeLocked(mDispatcher->mLock);
+            sp<WindowInfoHandle> actual;
+            for (const auto& handle : mDispatcher->mWindowInfos.getWindowHandlesForDisplay(requested->getInfo()->displayId)) {
+                if (handle->getInfo()->id == requested->getInfo()->id &&
+                    handle->getToken() == requested->getToken()) {
+                    if (actual) return sp<WindowInfoHandle>{};
+                    actual = handle;
+                }
+            }
+            return actual;
+        };
+        const auto a = endpoint(from), b = endpoint(to);
+        if (!a || !b) return nullptr;
+        std::shared_ptr<const MotionEntry> physical, resolved;
+        source->externalDesktopPublishedMotion.forEach(oldKey, [&](const auto& snapshot, auto ids) {
+            if ((ids & selected) == selected) { physical = snapshot.physicalOrigin; resolved = snapshot.traceOrigin; }
+        });
+        if (!physical || !resolved) return nullptr;
+        InputTarget target = resolvedTarget; target.windowHandle = b;
+        target = reserveSubmissionDoubleLocked(target, *physical);
+        auto identity = []() { return std::make_shared<ExternalDesktopStageObjectIdentity>(); };
+        return std::unique_ptr<ExternalDesktopTrustedTransfer>(new ExternalDesktopTrustedTransfer(
+                source, destination, {a, *a->getInfo(), identity(), identity()},
+                {b, *b->getInfo(), identity(), identity()}, identity(), physical, resolved,
+                std::make_shared<const InputTarget>(std::move(target)), selected, oldKey, newKey,
+                source->externalDesktopPublishedMotion.revision(), destination->externalDesktopPublishedMotion.revision(),
+                source->mExternalDesktopDeliveredMotionRevision, destination->mExternalDesktopDeliveredMotionRevision,
+                mDispatcher->mWindowInfosVsyncId));
+    }
+    bool transferForTest(ExternalDesktopTrustedTransfer& capability) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto prepared = mDispatcher->prepareExternalDesktopTrustedTransferLocked(capability);
+        return prepared.ok() && mDispatcher->commitExternalDesktopTrustedTransferLocked(**prepared).ok();
+    }
+    void transferStaleSecondOwnerForTest(ExternalDesktopTrustedTransfer& capability) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto prepared = mDispatcher->prepareExternalDesktopTrustedTransferLocked(capability);
+        ASSERT_TRUE(prepared.ok());
+        auto source = capability.mSource.lock(), destination = capability.mDestination.lock();
+        ASSERT_NE(source, destination);
+        const auto beforeSource = source->outboundQueue.size();
+        const auto beforeDestination = destination->outboundQueue.size();
+        auto oldSource = source->inputState.copyExternalDesktopMotionProjection();
+        ASSERT_TRUE(oldSource.ok());
+        destination->invalidateExternalDesktopDeliveredMotion();
+        EXPECT_FALSE(mDispatcher->commitExternalDesktopTrustedTransferLocked(**prepared).ok());
+        EXPECT_EQ(source->outboundQueue.size(), beforeSource);
+        EXPECT_EQ(destination->outboundQueue.size(), beforeDestination);
+        EXPECT_TRUE(source->inputState.sameExternalDesktopMotionProjection(**oldSource));
+        EXPECT_FALSE(capability.mConsumed);
+        for (const auto& row : mDispatcher->mExternalDesktopSubmissionLedger.mRows) {
+            if (row && row->mConnection.lock() == source && row->mKey == capability.mOldKey) {
+                EXPECT_FALSE(row->mClosing); // failed atomic commit never seals the source
+            }
+        }
+    }
+    void invalidateTransferEndpointDoubleForTest(ExternalDesktopTrustedTransfer& capability) {
+        capability.mTo.immutableInfo.id += 1;
+    }
+    void expectTransferProvenanceForTest(const ExternalDesktopTrustedTransfer& capability,
+                                        const std::shared_ptr<MotionEntry>& raw) {
+        EXPECT_EQ(capability.mPhysicalOrigin, raw);
+        EXPECT_NE(capability.mResolvedOrigin, raw); // nonuniform/zero normalization owns a copy
+    }
+    std::optional<ExternalDesktopPointerStreamKey> enqueuedOwnerForTest(
+            const std::shared_ptr<Connection>& connection, const MotionEntry& query,
+            bool hover, int32_t id) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        const auto state = connection->inputState.copyExternalDesktopPhysicalMotionSnapshotForOwner(query, hover);
+        EXPECT_TRUE(state.ok());
+        return state.ok() && state->has_value() ?
+                ExternalDesktopPointerOwnership::keyAt((*state)->externalDesktopPointerOwnership, id) : std::nullopt;
+    }
+    void queueMotionToTargetForTest(const std::shared_ptr<MotionEntry>& event,
+                                    const InputTarget& target) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        stampMotionIngressDoubleLocked(event);
+        const bool ownsTrace = mDispatcher->mTracer && !event->traceTracker;
+        if (ownsTrace) event->traceTracker = mDispatcher->mTracer->traceInboundEvent(*event);
+        if (mDispatcher->mTracer) mDispatcher->mTracer->dispatchToTargetHint(*event->traceTracker, target);
+        const size_t before = target.connection->outboundQueue.size();
+        const auto reservedTarget = reserveSubmissionDoubleLocked(target, *event);
+        mDispatcher->enqueueDispatchEntryLocked(target.connection, event, reservedTarget);
+        EXPECT_EQ(target.connection->outboundQueue.size(), before + 1);
+        if (ownsTrace) mDispatcher->mTracer->eventProcessingComplete(*event->traceTracker, systemTime(SYSTEM_TIME_MONOTONIC));
+    }
+    void splitPhysicalToTargetForTest(const std::shared_ptr<MotionEntry>& physical,
+                                      const InputTarget& target, bool publish) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        stampMotionIngressDoubleLocked(physical);
+        const bool ownsTrace = mDispatcher->mTracer && !physical->traceTracker;
+        if (ownsTrace) physical->traceTracker = mDispatcher->mTracer->traceInboundEvent(*physical);
+        if (mDispatcher->mTracer) mDispatcher->mTracer->dispatchToTargetHint(*physical->traceTracker, target);
+        auto split = mDispatcher->splitMotionEvent(*physical, target.getPointerIds(),
+                target.firstDownTimeInTarget.value_or(physical->downTime));
+        ASSERT_NE(split, nullptr);
+        const size_t count = target.connection->outboundQueue.size();
+        const auto reservedTarget = reserveSubmissionDoubleLocked(target, *physical);
+        mDispatcher->enqueueDispatchEntryLocked(target.connection, std::move(split), reservedTarget, physical);
+        ASSERT_EQ(target.connection->outboundQueue.size(), count + 1);
+        if (publish) mDispatcher->startDispatchCycleLocked(systemTime(SYSTEM_TIME_MONOTONIC), target.connection);
+        if (ownsTrace) mDispatcher->mTracer->eventProcessingComplete(*physical->traceTracker, systemTime(SYSTEM_TIME_MONOTONIC));
+    }
+    void replaceTransferOriginDoubleForTest(ExternalDesktopTrustedTransfer& cap) {
+        cap.mPhysicalOrigin = streamMotion(ACTION_MOVE, {0});
+    }
+    std::unique_ptr<MotionEvent> receiveAndAckTransferForTest(
+            const sp<FakeWindowHandle>& window, const std::shared_ptr<Connection>& connection) {
+        auto [seq, event] = window->receiveEvent();
+        EXPECT_TRUE(seq.has_value()); EXPECT_NE(event, nullptr);
+        if (!seq || !event) return nullptr;
+        EXPECT_EQ(event->getType(), InputEventType::MOTION);
+        window->finishEvent(*seq);
+        EXPECT_TRUE(waitForPublicationAckForTest(connection, *seq));
+        return event->getType() == InputEventType::MOTION ?
+                std::unique_ptr<MotionEvent>(static_cast<MotionEvent*>(event.release())) : nullptr;
+    }
+    void queueSharedPhysicalForBothForTest(const std::shared_ptr<MotionEntry>& physical,
+                                          const InputTarget& a, const InputTarget& b) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        stampMotionIngressDoubleLocked(physical);
+        ASSERT_FALSE(physical->traceTracker);
+        if (mDispatcher->mTracer) {
+            physical->traceTracker = mDispatcher->mTracer->traceInboundEvent(*physical);
+            mDispatcher->mTracer->dispatchToTargetHint(*physical->traceTracker, a);
+            mDispatcher->mTracer->dispatchToTargetHint(*physical->traceTracker, b);
+        }
+        for (const auto* target : {&a, &b}) {
+            auto split = mDispatcher->splitMotionEvent(*physical, target->getPointerIds(), physical->downTime);
+            ASSERT_NE(split, nullptr);
+            const size_t count = target->connection->outboundQueue.size();
+            const auto reservedTarget = reserveSubmissionDoubleLocked(*target, *physical);
+            mDispatcher->enqueueDispatchEntryLocked(target->connection, std::move(split), reservedTarget, physical);
+            ASSERT_EQ(target->connection->outboundQueue.size(), count + 1);
+        }
+        if (mDispatcher->mTracer) mDispatcher->mTracer->eventProcessingComplete(*physical->traceTracker, systemTime(SYSTEM_TIME_MONOTONIC));
+    }
+    // Explicit TEST_DOUBLE, not a reader notification/physical-release/claim.
+    // One raw object gets one ticket even when sent to multiple target helpers.
+    void stampMotionIngressDoubleLocked(const std::shared_ptr<MotionEntry>& event)
+            REQUIRES(mDispatcher->mLock) {
+        if (!event->externalDesktopNativeIngress) {
+            event->externalDesktopNativeIngress = mDispatcher->allocateExternalDesktopIngressLocked(ExternalDesktopNativeIngress::Kind::TEST_DOUBLE);
+        }
+        if (!event->externalDesktopPhysicalPacket && event->externalDesktopNativeIngress &&
+            event->externalDesktopNativeIngress->mKind == ExternalDesktopNativeIngress::Kind::TEST_DOUBLE) {
+            auto packet = std::shared_ptr<ExternalDesktopPhysicalPacket>(new ExternalDesktopPhysicalPacket);
+            auto& active = mDispatcher->mExternalDesktopSubmissionLedger.mActivePhysical;
+            const int32_t action = MotionEvent::getActionMasked(event->action);
+            const bool hover = action == ACTION_HOVER_ENTER || action == ACTION_HOVER_MOVE || action == ACTION_HOVER_EXIT;
+            for (const auto& property : event->pointerProperties) {
+                if (property.id < 0 || property.id > MAX_POINTER_ID) continue;
+                auto slot = std::find_if(active.begin(), active.end(), [&](const auto& p) {
+                    return p && p->mKind == ExternalDesktopPhysicalPointer::Kind::TEST_DOUBLE &&
+                            p->mDevice == event->deviceId && p->mSource == event->source &&
+                            (isMouseOrTouchpad(event->source) || p->mDisplay == event->displayId) &&
+                            p->mId == property.id && p->mHover == hover;
+                });
+                if (slot == active.end()) {
+                    slot = std::find(active.begin(), active.end(), nullptr);
+                    if (slot == active.end()) { mDispatcher->mExternalDesktopSubmissionLedger.mCoverageAvailable = false; break; }
+                    *slot = std::shared_ptr<ExternalDesktopPhysicalPointer>(new ExternalDesktopPhysicalPointer(
+                            ExternalDesktopPhysicalPointer::Kind::TEST_DOUBLE, event->deviceId, event->source,
+                            event->displayId, property.id, hover));
+                }
+                packet->mPointers[property.id] = *slot;
+            }
+            event->externalDesktopPhysicalPacket = std::move(packet);
+        }
+    }
+    void exhaustNativeIngressForTest() {
+        std::scoped_lock lock(mDispatcher->mLock);
+        mDispatcher->mExternalDesktopIngressOrdinal = std::numeric_limits<uint64_t>::max();
+        EXPECT_EQ(mDispatcher->allocateExternalDesktopIngressLocked(ExternalDesktopNativeIngress::Kind::TEST_DOUBLE), nullptr);
+        EXPECT_FALSE(mDispatcher->mExternalDesktopIngressAvailable);
+    }
+    void expectActualNotifyIngressForTest(const std::shared_ptr<Connection>& connection,
+                                          const MotionEntry& query) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        const auto* packet = connection->externalDesktopNativePacketForReplay(query);
+        ASSERT_NE(packet, nullptr); ASSERT_NE(packet->physical, nullptr);
+        const auto& ticket = packet->physical->externalDesktopNativeIngress;
+        ASSERT_NE(ticket, nullptr);
+        EXPECT_EQ(ticket->mKind, ExternalDesktopNativeIngress::Kind::NOTIFY_MOTION);
+        EXPECT_EQ(ticket->mOwner, mDispatcher->mExternalDesktopIngressOwner);
+        EXPECT_GT(ticket->mOrdinal, 0u);
+    }
+    void expectOrdinaryProvenanceForTest(const std::shared_ptr<Connection>& connection,
+                                         const MotionEvent& received,
+                                         ExternalDesktopNativeIngress::Kind expected) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto query = streamMotion(ACTION_MOVE, {0}, nullptr, received.getSource(),
+                                  received.getDisplayId(), received.getDeviceId());
+        const auto* packet = connection->externalDesktopNativePacketForReplay(*query);
+        ASSERT_NE(packet, nullptr); ASSERT_NE(packet->physical, nullptr);
+        const auto& ticket = packet->physical->externalDesktopNativeIngress;
+        ASSERT_NE(ticket, nullptr);
+        EXPECT_EQ(ticket->mKind, expected);
+        EXPECT_EQ(ticket->mOwner, mDispatcher->mExternalDesktopIngressOwner);
+        EXPECT_GT(ticket->mOrdinal, 0u);
+        EXPECT_EQ(packet->physical->isInjected(), expected == ExternalDesktopNativeIngress::Kind::INJECTED);
+        EXPECT_EQ(packet->resolved->isInjected(), expected == ExternalDesktopNativeIngress::Kind::INJECTED);
+        EXPECT_EQ(packet->physical->externalDesktopPointerOwnership, nullptr);
+        EXPECT_EQ(packet->resolved->externalDesktopPointerOwnership, nullptr);
+    }
+    std::unique_ptr<MotionEvent> publishAndAckSavedForTest(
+            const std::shared_ptr<MotionEntry>& event, const InputTarget& target,
+            const sp<FakeWindowHandle>& window) {
+        if (!publishStreamForTest(event, target)) return nullptr;
+        auto [seq, received] = window->receiveEvent();
+        EXPECT_TRUE(seq.has_value()); EXPECT_NE(received, nullptr);
+        if (!seq || !received) return nullptr;
+        EXPECT_EQ(received->getType(), InputEventType::MOTION);
+        window->finishEvent(*seq);
+        EXPECT_TRUE(waitForPublicationAckForTest(target.connection, *seq));
+        if (received->getType() != InputEventType::MOTION) return nullptr;
+        return std::unique_ptr<MotionEvent>(static_cast<MotionEvent*>(received.release()));
+    }
+    void replaceStoredCoordsForTest(InputState& state,const PointerCoords& point) {
+        ASSERT_EQ(state.mMotionMementos.size(),1u);
+        ASSERT_EQ(state.mMotionMementos.front().pointerCoords.size(),1u);
+        state.mMotionMementos.front().pointerCoords.front()=point;
+    }
+    PointerCoords storedCoordsForTest(const InputState& state) const {
+        EXPECT_EQ(state.mMotionMementos.size(),1u);
+        if(state.mMotionMementos.empty()) return {};
+        EXPECT_EQ(state.mMotionMementos.front().pointerCoords.size(),1u);
+        return state.mMotionMementos.front().pointerCoords.empty() ? PointerCoords{} :
+                state.mMotionMementos.front().pointerCoords.front();
+    }
+    void rejectUnscopedHoverShrinkForTest(const std::shared_ptr<Connection>& connection,
+                                          const std::shared_ptr<MotionEntry>& event) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        auto packet=publicationPacket(event);
+        EXPECT_FALSE(connection->externalDesktopPublishedMotion.prepare(*packet).ok());
+        const auto* delivered=connection->externalDesktopDeliveredMotionForReplay();
+        ASSERT_NE(delivered,nullptr);
+        EXPECT_FALSE(delivered->prepareExternalDesktopPublishedMotion(*event,{}).ok());
+    }
+    void rejectReusedHoverPacketCapabilityForTest(const std::shared_ptr<Connection>& connection,
+                                                 const std::shared_ptr<Connection>& other) {
+        std::scoped_lock lock(mDispatcher->mLock);
+        ASSERT_FALSE(connection->outboundQueue.empty());
+        const auto& packet=*connection->outboundQueue.front();
+        ASSERT_NE(packet.externalDesktopHoverRetirement,nullptr);
+        EXPECT_TRUE(connection->externalDesktopPublishedMotion.prepare(packet).ok());
+        auto copy=std::make_unique<DispatchEntry>(packet.eventEntry,packet.targetFlags,
+                packet.transform,packet.rawTransform,packet.globalScaleFactor,
+                packet.targetUid,packet.vsyncId,packet.windowId);
+        copy->resolvedMotionFlags=packet.resolvedMotionFlags;
+        copy->externalDesktopHoverRetirement=packet.externalDesktopHoverRetirement;
+        EXPECT_FALSE(connection->externalDesktopPublishedMotion.prepare(*copy).ok()); // wrong exact seq/packet.
+        EXPECT_FALSE(other->externalDesktopPublishedMotion.prepare(packet).ok()); // wrong actual owner.
+    }
+#endif
 
     void SetUp() override {
         perfetto::TracingInitArgs args;
@@ -194,7 +1491,7 @@ protected:
             handleEventReceivedByWindow(_1, _2);
         };
 
-        mFakePolicy = std::make_unique<FakeInputDispatcherPolicy>();
+        mFakePolicy = makePolicyForTest();
         mDispatcher = std::make_unique<
                 InputDispatcher>(*mFakePolicy,
                                  std::make_unique<input_trace::FakeInputTracingBackend>(
@@ -671,6 +1968,3123 @@ static NotifyPointerCaptureChangedArgs generatePointerCaptureChangedArgs(
 }
 
 } // namespace
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+// Public native object-reference double only. The JNI/JavaVM packet itself
+// needs the separate framework/JNI gate; this is NOT a WMS authority witness.
+class ExternalDesktopRosterTestReferences final : public ExternalDesktopStageRosterReferences {
+public:
+    explicit ExternalDesktopRosterTestReferences(std::function<void()> close = {}) : mClose(std::move(close)) {}
+    ~ExternalDesktopRosterTestReferences() override { if (mClose) mClose(); }
+    bool same(const ExternalDesktopStageRosterReferences& other) const override { return this == &other; }
+    const void* implementation() const override { return &sImplementation; }
+private:
+    inline static const char sImplementation = 0;
+    std::function<void()> mClose;
+};
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageRosterBoundsAllChildrenAndPreservesSecureSharedChannels) {
+    ExternalDesktopStageOwner owner;
+    auto client = sp<SurfaceComposerClient>::make();
+    ASSERT_EQ(client->initCheck(), NO_ERROR);
+    const auto surface = [&](const char* name) {
+        return client->createSurface(String8(name), 0, 0, PIXEL_FORMAT_UNKNOWN,
+                                     ISurfaceComposerClient::eFXSurfaceContainer);
+    };
+    auto task = surface("roster task");
+    auto first = surface("roster first");
+    auto second = surface("roster second");
+    ASSERT_TRUE(SurfaceControl::isValid(task));
+    ASSERT_TRUE(SurfaceControl::isValid(first));
+    ASSERT_TRUE(SurfaceControl::isValid(second));
+    const std::array<int64_t, 14> words{42, 10, 2, 1, 0, 100, 2, 0, 0, 1024, 768, 160, 1, 42};
+    ExternalDesktopStageLeaseView view{};
+    view.user = 0; view.topology_snapshot = {words.data(), words.size()};
+    ExternalDesktopStageRoster roster;
+    roster.references = std::make_shared<ExternalDesktopRosterTestReferences>();
+    roster.tasks.push_back({100, 10152, 0, 2, task, task->getLayerId()});
+    const auto channel = sp<BBinder>::make(), windowClient = sp<BBinder>::make();
+    roster.windows.push_back({first, channel, windowClient, first->getLayerId(), 1, 1,
+                              0x2000 /*FLAG_SECURE*/, 0, 63});
+    roster.windows.push_back({second, channel, windowClient, second->getLayerId(), 1000, 1,
+                              0x2000, 0, 63});
+    ASSERT_TRUE(validStageRoster(owner, view, roster));
+    EXPECT_EQ(roster.windows.size(), 2u); // Same BOTH Binder tokens, distinct windows.
+    EXPECT_EQ(roster.windows[0].flags, 0x2000);
+    EXPECT_EQ(roster.windows[0].state, 63u); // No secure/drop/stock-policy rewriting.
+    auto malformed = roster;
+    malformed.tasks[0].end = 1;
+    EXPECT_FALSE(validStageRoster(owner, view, malformed)); // No partial child omission.
+    malformed = roster; malformed.tasks[0].displayToken = 999;
+    EXPECT_FALSE(validStageRoster(owner, view, malformed));
+    malformed = roster; malformed.windows[1] = malformed.windows[0];
+    EXPECT_FALSE(validStageRoster(owner, view, malformed)); // Same layer is ambiguous.
+    malformed = roster; malformed.windows[1].state = 64;
+    EXPECT_FALSE(validStageRoster(owner, view, malformed));
+    malformed = roster; malformed.windows.resize(257); malformed.tasks[0].end = 257;
+    EXPECT_FALSE(validStageRoster(owner, view, malformed));
+    malformed = roster; malformed.windows.resize(8193);
+    EXPECT_FALSE(validStageRoster(owner, view, malformed));
+    EXPECT_FALSE(owner.receipt().hasCompleteBatch); // Roster is NOT an SF full batch.
+    EXPECT_EQ(owner.receipt().state, ExternalDesktopStageOwner::ReceiptState::NO_PUBLICATION);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageRosterCloseAndInvalidateDisposeAfterDispatcherUnlock) {
+    for (const int mode : {0, 1, 2}) {
+        bool destroyed = false, outsideLock = false;
+        auto refs = std::make_shared<ExternalDesktopRosterTestReferences>([&] {
+            destroyed = true; outsideLock = stageMutexAvailable();
+        });
+        std::weak_ptr<const ExternalDesktopStageRosterReferences> weak = refs;
+        auto packet = std::make_shared<ExternalDesktopStageRoster>(); packet->references = refs;
+        const auto ticket = seedStageRosterForDisposalTest(packet, mode == 1 ? 3 : 1);
+        ASSERT_GT(ticket.epoch, 0);
+        refs.reset(); packet.reset();
+        auto wrong = ticket; ++wrong.owner;
+        EXPECT_FALSE(mDispatcher->closeExternalDesktopStageSubmission(wrong));
+        EXPECT_FALSE(weak.expired());
+        if (mode == 1) {
+            const auto* current = stageRosterObservationIdentity();
+            ASSERT_NE(current, nullptr);
+            EXPECT_FALSE(mDispatcher->invalidateExternalDesktopStageSubmission(ticket, 100, 2)); // stale
+            EXPECT_EQ(stageRosterObservationIdentity(), current);
+            EXPECT_FALSE(weak.expired()); EXPECT_FALSE(destroyed);
+            EXPECT_FALSE(mDispatcher->invalidateExternalDesktopStageSubmission(ticket, 100, 3)); // equal
+            EXPECT_EQ(stageRosterObservationIdentity(), current);
+            EXPECT_FALSE(weak.expired()); EXPECT_FALSE(destroyed);
+            EXPECT_FALSE(mDispatcher->invalidateExternalDesktopStageSubmission(ticket, 999, 4));
+            EXPECT_EQ(stageRosterObservationIdentity(), current);
+            EXPECT_FALSE(weak.expired()); EXPECT_FALSE(destroyed);
+            EXPECT_FALSE(mDispatcher->invalidateExternalDesktopStageSubmission(wrong, 100, 4));
+            EXPECT_EQ(stageRosterObservationIdentity(), current);
+            EXPECT_FALSE(weak.expired()); EXPECT_FALSE(destroyed);
+            EXPECT_TRUE(mDispatcher->invalidateExternalDesktopStageSubmission(ticket, 100, 4));
+            EXPECT_EQ(stageRosterObservationIdentity(), nullptr);
+            EXPECT_TRUE(mDispatcher->closeExternalDesktopStageSubmission(ticket));
+        } else if (mode == 2) {
+            ASSERT_TRUE(closeStageBookkeepingForDisposalTest(ticket));
+            EXPECT_FALSE(mDispatcher->closeExternalDesktopStageSubmission(ticket));
+        } else {
+            EXPECT_TRUE(mDispatcher->closeExternalDesktopStageSubmission(ticket));
+        }
+        EXPECT_TRUE(destroyed); EXPECT_TRUE(outsideLock); EXPECT_TRUE(weak.expired());
+    }
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageRosterFailureAndOwnerTeardownReleaseOnlyObservations) {
+    bool destroyed = false;
+    auto refs = std::make_shared<ExternalDesktopRosterTestReferences>([&] { destroyed = true; });
+    std::weak_ptr<const ExternalDesktopStageRosterReferences> weak = refs;
+    auto packet = std::make_shared<ExternalDesktopStageRoster>(); packet->references = refs;
+    const std::array<int64_t, 14> words{42, 10, 2, 1, 0, 100, 2, 0, 0, 1024, 768, 160, 1, 42};
+    ExternalDesktopStageLeaseView view{};
+    view.user = 0; view.topology_snapshot = {words.data(), words.size()};
+    std::shared_ptr<const ExternalDesktopStageRoster> displaced;
+    ExternalDesktopStageOwner owner;
+    EXPECT_FALSE(owner.observeRoster(view, {}, 100, 1, packet, 99, displaced));
+    EXPECT_FALSE(displaced); // No lease/view fabrication to make a positive publication.
+    auto dying = std::make_unique<ExternalDesktopStageOwner>();
+    seedStageRosterForTeardownTest(*dying, packet);
+    refs.reset(); packet.reset();
+    EXPECT_FALSE(weak.expired());
+    // The local actual owner has no callback in flight. Its real Context,
+    // epoch-child and observation destructors run, not a fake StageMachine.
+    dying.reset();
+    EXPECT_TRUE(destroyed); EXPECT_TRUE(weak.expired());
+}
+
+// New real-owner SOURCE controls, UNCOMPILED. Object identity doubles here
+// cover only native storage; JavaVM/WMS production copying requires its type
+// and deployed integration gates. Actual SC and Binder owners are retained.
+TEST_F(InputDispatcherTest, ExternalDesktopStageStructuralLifetimeGeometryIsSeparateAndRefusalsNeverEvict) {
+    ExternalDesktopStageOwner owner;
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "structural Task");
+    auto child = sourceSurfaceForTest(client, "structural child");
+    ASSERT_TRUE(task && child);
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto roster = sourceRosterForTest(task, {child}, native, taskObject,
+            {std::make_shared<ExternalDesktopStageObjectIdentity>()}, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t,1> expires{android::elapsedRealtime()+60000};
+    auto view = sourceViewForTest(expires); auto ticket = sourceTicketForTest(owner,view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner,view,ticket,roster));
+    auto batch = sourceOriginalBatchForTest(roster);
+    gui::WindowInfo structural{}; structural.id=9000; structural.alpha=1;
+    structural.displayId=ui::LogicalDisplayId{2};
+    structural.inputConfig|=gui::WindowInfo::InputConfig::NO_INPUT_CHANNEL;
+    batch.windowInfos.push_back(structural); owner.receiveFullBatch(batch,2,1);
+    const auto identity=sp<BBinder>::make(), rootIdentity=sp<BBinder>::make();
+    auto rows=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),identity,rootIdentity);
+    const auto high=sourceHighKeyForTest(owner);
+    auto first=prepareStructuralForTest(owner,rows); ASSERT_TRUE(first);
+    const auto key=rows.front().structuralSources.front().nativeLifetimeKey;
+    EXPECT_GT(key,high); EXPECT_EQ(sourceHighKeyForTest(owner),high); // not published by prepare
+    ASSERT_TRUE(commitStructuralForTest(owner,std::move(*first)));
+    EXPECT_FALSE(commitStructuralForTest(owner,std::move(*first))); // consumed preparation
+    EXPECT_EQ(retainedStructuralForTest(owner),1u);
+    batch.windowInfos[0].transform.set(11,13); owner.receiveFullBatch(batch,2,1);
+    rows=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),identity,rootIdentity);
+    auto moved=prepareStructuralForTest(owner,rows); ASSERT_TRUE(moved);
+    EXPECT_EQ(rows.front().structuralSources.front().nativeLifetimeKey,key); // geometry NOT identity
+    owner.receiveFullBatch(batch,2,1); // real observation revision invalidates the prepared commit
+    EXPECT_FALSE(commitStructuralForTest(owner,std::move(*moved)));
+    EXPECT_EQ(retainedStructuralForTest(owner),1u);
+    auto foreign=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),sp<BBinder>::make(),rootIdentity);
+    EXPECT_FALSE(prepareStructuralForTest(owner,foreign)); // no recycled WindowInfo-ID rebinding
+    EXPECT_EQ(retainedStructuralForTest(owner),1u);
+    auto alias=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),sp<BBinder>::make(),rootIdentity);
+    alias.front().structuralSources.front().windowId=roster.windows[0].layerId;
+    EXPECT_FALSE(prepareStructuralForTest(owner,alias)); // Window and Structural share one identity domain
+    sourceExhaustForTest(owner);
+    auto overflow=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),sp<BBinder>::make(),rootIdentity);
+    overflow.front().structuralSources.front().windowId=9001;
+    EXPECT_FALSE(prepareStructuralForTest(owner,overflow));
+    owner.receiveFullBatch(batch,2,1);
+    EXPECT_EQ(sourceJoinForTest(owner),ExternalDesktopSourceLifetimes::Join::ORIGINALS_OBSERVED);
+    EXPECT_EQ(retainedStructuralForTest(owner),1u); // no UP/ACK/absence/overflow release
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStructuralSnapshotRecreationCannotAliasOldLifetimeOrDiagnosticFallback) {
+    ExternalDesktopStageOwner owner;
+    auto client=sp<SurfaceComposerClient>::make();ASSERT_EQ(client->initCheck(),NO_ERROR);
+    auto task=sourceSurfaceForTest(client,"snapshot Task");
+    auto child=sourceSurfaceForTest(client,"snapshot child");ASSERT_TRUE(task && child);
+    auto roster=sourceRosterForTest(task,{child},std::make_shared<ExternalDesktopStageObjectIdentity>(),
+            std::make_shared<ExternalDesktopStageObjectIdentity>(),{std::make_shared<ExternalDesktopStageObjectIdentity>()},
+            std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t,1> expires{android::elapsedRealtime()+60000};
+    auto view=sourceViewForTest(expires);auto ticket=sourceTicketForTest(owner,view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner,view,ticket,roster));
+    auto batch=sourceOriginalBatchForTest(roster);gui::WindowInfo structural{};
+    structural.id=9000;structural.displayId=ui::LogicalDisplayId{2};
+    structural.inputConfig|=gui::WindowInfo::InputConfig::NO_INPUT_CHANNEL;
+    batch.windowInfos.push_back(structural);owner.receiveFullBatch(batch,2,1);
+    const auto sourceIdentity=sp<BBinder>::make(),rootIdentity=sp<BBinder>::make();
+    auto rows=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),sourceIdentity,rootIdentity);
+    auto prepared=prepareStructuralForTest(owner,rows);ASSERT_TRUE(prepared);
+    const auto firstKey=rows[0].structuralSources[0].nativeLifetimeKey;
+    ASSERT_TRUE(commitStructuralForTest(owner,std::move(*prepared)));
+    rows=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),sourceIdentity,rootIdentity);
+    rows[0].structuralSources[0].snapshotIdentity=sp<BBinder>::make();
+    EXPECT_FALSE(prepareStructuralForTest(owner,rows)); // Same numeric ID is NOT a recreation identity.
+    EXPECT_EQ(retainedStructuralForTest(owner),1u);
+    rows[0].structuralSources[0].windowId=9001;
+    auto recreated=prepareStructuralForTest(owner,rows);ASSERT_TRUE(recreated);
+    EXPECT_GT(rows[0].structuralSources[0].nativeLifetimeKey,firstKey);
+    ASSERT_TRUE(commitStructuralForTest(owner,std::move(*recreated)));
+    EXPECT_EQ(retainedStructuralForTest(owner),2u); // Never release old lifetime from a new observation.
+    rows=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),sourceIdentity,rootIdentity);
+    rows[0].structuralSources[0].orderedRootLifetimes={sp<BBinder>::make()};
+    EXPECT_FALSE(prepareStructuralForTest(owner,rows)); // Full ordered root identity is independent.
+    rows=TEST_DOUBLE_structuralRows(sourceBatchForTest(owner),sourceIdentity,rootIdentity);
+    rows[0].coherentSourceFacts=false;
+    const auto high=sourceHighKeyForTest(owner);
+    auto diagnostic=prepareStructuralForTest(owner,rows);ASSERT_TRUE(diagnostic);
+    EXPECT_EQ(rows[0].structuralSources[0].nativeLifetimeKey,0u);
+    EXPECT_EQ(sourceHighKeyForTest(owner),high);EXPECT_EQ(retainedStructuralForTest(owner),2u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageLifetimeKeepsDistinctChildrenWithSharedChannelsAcrossGeometry) {
+    ExternalDesktopStageOwner owner;
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "source task");
+    auto first = sourceSurfaceForTest(client, "source first"), second = sourceSurfaceForTest(client, "source second");
+    ASSERT_TRUE(SurfaceControl::isValid(task)); ASSERT_TRUE(SurfaceControl::isValid(first)); ASSERT_TRUE(SurfaceControl::isValid(second));
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>(), taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    const std::vector<ExternalDesktopStageObject> objects{std::make_shared<ExternalDesktopStageObjectIdentity>(), std::make_shared<ExternalDesktopStageObjectIdentity>()};
+    auto roster = sourceRosterForTest(task, {first, second}, native, taskObject, objects, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t, 1> expires{android::elapsedRealtime() + 60000};
+    auto view = sourceViewForTest(expires); auto ticket = sourceTicketForTest(owner, view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    const auto children = sourceChildKeysForTest(owner);
+    ASSERT_EQ(children.size(), 2u); EXPECT_NE(children[0], children[1]);
+    EXPECT_EQ(roster.windows[0].channel, roster.windows[1].channel);
+    EXPECT_EQ(roster.windows[0].client, roster.windows[1].client);
+    auto batch = sourceOriginalBatchForTest(roster); owner.receiveFullBatch(batch, 2, 1);
+    ASSERT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::ORIGINALS_OBSERVED);
+    const auto windows = sourceWindowKeysForTest(owner); ASSERT_EQ(windows.size(), 2u); EXPECT_NE(windows[0], windows[1]);
+    auto moved = roster; moved.windows[1].state = 2; moved.windows[1].flags |= 0x20;
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, moved));
+    batch.windowInfos[0].transform.set(11.0f, 13.0f);
+    owner.receiveFullBatch(batch, 2, 1);
+    EXPECT_EQ(sourceChildKeysForTest(owner), children); EXPECT_EQ(sourceWindowKeysForTest(owner), windows);
+    EXPECT_EQ(roster.windows[0].flags, 0x2000); // Stock secure ordinary support retained.
+    EXPECT_EQ(retainedSourceChildrenForTest(owner), 2u); EXPECT_EQ(retainedSourceWindowsForTest(owner), 2u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageLifetimeRejectsWholeForeignOrOverflowSuccessorWithoutEviction) {
+    ExternalDesktopStageOwner owner; sourceCapacityForTest(owner, 2);
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "bounded task"), a = sourceSurfaceForTest(client, "a"), b = sourceSurfaceForTest(client, "b");
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>(), taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    const std::vector<ExternalDesktopStageObject> objects{std::make_shared<ExternalDesktopStageObjectIdentity>(), std::make_shared<ExternalDesktopStageObjectIdentity>()};
+    auto roster = sourceRosterForTest(task, {a, b}, native, taskObject, objects, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t, 1> expires{android::elapsedRealtime() + 60000};
+    auto view = sourceViewForTest(expires); auto ticket = sourceTicketForTest(owner, view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    const auto keys = sourceChildKeysForTest(owner);
+    const auto high = sourceHighKeyForTest(owner);
+    auto bad = roster; bad.tasks[0].taskToken++;
+    EXPECT_FALSE(commitSourceObjectsForTest(owner, view, ticket, bad));
+    bad = roster; bad.windows[1].windowIdentity.reset();
+    EXPECT_FALSE(commitSourceObjectsForTest(owner, view, ticket, bad));
+    bad = roster; bad.windows[1].type = 2011; // IME/protected system is not an app child.
+    EXPECT_FALSE(commitSourceObjectsForTest(owner, view, ticket, bad));
+    bad = roster; bad.tasks[0].end = 1;
+    EXPECT_FALSE(commitSourceObjectsForTest(owner, view, ticket, bad));
+    EXPECT_EQ(sourceChildKeysForTest(owner), keys); EXPECT_EQ(sourceHighKeyForTest(owner), high);
+    auto empty = roster; empty.windows.clear(); empty.tasks[0].end = 0;
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, empty));
+    auto extra = sourceSurfaceForTest(client, "overflow child");
+    bad = roster; bad.windows.push_back({extra, roster.windows[0].channel, roster.windows[0].client,
+        extra->getLayerId(), 1000, 1, 0x2000, 0, 63, taskObject, std::make_shared<ExternalDesktopStageObjectIdentity>()});
+    bad.tasks[0].end = 3;
+    EXPECT_FALSE(commitSourceObjectsForTest(owner, view, ticket, bad));
+    EXPECT_EQ(retainedSourceChildrenForTest(owner), 2u); // Empty frame never evicted history.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageLifetimeJoinsOnlyCompleteExactOriginalRowsNeverUnownedCloneTags) {
+    ExternalDesktopStageOwner owner;
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "join task"), a = sourceSurfaceForTest(client, "join child");
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>(), taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto roster = sourceRosterForTest(task, {a}, native, taskObject, {std::make_shared<ExternalDesktopStageObjectIdentity>()}, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t, 1> expires{android::elapsedRealtime() + 60000};
+    auto view = sourceViewForTest(expires); auto ticket = sourceTicketForTest(owner, view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    auto batch = sourceOriginalBatchForTest(roster); owner.receiveFullBatch(batch, 1, 1);
+    ASSERT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::ORIGINALS_OBSERVED);
+    const auto old = sourceWindowKeysForTest(owner);
+    auto bad = batch; bad.windowInfos[0].ownerUid = gui::Uid{1000}; owner.receiveFullBatch(bad, 1, 1);
+    EXPECT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::REJECTED);
+    bad = batch; bad.windowInfos.push_back(bad.windowInfos[0]); owner.receiveFullBatch(bad, 2, 1);
+    EXPECT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::REJECTED);
+    bad = batch; bad.windowInfos[0].inputConfig |= WindowInfo::InputConfig::TRUSTED_OVERLAY;
+    owner.receiveFullBatch(bad, 1, 1); EXPECT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::REJECTED);
+    auto clone = batch.windowInfos[0]; clone.id += 100000;
+    clone.cloneLineage = WindowInfo::CloneLineage{static_cast<uint32_t>(a->getLayerId()), {999}};
+    clone.stageTag = WindowInfo::StageTag{42, 7, 10, 1, 77}; batch.windowInfos.push_back(clone);
+    const auto untouched = batch.windowInfos[1]; owner.receiveFullBatch(batch, 1, 1);
+    EXPECT_EQ(sourceWindowKeysForTest(owner), old); EXPECT_EQ(retainedSourceWindowsForTest(owner), 1u);
+    EXPECT_EQ(batch.windowInfos[1], untouched); // Tag/path does not issue a presentation or alter phone input.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageLifetimeRecreatedWindowCannotInheritObservedIdOrAnotherOwner) {
+    ExternalDesktopStageOwner owner;
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "recreate task"), a = sourceSurfaceForTest(client, "recreate child");
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>(), taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto roster = sourceRosterForTest(task, {a}, native, taskObject, {std::make_shared<ExternalDesktopStageObjectIdentity>()}, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t, 1> expires{android::elapsedRealtime() + 60000};
+    auto view = sourceViewForTest(expires); auto ticket = sourceTicketForTest(owner, view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    auto batch = sourceOriginalBatchForTest(roster); owner.receiveFullBatch(batch, 1, 1);
+    const auto original = sourceChildKeysForTest(owner);
+    auto replacement = roster; replacement.windows[0].windowIdentity = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, replacement));
+    EXPECT_NE(sourceChildKeysForTest(owner), original); owner.receiveFullBatch(batch, 1, 1);
+    EXPECT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::REJECTED);
+    EXPECT_EQ(retainedSourceChildrenForTest(owner), 2u); EXPECT_EQ(retainedSourceWindowsForTest(owner), 1u);
+    auto wrong = ticket; ++wrong.owner;
+    EXPECT_FALSE(commitSourceObjectsForTest(owner, view, wrong, replacement));
+    replacement.nativeOwnerIdentity = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    EXPECT_FALSE(commitSourceObjectsForTest(owner, view, ticket, replacement));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageLifetimeMissingOrClosedPublicationNeverRetiresHistory) {
+    ExternalDesktopStageOwner owner;
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "closed task"), a = sourceSurfaceForTest(client, "closed child");
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>(), taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto roster = sourceRosterForTest(task, {a}, native, taskObject, {std::make_shared<ExternalDesktopStageObjectIdentity>()}, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t, 1> expires{android::elapsedRealtime() + 60000};
+    auto view = sourceViewForTest(expires); auto ticket = sourceTicketForTest(owner, view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    owner.receiveFullBatch(sourceOriginalBatchForTest(roster), 1, 1);
+    ASSERT_EQ(retainedSourceWindowsForTest(owner), 1u);
+    owner.receiveFullBatch(gui::WindowInfosUpdate{}, 0, 0);
+    EXPECT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::INCOMPLETE);
+    EXPECT_EQ(retainedSourceWindowsForTest(owner), 1u);
+    EXPECT_TRUE(owner.closeSubmission(ticket));
+    EXPECT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::NO_ROSTER);
+    EXPECT_EQ(retainedSourceChildrenForTest(owner), 1u); EXPECT_EQ(retainedSourceWindowsForTest(owner), 1u);
+    EXPECT_FALSE(owner.closeSubmission(ticket)); // Terminal close is not physical retirement/drain.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageLifetimeCounterExhaustionRefusesWithoutPartialMutation) {
+    ExternalDesktopStageOwner owner;
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "counter task"), a = sourceSurfaceForTest(client, "counter child");
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>(), taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto roster = sourceRosterForTest(task, {a}, native, taskObject, {std::make_shared<ExternalDesktopStageObjectIdentity>()}, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t, 1> expires{android::elapsedRealtime() + 60000};
+    auto view = sourceViewForTest(expires); auto ticket = sourceTicketForTest(owner, view);
+    sourceExhaustForTest(owner);
+    EXPECT_FALSE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    EXPECT_EQ(retainedSourceChildrenForTest(owner), 0u); EXPECT_EQ(retainedSourceWindowsForTest(owner), 0u);
+    EXPECT_EQ(sourceHighKeyForTest(owner), UINT64_MAX); // No wrapping/fallback/recycled ID.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageLifetimePreparationsAreOwnerBoundMovedOnceAndFencedByCloseOrBatch) {
+    ExternalDesktopStageOwner owner, foreign;
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "prepared task"), a = sourceSurfaceForTest(client, "prepared child");
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>(), taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto roster = sourceRosterForTest(task, {a}, native, taskObject, {std::make_shared<ExternalDesktopStageObjectIdentity>()}, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t, 1> expires{android::elapsedRealtime() + 60000};
+    auto view = sourceViewForTest(expires); auto ticket = sourceTicketForTest(owner, view);
+    auto prepared = prepareSourceObjectsForTest(owner, view, ticket, roster); ASSERT_TRUE(prepared);
+    auto moved = std::move(*prepared);
+    EXPECT_FALSE(commitPreparedSourceForTest(owner, std::move(*prepared)));
+    EXPECT_FALSE(commitPreparedSourceForTest(foreign, std::move(moved)));
+    EXPECT_FALSE(commitPreparedSourceForTest(owner, std::move(moved))); // Wrong-owner attempt consumed it.
+    EXPECT_EQ(retainedSourceChildrenForTest(owner), 0u); EXPECT_EQ(retainedSourceChildrenForTest(foreign), 0u);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    auto beforeBatch = prepareSourceObjectsForTest(owner, view, ticket, roster); ASSERT_TRUE(beforeBatch);
+    owner.receiveFullBatch(gui::WindowInfosUpdate{}, 0, 0);
+    EXPECT_FALSE(commitPreparedSourceForTest(owner, std::move(*beforeBatch)));
+    auto beforeClose = prepareSourceObjectsForTest(owner, view, ticket, roster); ASSERT_TRUE(beforeClose);
+    ASSERT_TRUE(owner.closeSubmission(ticket));
+    EXPECT_FALSE(commitPreparedSourceForTest(owner, std::move(*beforeClose)));
+    EXPECT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::NO_ROSTER);
+    EXPECT_EQ(retainedSourceChildrenForTest(owner), 1u); // No resurrection and no history eviction.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageLifetimeSurvivingObjectsKeepPhysicalIdsAcrossAdmittedDisplays) {
+    ExternalDesktopStageOwner owner;
+    auto client = sp<SurfaceComposerClient>::make(); ASSERT_EQ(client->initCheck(), NO_ERROR);
+    auto task = sourceSurfaceForTest(client, "moving task"), a = sourceSurfaceForTest(client, "moving child");
+    auto native = std::make_shared<ExternalDesktopStageObjectIdentity>(), taskObject = std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto roster = sourceRosterForTest(task, {a}, native, taskObject, {std::make_shared<ExternalDesktopStageObjectIdentity>()}, std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t, 1> expiry{android::elapsedRealtime() + 60000};
+    auto view = sourceViewForTest(expiry);
+    const std::array<int64_t, 23> words{42, 10, 2, 2, 0,
+        100, 2, 0, 0, 1024, 768, 160, 1, 42, 200, 3, 0, 0, 1024, 768, 160, 1, 42};
+    const std::array<int64_t, 2> expires{expiry[0], expiry[0]};
+    view.topology_snapshot = {words.data(), words.size()}; view.expires_by_display = {expires.data(), expires.size()};
+    auto ticket = sourceTicketForTest(owner, view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    auto batch = sourceOriginalBatchForTest(roster); owner.receiveFullBatch(batch, 1, 1);
+    ASSERT_EQ(sourceJoinForTest(owner), ExternalDesktopSourceLifetimes::Join::ORIGINALS_OBSERVED);
+    const auto children = sourceChildKeysForTest(owner), windows = sourceWindowKeysForTest(owner);
+    const auto presentations = sourcePresentationKeysForTest(owner);
+    roster.tasks[0].displayToken = 200; // Current association changes, actual Java/SC/Binder referents survive.
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    batch.windowInfos[0].displayId = ui::LogicalDisplayId{3};
+    owner.receiveFullBatch(batch, 1, 1);
+    EXPECT_EQ(sourceChildKeysForTest(owner), children); EXPECT_EQ(sourceWindowKeysForTest(owner), windows);
+    EXPECT_EQ(sourcePresentationKeysForTest(owner), presentations);
+    auto newRoot = sourceSurfaceForTest(client, "new physical Task root");
+    roster.tasks[0].surface = newRoot; roster.tasks[0].layerId = newRoot->getLayerId();
+    ASSERT_TRUE(commitSourceObjectsForTest(owner, view, ticket, roster));
+    owner.receiveFullBatch(batch, 1, 1);
+    EXPECT_EQ(sourceChildKeysForTest(owner), children); EXPECT_EQ(sourceWindowKeysForTest(owner), windows);
+    EXPECT_NE(sourcePresentationKeysForTest(owner), presentations); // A new actual root is a new presentation lifetime.
+    EXPECT_EQ(retainedSourceChildrenForTest(owner), 1u); EXPECT_EQ(retainedSourceWindowsForTest(owner), 1u);
+}
+
+// Actual dispatcher/real Rust Context cases, not a StageMachine model or an
+// activation claim. The existing upstream fake channels supply ordinary input.
+TEST_F(InputDispatcherTest, ExternalDesktopStageOwnerKeepsOneContextAndSeesAllInstalledMaps) {
+    const void* context = stageContextIdentity();
+    ASSERT_NE(context, nullptr);
+    const auto baseline = stageReceipt();
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto phone = sp<FakeWindowHandle>::make(application, mDispatcher, "phone",
+                                            ui::LogicalDisplayId::DEFAULT);
+    auto external = sp<FakeWindowHandle>::make(application, mDispatcher, "external",
+                                               SECOND_DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*phone->getInfo(), *external->getInfo()}, {}, 0, 0});
+    const auto receipt = stageReceipt();
+    EXPECT_EQ(receipt.observations, baseline.observations + 1);
+    EXPECT_EQ(receipt.rawWindows, 2u);
+    EXPECT_EQ(receipt.inspectedWindows, 2u);
+    EXPECT_EQ(receipt.installedWindows, 2u);
+    EXPECT_EQ(receipt.installedDisplayMaps, 2u);
+    EXPECT_EQ(receipt.state, ExternalDesktopStageOwner::ReceiptState::NO_PUBLICATION);
+    EXPECT_EQ(stageContextIdentity(), context);
+
+    // Absence updates stock maps, NOT root/window/tail ownership. Repeated
+    // zero vsync IDs are accepted diagnostics, never native stage epochs.
+    mDispatcher->onWindowInfosChanged({{}, {}, 0, 0});
+    const auto empty = stageReceipt();
+    EXPECT_EQ(empty.observations, receipt.observations + 1);
+    EXPECT_EQ(empty.rawWindows, 0u);
+    EXPECT_EQ(empty.installedWindows, 0u);
+    EXPECT_EQ(empty.installedDisplayMaps, 0u);
+    EXPECT_EQ(stageContextIdentity(), context);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageOwnerNativeArrivalIsNotSfTimestampAndNeverRefreshedByCachedJoin) {
+    ExternalDesktopStageOwner owner;
+    auto client=sp<SurfaceComposerClient>::make();ASSERT_EQ(client->initCheck(),NO_ERROR);
+    auto task=sourceSurfaceForTest(client,"arrival task"),child=sourceSurfaceForTest(client,"arrival child");
+    auto native=std::make_shared<ExternalDesktopStageObjectIdentity>(),taskObject=std::make_shared<ExternalDesktopStageObjectIdentity>();
+    auto roster=sourceRosterForTest(task,{child},native,taskObject,
+        {std::make_shared<ExternalDesktopStageObjectIdentity>()},std::make_shared<ExternalDesktopRosterTestReferences>());
+    const std::array<int64_t,1> expires{android::elapsedRealtime()+60000};
+    const auto view=sourceViewForTest(expires);const auto ticket=sourceTicketForTest(owner,view);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner,view,ticket,roster));
+    auto batch=sourceOriginalBatchForTest(roster);batch.timestamp=-999;batch.vsyncId=71;
+    const auto before=android::elapsedRealtime();owner.receiveFullBatch(batch,1,1);
+    const auto after=android::elapsedRealtime();const auto observed=owner.receipt();
+    ASSERT_TRUE(observed.hasCompleteBatch);EXPECT_EQ(observed.timestamp,-999);EXPECT_EQ(observed.vsyncId,71);
+    EXPECT_GE(observed.nativeObservedAt,before);EXPECT_LE(observed.nativeObservedAt,after);
+    ASSERT_EQ(sourceJoinForTest(owner),ExternalDesktopSourceLifetimes::Join::ORIGINALS_OBSERVED);
+    EXPECT_EQ(sourceArrivalForTest(owner),observed.nativeObservedAt);
+    ASSERT_TRUE(commitSourceObjectsForTest(owner,view,ticket,roster)); // new current roster, same actual cached batch
+    EXPECT_EQ(sourceArrivalForTest(owner),-1);
+    observeCachedBatchForTest(owner);
+    EXPECT_EQ(sourceJoinForTest(owner),ExternalDesktopSourceLifetimes::Join::ORIGINALS_OBSERVED);
+    EXPECT_EQ(sourceArrivalForTest(owner),observed.nativeObservedAt);
+    EXPECT_EQ(owner.receipt().nativeObservedAt,observed.nativeObservedAt);
+    EXPECT_EQ(owner.receipt().observations,observed.observations);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageOwnerNewCallbackKeepsMonotonicNativeClockDespiteBackwardSfDiagnostics) {
+    ExternalDesktopStageOwner owner;gui::WindowInfosUpdate batch;
+    batch.timestamp=999;batch.vsyncId=71;owner.receiveFullBatch(batch,0,0);
+    const auto first=owner.receipt();ASSERT_TRUE(first.hasCompleteBatch);
+    batch.timestamp=-999;batch.vsyncId=0;owner.receiveFullBatch(batch,0,0);
+    const auto second=owner.receipt();ASSERT_TRUE(second.hasCompleteBatch);
+    EXPECT_EQ(second.observations,first.observations+1);
+    EXPECT_GE(second.nativeObservedAt,first.nativeObservedAt); // equality is valid at ms precision
+    EXPECT_EQ(second.timestamp,-999);EXPECT_EQ(second.vsyncId,0);
+    const auto retained=second.nativeObservedAt;observeCachedBatchForTest(owner);
+    EXPECT_EQ(owner.receipt().nativeObservedAt,retained);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageOwnerReceivesRawRowsFilteredFromDispatchMaps) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "registered",
+                                             ui::LogicalDisplayId::DEFAULT);
+    WindowInfo filtered = *window->getInfo();
+    filtered.id += 100000;
+    filtered.token = sp<BBinder>::make(); // No registered dispatcher channel.
+    filtered.setInputConfig(WindowInfo::InputConfig::NO_INPUT_CHANNEL, false);
+    filtered.stageTag = WindowInfo::StageTag{42, 7, 10, 1, 77}; // NOT authority.
+    mDispatcher->onWindowInfosChanged({{*window->getInfo(), filtered}, {}, 0, 0});
+    const auto receipt = stageReceipt();
+    EXPECT_EQ(receipt.rawWindows, 2u);
+    EXPECT_EQ(receipt.inspectedWindows, 2u);
+    EXPECT_EQ(receipt.installedWindows, 1u);
+    EXPECT_EQ(receipt.informationalTagRows, 1u);
+    EXPECT_EQ(receipt.state, ExternalDesktopStageOwner::ReceiptState::NO_PUBLICATION);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageOwnerDoesNotInterceptUnclaimedTaggedPhoneWindow) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto phone = sp<FakeWindowHandle>::make(application, mDispatcher, "ordinary phone",
+                                            ui::LogicalDisplayId::DEFAULT);
+    phone->editInfo()->stageTag = WindowInfo::StageTag{42, 7, 10, 1, 77};
+    const auto inputConfig = phone->getInfo()->inputConfig;
+    mDispatcher->onWindowInfosChanged({{*phone->getInfo()}, {}, 0, 0});
+    EXPECT_EQ(stageReceipt().state, ExternalDesktopStageOwner::ReceiptState::NO_PUBLICATION);
+    EXPECT_EQ(phone->getInfo()->inputConfig, inputConfig);
+    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED,
+              injectMotionDown(*mDispatcher, AINPUT_SOURCE_TOUCHSCREEN,
+                               ui::LogicalDisplayId::DEFAULT));
+    phone->consumeMotionDown(ui::LogicalDisplayId::DEFAULT);
+    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED,
+              injectMotionUp(*mDispatcher, AINPUT_SOURCE_TOUCHSCREEN,
+                             ui::LogicalDisplayId::DEFAULT));
+    phone->consumeMotionUp(ui::LogicalDisplayId::DEFAULT);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageOwnerDoesNotDeduplicateSharedChannels) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto original = sp<FakeWindowHandle>::make(application, mDispatcher, "ordinary source",
+                                               ui::LogicalDisplayId::DEFAULT);
+    auto clone = original->clone(SECOND_DISPLAY_ID);
+    ASSERT_EQ(original->getToken(), clone->getToken());
+    ASSERT_NE(original->getId(), clone->getId());
+    mDispatcher->onWindowInfosChanged({{*original->getInfo(), *clone->getInfo()}, {}, 0, 0});
+    EXPECT_EQ(stageReceipt().rawWindows, 2u);
+    EXPECT_EQ(stageReceipt().inspectedWindows, 2u);
+    EXPECT_EQ(stageReceipt().installedWindows, 2u);
+    EXPECT_EQ(stageReceipt().state, ExternalDesktopStageOwner::ReceiptState::NO_PUBLICATION);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageOwnerBoundsPrivateInspectionWithoutClaimingWindows) {
+    ExternalDesktopStageOwner owner; // Another actual native owner, no global shared Context.
+    const void* context = independentStageContext(owner);
+    ASSERT_NE(context, nullptr);
+    gui::WindowInfosUpdate oversized;
+    oversized.windowInfos.resize(8193);
+    owner.receiveFullBatch(oversized, 0, 0);
+    EXPECT_EQ(owner.receipt().rawWindows, 8193u);
+    EXPECT_EQ(owner.receipt().inspectedWindows, 0u);
+    EXPECT_EQ(owner.receipt().state, ExternalDesktopStageOwner::ReceiptState::UNSUPPORTED_SIZE);
+    owner.receiveFullBatch(gui::WindowInfosUpdate{}, 0, 0);
+    EXPECT_EQ(owner.receipt().observations, 2u);
+    EXPECT_EQ(owner.receipt().state, ExternalDesktopStageOwner::ReceiptState::NO_PUBLICATION);
+    EXPECT_EQ(independentStageContext(owner), context);
+    // Scope exit calls the real Context deleter, with no fabricated Live,
+    // stage epoch, drained-tail proof or activation acknowledgement.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageOwnerRefusesComplexPrivateReceiptWithoutMutatingRows) {
+    ExternalDesktopStageOwner owner;
+    gui::WindowInfosUpdate update;
+    WindowInfo info;
+    for (int32_t x = 0; x < 1025; ++x) {
+        info.touchableRegion.orSelf(Rect(2 * x, 0, 2 * x + 1, 1));
+    }
+    info.stageTag = WindowInfo::StageTag{42, 7, 10, 1, 77};
+    const Region original = info.touchableRegion;
+    const auto inputConfig = info.inputConfig;
+    update.windowInfos.push_back(info);
+    owner.receiveFullBatch(update, 0, 0);
+    EXPECT_EQ(owner.receipt().state, ExternalDesktopStageOwner::ReceiptState::UNSUPPORTED_SIZE);
+    EXPECT_TRUE(update.windowInfos.front().touchableRegion.hasSameRects(original));
+    EXPECT_EQ(update.windowInfos.front().inputConfig, inputConfig);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageEpochRejectsEqualBackwardOverflowAndBurnedMarks) {
+    ExternalDesktopStageOwner owner;
+    auto* child = epochChildForBookkeepingTest(owner);
+    ASSERT_NE(child, nullptr);
+    std::array<int64_t, 14> words{42, 10, 2, 1, 0, 100, 2, 0, 0, 1024, 768, 160, 1, 42};
+    ExternalDesktopStageLeaseView view{};
+    view.expected_client_uid = 10152; view.user = 0; view.generation = 42;
+    view.topology_snapshot = {words.data(), words.size()};
+    ExternalDesktopStageEpochTicket ticket{};
+    EXPECT_EQ(external_desktop_input_epoch_reserve(child, 100, &view, &ticket), 0);
+    EXPECT_EQ(external_desktop_input_epoch_reserve(child, 99, &view, &ticket), 0);
+    EXPECT_EQ(external_desktop_input_epoch_reserve(child, INT64_MAX, &view, &ticket), 0);
+    ASSERT_EQ(external_desktop_input_epoch_reserve(child, 101, &view, &ticket), 1);
+    EXPECT_TRUE(owner.closeSubmission(ticket)); // Exact real owner, no surviving Live.
+    EXPECT_EQ(external_desktop_input_epoch_reserve(child, 101, &view, &ticket), 0);
+    words[0] = view.generation = 43;
+    ASSERT_EQ(external_desktop_input_epoch_reserve(child, 102, &view, &ticket), 1);
+    EXPECT_EQ(ticket.epoch, 102);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageEpochCrossOwnerFailsEvenWhenScalarRepeats) {
+    ExternalDesktopStageOwner oldOwner, newOwner;
+    auto* oldChild = epochChildForBookkeepingTest(oldOwner);
+    auto* newChild = epochChildForBookkeepingTest(newOwner);
+    ASSERT_NE(oldChild, nullptr); ASSERT_NE(newChild, nullptr);
+    const std::array<int64_t, 14> words{42, 10, 2, 1, 0, 100, 2, 0, 0, 1024, 768, 160, 1, 42};
+    ExternalDesktopStageLeaseView view{};
+    view.expected_client_uid = 10152; view.user = 0; view.generation = 42;
+    view.topology_snapshot = {words.data(), words.size()};
+    ExternalDesktopStageEpochTicket oldTicket{}, newTicket{};
+    ASSERT_EQ(external_desktop_input_epoch_reserve(oldChild, 101, &view, &oldTicket), 1);
+    ASSERT_EQ(external_desktop_input_epoch_reserve(newChild, 101, &view, &newTicket), 1);
+    EXPECT_EQ(oldTicket.epoch, newTicket.epoch);
+    EXPECT_NE(oldTicket.owner, newTicket.owner);
+    EXPECT_EQ(external_desktop_input_epoch_begin(newChild, &view, oldTicket, 100, 1), 0);
+    EXPECT_EQ(external_desktop_input_epoch_note(newChild, &view, oldTicket, 100, 1, 0), 0);
+    EXPECT_FALSE(newOwner.closeSubmission(oldTicket));
+    EXPECT_EQ(external_desktop_input_epoch_begin(newChild, &view, newTicket, 100, 1), 1);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageEpochFencesRealOwnerInvalidationAndLateSerial) {
+    ExternalDesktopStageOwner owner;
+    auto* child = epochChildForBookkeepingTest(owner);
+    ASSERT_NE(child, nullptr);
+    const std::array<int64_t, 14> words{42, 10, 2, 1, 0, 100, 2, 0, 0, 1024, 768, 160, 1, 42};
+    ExternalDesktopStageLeaseView view{};
+    view.expected_client_uid = 10152; view.user = 0; view.generation = 42;
+    view.topology_snapshot = {words.data(), words.size()};
+    ExternalDesktopStageEpochTicket ticket{};
+    ASSERT_EQ(external_desktop_input_epoch_reserve(child, 101, &view, &ticket), 1);
+    EXPECT_EQ(external_desktop_input_epoch_note(child, &view, ticket, 100, 1, 0), 0);
+    ASSERT_EQ(external_desktop_input_epoch_begin(child, &view, ticket, 100, 1), 1);
+    EXPECT_EQ(external_desktop_input_epoch_note(child, &view, ticket, 100, 1, 1), 1);
+    EXPECT_TRUE(owner.invalidateSubmission(ticket, 100, 2)); // No Live/authority needed.
+    EXPECT_EQ(external_desktop_input_epoch_note(child, &view, ticket, 100, 1, 0), 0);
+    EXPECT_EQ(external_desktop_input_epoch_begin(child, &view, ticket, 100, 2), 0);
+    EXPECT_EQ(external_desktop_input_epoch_begin(child, &view, ticket, 100, 3), 1);
+    EXPECT_EQ(external_desktop_input_epoch_note(child, &view, ticket, 100, 3, 2), 0);
+    view.expected_client_uid += 1;
+    EXPECT_EQ(external_desktop_input_epoch_note(child, &view, ticket, 100, 3, 0), 0);
+    EXPECT_TRUE(owner.closeSubmission(ticket));
+    EXPECT_FALSE(owner.closeSubmission(ticket));
+    EXPECT_EQ(external_desktop_input_epoch_note(child, &view, ticket, 100, 3, 1), 0);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageEpochFailedUnsubmittedSuccessorKeepsOldReceipt) {
+    ExternalDesktopStageOwner owner;
+    auto* child = epochChildForBookkeepingTest(owner);
+    ASSERT_NE(child, nullptr);
+    const std::array<int64_t, 14> words{42, 10, 2, 1, 0, 100, 2, 0, 0, 1024, 768, 160, 1, 42};
+    ExternalDesktopStageLeaseView view{};
+    view.expected_client_uid = 10152; view.user = 0; view.generation = 42;
+    view.topology_snapshot = {words.data(), words.size()};
+    ExternalDesktopStageEpochTicket first{}, rejected{};
+    ASSERT_EQ(external_desktop_input_epoch_reserve(child, 101, &view, &first), 1);
+    ASSERT_EQ(external_desktop_input_epoch_begin(child, &view, first, 100, 1), 1);
+    ASSERT_EQ(external_desktop_input_epoch_reserve(child, 102, &view, &rejected), 1);
+    EXPECT_EQ(external_desktop_input_epoch_note(child, &view, first, 100, 1, 0), 1);
+    EXPECT_TRUE(owner.closeSubmission(rejected));
+    EXPECT_EQ(external_desktop_input_epoch_note(child, &view, first, 100, 1, 1), 1);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageBatchOwnsAllRowsAndPreservesSharedChannels) {
+    ExternalDesktopStageOwner owner;
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto original = sp<FakeWindowHandle>::make(application, mDispatcher, "original",
+                                               ui::LogicalDisplayId::DEFAULT);
+    auto clone = original->clone(SECOND_DISPLAY_ID);
+    gui::WindowInfosUpdate update{{*original->getInfo(), *clone->getInfo()}, {}, 0, 123};
+    auto& source = update.windowInfos[1];
+    source.alpha = 1.0f;
+    source.name = "complete clone";
+    source.packageName = "ordinary.application";
+    source.applicationInfo.name = "application";
+    source.stageTag = WindowInfo::StageTag{42, 7, 10, 1, 77};
+    source.cloneLineage = WindowInfo::CloneLineage{123, {45, 46}};
+    source.preViewportTouchableRegion = Region(Rect(-3, -4, 80, 90));
+    const auto before = source;
+    owner.receiveFullBatch(update, 1, 1); // One row filtered from stock maps.
+    ASSERT_TRUE(owner.receipt().hasCompleteBatch);
+    const auto* saved = completeStageEvidence(owner);
+    ASSERT_NE(saved, nullptr);
+    ASSERT_EQ(saved->windowInfos.size(), 2u);
+    EXPECT_EQ(saved->windowInfos[0].token, saved->windowInfos[1].token);
+    EXPECT_NE(saved->windowInfos[0].id, saved->windowInfos[1].id);
+    EXPECT_EQ(saved->windowInfos[1], before);
+    EXPECT_EQ(saved->vsyncId, 0);
+    EXPECT_EQ(saved->timestamp, 123);
+    source.name = "mutated";
+    source.packageName.clear();
+    source.applicationInfo.name.clear();
+    source.cloneLineage->mirrorRootIds.clear();
+    source.preViewportTouchableRegion->clear();
+    source.touchableRegion.clear();
+    source.token.clear();
+    source.stageTag.reset();
+    EXPECT_EQ(saved->windowInfos[1], before);
+    EXPECT_EQ(saved->windowInfos[1].cloneLineage->mirrorRootIds,
+              (std::vector<uint32_t>{45, 46}));
+    EXPECT_TRUE(saved->windowInfos[1].preViewportTouchableRegion->hasSameRects(
+            Region(Rect(-3, -4, 80, 90))));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageBatchDistinguishesEmptyCompleteFromRejectedCallback) {
+    ExternalDesktopStageOwner owner;
+    owner.receiveFullBatch(gui::WindowInfosUpdate{}, 0, 0);
+    ASSERT_TRUE(owner.receipt().hasCompleteBatch);
+    ASSERT_NE(completeStageEvidence(owner), nullptr);
+    EXPECT_TRUE(completeStageEvidence(owner)->windowInfos.empty());
+    gui::WindowInfosUpdate unsupported;
+    unsupported.displayInfos.resize(8193);
+    owner.receiveFullBatch(unsupported, 0, 0);
+    EXPECT_FALSE(owner.receipt().hasCompleteBatch);
+    EXPECT_EQ(completeStageEvidence(owner), nullptr);
+    EXPECT_EQ(owner.receipt().state, ExternalDesktopStageOwner::ReceiptState::UNSUPPORTED_SIZE);
+    // Exact new callback, not the preceding empty callback or an invented epoch.
+    owner.receiveFullBatch(gui::WindowInfosUpdate{{}, {}, 0, 456}, 0, 0);
+    ASSERT_TRUE(owner.receipt().hasCompleteBatch);
+    EXPECT_EQ(completeStageEvidence(owner)->timestamp, 456);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageBatchBoundsBothRegionFamiliesAcrossWholeCallback) {
+    ExternalDesktopStageOwner owner;
+    Region region;
+    for (int32_t x = 0; x < 1024; ++x) {
+        region.orSelf(Rect(2 * x, 0, 2 * x + 1, 1));
+    }
+    WindowInfo info;
+    info.alpha = 1.0f;
+    info.touchableRegion = region;
+    info.preViewportTouchableRegion = region;
+    gui::WindowInfosUpdate update;
+    update.windowInfos.assign(16, info); // Exactly 32768 rectangles INCLUDING pre-viewport.
+    owner.receiveFullBatch(update, 0, 0);
+    ASSERT_TRUE(owner.receipt().hasCompleteBatch);
+    update.windowInfos.push_back(info);
+    owner.receiveFullBatch(update, 0, 0);
+    EXPECT_EQ(owner.receipt().state, ExternalDesktopStageOwner::ReceiptState::UNSUPPORTED_SIZE);
+    EXPECT_FALSE(owner.receipt().hasCompleteBatch);
+    EXPECT_EQ(completeStageEvidence(owner), nullptr);
+    EXPECT_TRUE(update.windowInfos.back().touchableRegion.hasSameRects(region));
+    EXPECT_TRUE(update.windowInfos.back().preViewportTouchableRegion->hasSameRects(region));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageBatchBoundsAllOwnedStringsWithoutTruncatingStockRows) {
+    ExternalDesktopStageOwner owner;
+    WindowInfo info;
+    info.alpha = 1.0f;
+    info.name.assign(350000, 'w');
+    info.packageName.assign(350000, 'p');
+    info.applicationInfo.name.assign(348576, 'a'); // Exactly 1MiB across all three strings.
+    gui::WindowInfosUpdate update{{info}, {}, -1, 0};
+    owner.receiveFullBatch(update, 0, 0);
+    ASSERT_TRUE(owner.receipt().hasCompleteBatch);
+    EXPECT_EQ(completeStageEvidence(owner)->windowInfos.front().applicationInfo.name.size(), 348576u);
+    update.windowInfos.front().applicationInfo.name.push_back('a');
+    owner.receiveFullBatch(update, 0, 0);
+    EXPECT_EQ(owner.receipt().state, ExternalDesktopStageOwner::ReceiptState::UNSUPPORTED_SIZE);
+    EXPECT_FALSE(owner.receipt().hasCompleteBatch);
+    EXPECT_EQ(completeStageEvidence(owner), nullptr);
+    EXPECT_EQ(update.windowInfos.front().applicationInfo.name.size(), 348577u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageBatchRejectsWholeSuccessorWhenLastLineageOverflows) {
+    ExternalDesktopStageOwner owner;
+    WindowInfo info;
+    info.alpha = 1.0f;
+    info.cloneLineage = WindowInfo::CloneLineage{123, {45}};
+    gui::WindowInfosUpdate update{{info, info}, {}, 0, 0};
+    owner.receiveFullBatch(update, 0, 0);
+    ASSERT_TRUE(owner.receipt().hasCompleteBatch);
+    update.windowInfos.back().cloneLineage->mirrorRootIds.resize(51, 45);
+    owner.receiveFullBatch(update, 0, 0);
+    EXPECT_EQ(owner.receipt().inspectedWindows, 1u);
+    EXPECT_FALSE(owner.receipt().hasCompleteBatch);
+    EXPECT_EQ(completeStageEvidence(owner), nullptr);
+    EXPECT_EQ(update.windowInfos.back().cloneLineage->mirrorRootIds.size(), 51u);
+}
+
+// PhaseA actual-owner transport cases. No producer/authority, publication/ACK,
+// stream drain or active routing is asserted by fixture-owned private keys.
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamImmutableTableBoundsAndOrdinaryAbsence) {
+    const auto a = streamKey();
+    ExternalDesktopPointerOwnershipPtr saved;
+    {
+        std::vector<ExternalDesktopPointerOwnership::Row> caller;
+        for (int32_t id = 0; id <= MAX_POINTER_ID; ++id) caller.push_back({id, std::nullopt});
+        caller[0].key = a;
+        auto value = ExternalDesktopPointerOwnership::create(caller);
+        ASSERT_TRUE(value.ok());
+        saved = *value;
+        ASSERT_NE(saved, nullptr);
+        caller[0].key.reset();
+        caller.clear();
+        caller.shrink_to_fit();
+    }
+    EXPECT_EQ(saved->ids().count(), 32u);
+    expectStreamOwner(saved, 0, a);
+    expectStreamOwner(saved, 31, std::nullopt);
+    const std::array<ExternalDesktopPointerOwnership::Row, 2> ordinary{{{0, std::nullopt}, {1, std::nullopt}}};
+    auto absent = ExternalDesktopPointerOwnership::create(ordinary);
+    ASSERT_TRUE(absent.ok());
+    EXPECT_EQ(*absent, nullptr);
+    auto invalid = a;
+    invalid.generation = 0;
+    for (const auto& rows : std::vector<std::vector<ExternalDesktopPointerOwnership::Row>>{
+                 {{0, a}, {0, a}}, {{-1, a}}, {{32, a}}, {{0, invalid}}, {}}) {
+        EXPECT_FALSE(ExternalDesktopPointerOwnership::create(rows).ok());
+    }
+    std::vector<ExternalDesktopPointerOwnership::Row> oversized(33, {0, a});
+    EXPECT_FALSE(ExternalDesktopPointerOwnership::create(oversized).ok());
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamEqualTransformsKeepDistinctAndNullOwners) {
+    auto a = streamKey();
+    auto b = streamKey(8);
+    b.windowLifetime++;
+    b.presentationLifetime++;
+    InputTarget target{nullptr};
+    ui::Transform transform;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), transform,
+                                                streamOwners({{0, a}})).ok());
+    ASSERT_TRUE(target.addPointers(std::bitset<32>(2), transform).ok());
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(4), transform,
+                                                streamOwners({{2, b}})).ok());
+    ASSERT_TRUE(target.useDefaultPointerTransform()); // Same transform, NOT same owner.
+    EXPECT_EQ(target.getPointerIds().count(), 3u);
+    const auto before = target.getExternalDesktopPointerOwnership();
+    expectStreamOwner(before, 0, a);
+    expectStreamOwner(before, 1, std::nullopt);
+    expectStreamOwner(before, 2, b);
+    EXPECT_FALSE(target.addPointersWithOwnership(std::bitset<32>(1), transform,
+                                                 streamOwners({{0, b}})).ok());
+    EXPECT_FALSE(target.addPointersWithOwnership(std::bitset<32>(8), transform,
+                                                 streamOwners({{4, b}})).ok());
+    EXPECT_EQ(target.getExternalDesktopPointerOwnership(), before);
+    transform.set(31.0f, -17.0f);
+    target.setDefaultPointerTransform(transform);
+    EXPECT_EQ(target.getExternalDesktopPointerOwnership(), before); // Geometry is not stream identity.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamPartialCancelKeepsDepartingIdentityAndSibling) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState state(generator);
+    const auto a = streamKey();
+    const auto one = streamOwners({{0, a}});
+    const auto mixed = streamOwners({{0, a}, {1, std::nullopt}});
+    ASSERT_TRUE(state.trackMotion(*streamMotion(ACTION_DOWN, {0}, one), {}));
+    ASSERT_TRUE(state.trackMotion(*streamMotion(POINTER_1_DOWN, {0, 1}, mixed), {}));
+    EXPECT_FALSE(state.trackMotion(*streamMotion(ACTION_MOVE, {0, 1}), {}));
+    std::unique_ptr<trace::EventTrackerInterface> tracker;
+    CancellationOptions exact(CancellationOptions::Mode::CANCEL_POINTER_EVENTS, "private exact", tracker);
+    exact.externalDesktopStream = a;
+    auto events = state.synthesizeCancellationEvents(ARBITRARY_TIME + 1, exact);
+    ASSERT_EQ(events.size(), 1u);
+    const auto& up = static_cast<const MotionEntry&>(*events.front());
+    EXPECT_EQ(up.action, POINTER_0_UP);
+    ASSERT_EQ(up.getPointerCount(), 2u);
+    expectStreamOwner(up.externalDesktopPointerOwnership, 0, a); // Departing row is still in this packet.
+    expectStreamOwner(up.externalDesktopPointerOwnership, 1, std::nullopt);
+    ASSERT_TRUE(state.trackMotion(up, up.flags));
+    EXPECT_TRUE(state.synthesizeCancellationEvents(ARBITRARY_TIME + 2, exact).empty());
+    EXPECT_FALSE(state.trackMotion(*streamMotion(ACTION_UP, {0}, one), {})); // Stale tail cannot erase p1.
+    EXPECT_TRUE(state.trackMotion(*streamMotion(ACTION_MOVE, {1}), {}));
+    EXPECT_TRUE(state.trackMotion(*streamMotion(ACTION_UP, {1}), {}));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamIdentityComponentsDoNotFollowGeometry) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState state(generator);
+    const auto a = streamKey();
+    const auto table = streamOwners({{0, a}});
+    ASSERT_TRUE(state.trackMotion(*streamMotion(ACTION_DOWN, {0}, table), {}));
+    for (int field = 0; field < 5; ++field) {
+        auto changed = a;
+        if (field == 0) ++changed.domain;
+        if (field == 1) ++changed.generation;
+        if (field == 2) ++changed.windowLifetime;
+        if (field == 3) ++changed.presentationLifetime;
+        if (field == 4) ++changed.streamInstance;
+        EXPECT_FALSE(state.trackMotion(*streamMotion(ACTION_MOVE, {0}, streamOwners({{0, changed}})), {}));
+        EXPECT_FALSE(state.trackMotion(*streamMotion(ACTION_UP, {0}, streamOwners({{0, changed}})), {}));
+    }
+    auto moved = streamMotion(ACTION_MOVE, {0}, table);
+    ASSERT_EQ(OK, moved->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, 73.0f));
+    ASSERT_TRUE(state.trackMotion(*moved, {}));
+    ExternalDesktopPointerOwnershipPtr saved;
+    auto last = state.getPointersOfLastEvent(*moved, false, &saved);
+    ASSERT_TRUE(last.has_value());
+    EXPECT_FLOAT_EQ(last->second[0].getX(), 73.0f);
+    expectStreamOwner(saved, 0, a);
+    auto missing = streamMotion(ACTION_MOVE, {0});
+    EXPECT_FALSE(state.getPointersOfLastEvent(*missing, false, &saved).has_value());
+    EXPECT_EQ(saved, nullptr);
+    EXPECT_TRUE(state.trackMotion(*streamMotion(ACTION_UP, {0}, table), {}));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamHoverExitThenNewLifetimeKeepsTouchSibling) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState state(generator);
+    const auto a = streamKey();
+    auto b = streamKey(9);
+    ++b.windowLifetime;
+    ++b.presentationLifetime;
+    const auto first = streamOwners({{0, a}});
+    const auto second = streamOwners({{0, b}});
+    // Real InputState transport owner, not a change to caller device/stylus policy.
+    auto touch = streamMotion(ACTION_DOWN, {1});
+    touch->deviceId = SECOND_DEVICE_ID;
+    ASSERT_TRUE(state.trackMotion(*touch, {}));
+    ASSERT_TRUE(state.trackMotion(*streamMotion(ACTION_HOVER_ENTER, {0}, first, AINPUT_SOURCE_MOUSE), {}));
+    ASSERT_TRUE(state.trackMotion(*streamMotion(ACTION_HOVER_EXIT, {0}, first, AINPUT_SOURCE_MOUSE), {}));
+    ASSERT_TRUE(state.trackMotion(*streamMotion(ACTION_HOVER_ENTER, {0}, second, AINPUT_SOURCE_MOUSE), {}));
+    EXPECT_FALSE(state.trackMotion(*streamMotion(ACTION_HOVER_EXIT, {0}, first, AINPUT_SOURCE_MOUSE), {}));
+    EXPECT_FALSE(state.trackMotion(*streamMotion(ACTION_HOVER_MOVE, {0}, nullptr, AINPUT_SOURCE_MOUSE), {}));
+    EXPECT_TRUE(state.isHovering(DEVICE_ID, AINPUT_SOURCE_MOUSE, DISPLAY_ID, second));
+    auto touchMove = streamMotion(ACTION_MOVE, {1});
+    touchMove->deviceId = SECOND_DEVICE_ID;
+    EXPECT_TRUE(state.trackMotion(*touchMove, {}));
+    std::unique_ptr<trace::EventTrackerInterface> tracker;
+    CancellationOptions exact(CancellationOptions::Mode::CANCEL_HOVER_EVENTS, "hover exact", tracker);
+    exact.externalDesktopStream = b;
+    auto exit = state.synthesizeCancellationEvents(ARBITRARY_TIME + 1, exact);
+    ASSERT_EQ(exit.size(), 1u);
+    const auto& event = static_cast<const MotionEntry&>(*exit.front());
+    EXPECT_EQ(event.action, ACTION_HOVER_EXIT);
+    expectStreamOwner(event.externalDesktopPointerOwnership, 0, b);
+    ASSERT_TRUE(state.trackMotion(event, event.flags));
+    EXPECT_TRUE(state.trackMotion(*touchMove, {}));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamMixedHoverSubsetRemainsExplicitOpenGate) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState state(generator);
+    const auto a = streamKey();
+    const auto mixed = streamOwners({{0, a}, {1, std::nullopt}});
+    // Generic validateMotionEvent permits multi-hover; some physical readers
+    // suppress it. PhaseA MUST NOT claim it malformed or broaden HOVER_EXIT.
+    auto hover = streamMotion(ACTION_HOVER_ENTER, {0, 1}, mixed, AINPUT_SOURCE_MOUSE);
+    ASSERT_TRUE(state.trackMotion(*hover, {}));
+    std::unique_ptr<trace::EventTrackerInterface> tracker;
+    CancellationOptions exact(CancellationOptions::Mode::CANCEL_HOVER_EVENTS, "open subset", tracker);
+    exact.externalDesktopStream = a;
+    EXPECT_TRUE(state.synthesizeCancellationEvents(ARBITRARY_TIME + 1, exact).empty());
+    EXPECT_TRUE(state.isHovering(DEVICE_ID, AINPUT_SOURCE_MOUSE, DISPLAY_ID, mixed));
+    auto last = state.getPointersOfLastEvent(*hover, true);
+    ASSERT_TRUE(last.has_value());
+    EXPECT_EQ(last->first.size(), 2u);
+    // Scoped mixed-hover representation/synthesis remains OPEN before activation.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamPrivateMergeRefusesAndSyntheticDownCopiesOwners) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState source(generator), destination(generator), ordinary(generator);
+    const auto a = streamKey();
+    const auto b = streamKey(8);
+    const auto both = streamOwners({{0, a}, {1, b}});
+    ASSERT_TRUE(source.trackMotion(*streamMotion(ACTION_DOWN, {0}, streamOwners({{0, a}})), {}));
+    ASSERT_TRUE(source.trackMotion(*streamMotion(POINTER_1_DOWN, {0, 1}, both), {}));
+    setStreamFirstNewForTest(source, 0); // Cold transport branch, NOT authorized transfer.
+    EXPECT_FALSE(source.mergePointerStateTo(destination));
+    EXPECT_EQ(streamFirstNewForTest(source), 0);
+    EXPECT_TRUE(destination.synthesizePointerDownEvents(ARBITRARY_TIME).empty());
+    auto down = source.synthesizePointerDownEvents(ARBITRARY_TIME);
+    ASSERT_EQ(down.size(), 2u);
+    const auto& first = static_cast<const MotionEntry&>(*down[0]);
+    const auto& second = static_cast<const MotionEntry&>(*down[1]);
+    EXPECT_EQ(first.action, ACTION_DOWN);
+    EXPECT_EQ(second.action, POINTER_1_DOWN);
+    expectStreamOwner(first.externalDesktopPointerOwnership, 0, a);
+    expectStreamOwner(second.externalDesktopPointerOwnership, 0, a);
+    expectStreamOwner(second.externalDesktopPointerOwnership, 1, b);
+    EXPECT_EQ(streamFirstNewForTest(source), INVALID_POINTER_INDEX);
+    ASSERT_TRUE(ordinary.trackMotion(*streamMotion(ACTION_DOWN, {3}), {}));
+    EXPECT_FALSE(ordinary.mergePointerStateTo(source));
+    EXPECT_TRUE(ordinary.mergePointerStateTo(destination));
+    auto ordinaryDown = destination.synthesizePointerDownEvents(ARBITRARY_TIME);
+    ASSERT_EQ(ordinaryDown.size(), 1u);
+    EXPECT_EQ(static_cast<const MotionEntry&>(*ordinaryDown[0]).externalDesktopPointerOwnership, nullptr);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamSplitKeepsOnlyActualPointerSubset) {
+    const auto a = streamKey();
+    const auto b = streamKey(8);
+    auto original = streamMotion(POINTER_1_DOWN, {0, 1}, streamOwners({{0, a}, {1, b}}));
+    auto split = splitStreamForTest(*original, std::bitset<32>(2));
+    ASSERT_NE(split, nullptr);
+    EXPECT_EQ(split->action, ACTION_DOWN);
+    ASSERT_EQ(split->getPointerCount(), 1u);
+    EXPECT_EQ(split->pointerProperties[0].id, 1);
+    expectStreamOwner(split->externalDesktopPointerOwnership, 1, b);
+    EXPECT_EQ(split->externalDesktopPointerOwnership->ids().count(), 1u);
+    EXPECT_EQ(original->externalDesktopPointerOwnership->ids().count(), 2u);
+    expectStreamOwner(original->externalDesktopPointerOwnership, 0, a);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamNormalizeAndZeroNeverMutateSharedRawEvent) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "transport", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    const auto a = streamKey();
+    const auto b = streamKey(8);
+    InputTarget first{connection};
+    first.windowHandle = window;
+    ui::Transform identity;
+    ASSERT_TRUE(first.addPointersWithOwnership(std::bitset<32>(1), identity,
+                                               streamOwners({{0, a}})).ok());
+    auto rawDown = streamMotion(ACTION_DOWN, {0});
+    auto packet = enqueueStreamForTest(rawDown, first);
+    ASSERT_NE(packet, nullptr);
+    EXPECT_EQ(rawDown->externalDesktopPointerOwnership, nullptr);
+    expectStreamOwner(packet->externalDesktopPointerOwnership, 0, a);
+    InputTarget mixed{connection};
+    mixed.windowHandle = window;
+    ui::Transform translated;
+    translated.set(30.0f, 40.0f);
+    ASSERT_TRUE(mixed.addPointersWithOwnership(std::bitset<32>(1), identity,
+                                               streamOwners({{0, a}})).ok());
+    ASSERT_TRUE(mixed.addPointersWithOwnership(std::bitset<32>(2), translated,
+                                               streamOwners({{1, b}})).ok());
+    auto raw = streamMotion(POINTER_1_DOWN, {0, 1});
+    auto normalized = enqueueStreamForTest(raw, mixed);
+    ASSERT_NE(normalized, nullptr);
+    EXPECT_EQ(raw->externalDesktopPointerOwnership, nullptr);
+    expectStreamOwner(normalized->externalDesktopPointerOwnership, 0, a);
+    expectStreamOwner(normalized->externalDesktopPointerOwnership, 1, b);
+    const auto& motion = static_cast<const MotionEntry&>(*normalized->eventEntry);
+    expectStreamOwner(motion.externalDesktopPointerOwnership, 1, b);
+    EXPECT_FLOAT_EQ(raw->pointerCoords[1].getX(), 11.0f);
+    clearStreamStateForTest(connection);
+    first.flags |= InputTarget::Flags::ZERO_COORDS;
+    auto zero = enqueueStreamForTest(rawDown, first);
+    ASSERT_NE(zero, nullptr);
+    const auto& zeroMotion = static_cast<const MotionEntry&>(*zero->eventEntry);
+    EXPECT_FLOAT_EQ(zeroMotion.pointerCoords[0].getX(), 0.0f);
+    expectStreamOwner(zeroMotion.externalDesktopPointerOwnership, 0, a);
+    EXPECT_EQ(rawDown->externalDesktopPointerOwnership, nullptr);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamResolveDisplayHoverAndCancelOriginWithoutRetag) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "resolve", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    const auto a = streamKey();
+    auto newer = a;
+    ++newer.generation;
+    InputTarget target{connection};
+    target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(),
+                                                streamOwners({{0, a}})).ok());
+    auto raw = streamMotion(ACTION_HOVER_MOVE, {0}, nullptr, AINPUT_SOURCE_MOUSE, SECOND_DISPLAY_ID);
+    auto hover = enqueueStreamForTest(raw, target);
+    ASSERT_NE(hover, nullptr);
+    const auto& resolved = static_cast<const MotionEntry&>(*hover->eventEntry);
+    EXPECT_EQ(resolved.action, ACTION_HOVER_ENTER);
+    EXPECT_EQ(resolved.displayId, DISPLAY_ID);
+    EXPECT_EQ(raw->displayId, SECOND_DISPLAY_ID);
+    expectStreamOwner(resolved.externalDesktopPointerOwnership, 0, a);
+    clearStreamStateForTest(connection);
+    ASSERT_NE(enqueueStreamForTest(streamMotion(ACTION_DOWN, {0}), target), nullptr);
+    InputTarget next{connection};
+    next.windowHandle = window;
+    ASSERT_TRUE(next.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(),
+                                              streamOwners({{0, newer}})).ok());
+    auto cancel = streamMotion(ACTION_CANCEL, {0}, streamOwners({{0, a}}));
+    auto queued = enqueueStreamForTest(cancel, next);
+    ASSERT_NE(queued, nullptr);
+    expectStreamOwner(queued->externalDesktopPointerOwnership, 0, a);
+    expectStreamOwner(next.getExternalDesktopPointerOwnership(), 0, newer);
+    // Identity only: current cancellation geometry/publisher/ACK remains PhaseB.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamTransferRefusesBeforeTouchStateMutation) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(application, mDispatcher, "from", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(application, mDispatcher, "to", DISPLAY_ID);
+    from->setFrame(Rect(0, 0, 100, 100));
+    to->setFrame(Rect(100, 0, 200, 100));
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    mDispatcher->notifyMotion(generateMotionArgs(ACTION_DOWN, AINPUT_SOURCE_TOUCHSCREEN,
+                                                 DISPLAY_ID, {PointF{10, 10}}));
+    from->consumeMotionEvent(WithMotionAction(ACTION_DOWN));
+    const auto connection = streamConnection(from);
+    ASSERT_NE(connection, nullptr);
+    ASSERT_TRUE(seedStreamStateForTest(connection,
+                    *streamMotion(ACTION_DOWN, {0}, streamOwners({{0, streamKey()}}))));
+    const auto before = streamTouchStateForTest();
+    EXPECT_FALSE(mDispatcher->transferTouchGesture(from->getToken(), to->getToken(), false, false));
+    EXPECT_EQ(streamTouchStateForTest(), before);
+    from->assertNoEvents();
+    to->assertNoEvents();
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageStreamSelectorDoesNotCancelKeysOrAcceptMalformedPacket) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState state(generator);
+    const auto a = streamKey();
+    const auto table = streamOwners({{0, a}});
+    ASSERT_TRUE(state.trackMotion(*streamMotion(ACTION_DOWN, {0}, table), {}));
+    KeyEntry key(InputEvent::nextId(), nullptr, ARBITRARY_TIME, DEVICE_ID, AINPUT_SOURCE_KEYBOARD,
+                 DISPLAY_ID, POLICY_FLAG_TRUSTED, AKEY_EVENT_ACTION_DOWN, 0, AKEYCODE_A,
+                 KEY_A, AMETA_NONE, 0, ARBITRARY_TIME);
+    ASSERT_TRUE(state.trackKey(key, 0));
+    auto duplicate = streamMotion(ACTION_MOVE, {0, 0}, table);
+    EXPECT_FALSE(state.trackMotion(*duplicate, {}));
+    auto wrongRoster = streamMotion(ACTION_MOVE, {1}, table);
+    EXPECT_FALSE(state.trackMotion(*wrongRoster, {}));
+    std::unique_ptr<trace::EventTrackerInterface> tracker;
+    CancellationOptions exact(CancellationOptions::Mode::CANCEL_ALL_EVENTS, "only owned pointer", tracker);
+    exact.externalDesktopStream = a;
+    exact.pointerIds = std::bitset<32>(2);
+    EXPECT_TRUE(state.synthesizeCancellationEvents(ARBITRARY_TIME, exact).empty());
+    exact.pointerIds.reset();
+    auto invalid = a;
+    invalid.domain = 0;
+    exact.externalDesktopStream = invalid;
+    EXPECT_TRUE(state.synthesizeCancellationEvents(ARBITRARY_TIME, exact).empty());
+    exact.externalDesktopStream = a;
+    auto cancellation = state.synthesizeCancellationEvents(ARBITRARY_TIME, exact);
+    ASSERT_EQ(cancellation.size(), 1u);
+    ASSERT_EQ(cancellation[0]->type, EventEntry::Type::MOTION);
+    ASSERT_TRUE(state.trackMotion(static_cast<const MotionEntry&>(*cancellation[0]), {}));
+    CancellationOptions ordinary(CancellationOptions::Mode::CANCEL_NON_POINTER_EVENTS, "keys unchanged", tracker);
+    auto keyUp = state.synthesizeCancellationEvents(ARBITRARY_TIME, ordinary);
+    ASSERT_EQ(keyUp.size(), 1u);
+    EXPECT_EQ(keyUp[0]->type, EventEntry::Type::KEY);
+}
+
+// Source-written publication assertions: must be built and run on Android.
+// Fixture keys still do not issue authority or establish an active atlas.
+TEST_F(InputDispatcherTest, ExternalDesktopStagePublicationSnapshotOwnsOnlySuccessfullyCommittedGeometry) {
+    const auto key = streamKey();
+    const auto owners = streamOwners({{0, key}});
+    ExternalDesktopPublishedMotion state;
+    auto event = streamMotion(ACTION_DOWN, {0}, owners);
+    auto packet = publicationPacket(event, 13);
+    const auto expectedTransform = packet->transform;
+    auto first = state.prepare(*packet);
+    ASSERT_TRUE(first.ok());
+    EXPECT_EQ(state.livePointers(key), 0u); // Preparing/enqueueing is not delivery.
+    ASSERT_TRUE(state.commit(std::move(*first)));
+    ASSERT_EQ(state.livePointers(key), 1u);
+    ASSERT_EQ(OK, event->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, 999));
+    packet->transform.set(900.0f, 800.0f);
+    size_t calls = 0;
+    state.forEach(key, [&](const auto& saved, const auto& ids) {
+        ++calls;
+        EXPECT_EQ(ids, std::bitset<32>(1));
+        EXPECT_EQ(saved.transform, expectedTransform);
+        EXPECT_EQ(saved.rawTransform, expectedTransform);
+        EXPECT_FLOAT_EQ(saved.globalScaleFactor, 2.0f);
+        EXPECT_FLOAT_EQ(saved.coords[0].getX(), 1.0f);
+        EXPECT_EQ(saved.vsyncId, 29);
+        EXPECT_EQ(saved.windowId, 41);
+    });
+    EXPECT_EQ(calls, 1u);
+    auto moving = publicationPacket(streamMotion(ACTION_MOVE, {0}, owners), 77);
+    { // Discarding preparation models only the owner contract, NOT a real pipe-full test.
+        auto unpublished = state.prepare(*moving);
+        ASSERT_TRUE(unpublished.ok());
+    }
+    state.forEach(key, [&](const auto& saved, const auto&) { EXPECT_EQ(saved.transform, expectedTransform); });
+    auto prepared = state.prepare(*moving);
+    ASSERT_TRUE(prepared.ok());
+    ASSERT_TRUE(state.commit(std::move(*prepared)));
+    state.forEach(key, [&](const auto& saved, const auto&) { EXPECT_EQ(saved.transform, moving->transform); });
+    for (const int action : {AMOTION_EVENT_ACTION_BUTTON_PRESS, AMOTION_EVENT_ACTION_BUTTON_RELEASE,
+                             AMOTION_EVENT_ACTION_SCROLL}) {
+        auto sampleEvent = streamMotion(action, {0}, owners);
+        if (action != AMOTION_EVENT_ACTION_SCROLL) {
+            sampleEvent->actionButton = AMOTION_EVENT_BUTTON_PRIMARY;
+            sampleEvent->buttonState = action == AMOTION_EVENT_ACTION_BUTTON_PRESS ? AMOTION_EVENT_BUTTON_PRIMARY : 0;
+        }
+        auto sample = publicationPacket(sampleEvent, static_cast<float>(action + 100));
+        auto next = state.prepare(*sample);
+        ASSERT_TRUE(next.ok());
+        ASSERT_TRUE(state.commit(std::move(*next)));
+        EXPECT_EQ(state.livePointers(key), 1u); // Sample changes geometry, not contact state.
+        state.forEach(key, [&](const auto& saved, const auto&) { EXPECT_EQ(saved.transform, sample->transform); });
+    }
+    auto restore = state.prepare(*moving);
+    ASSERT_TRUE(restore.ok());
+    ASSERT_TRUE(state.commit(std::move(*restore)));
+    ExternalDesktopPublishedMotion hoverState;
+    auto entering = publicationPacket(streamMotion(ACTION_HOVER_ENTER, {0}, owners, AINPUT_SOURCE_MOUSE), 31);
+    auto enter = hoverState.prepare(*entering);
+    ASSERT_TRUE(enter.ok());
+    ASSERT_TRUE(hoverState.commit(std::move(*enter)));
+    auto scrolling = publicationPacket(streamMotion(AMOTION_EVENT_ACTION_SCROLL, {0}, owners, AINPUT_SOURCE_MOUSE), 47);
+    auto scroll = hoverState.prepare(*scrolling);
+    ASSERT_TRUE(scroll.ok());
+    ASSERT_TRUE(hoverState.commit(std::move(*scroll)));
+    hoverState.forEach(key, [&](const auto& saved, const auto&) {
+        EXPECT_TRUE(saved.hovering);
+        EXPECT_EQ(saved.transform, scrolling->transform);
+    });
+    // Reentrant mutation cannot destroy the queried old value or make this
+    // query observe a mixture of before/after revisions.
+    auto replacement = publicationPacket(streamMotion(ACTION_DOWN, {0}, owners), 89);
+    calls = 0;
+    state.forEach(key, [&](const auto& saved, const auto& ids) {
+        ++calls;
+        state.clear();
+        auto next = state.prepare(*replacement);
+        ASSERT_TRUE(next.ok());
+        ASSERT_TRUE(state.commit(std::move(*next)));
+        EXPECT_EQ(saved.transform, moving->transform);
+        EXPECT_EQ(ids, std::bitset<32>(1));
+    });
+    EXPECT_EQ(calls, 1u);
+    state.forEach(key, [&](const auto& saved, const auto&) { EXPECT_EQ(saved.transform, replacement->transform); });
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePublicationPreparationIsSingleUseOwnerBoundAndStaleSafe) {
+    ExternalDesktopPublishedMotion state, other;
+    const auto key = streamKey();
+    auto packet = publicationPacket(streamMotion(ACTION_DOWN, {0}, streamOwners({{0, key}})));
+    auto preparation = state.prepare(*packet);
+    ASSERT_TRUE(preparation.ok());
+    EXPECT_FALSE(other.commit(std::move(*preparation)));
+    auto moved = std::move(*preparation);
+    EXPECT_FALSE(state.commit(std::move(*preparation))); // Moved-from cannot clear a slot.
+    ASSERT_TRUE(state.commit(std::move(moved)));
+    EXPECT_FALSE(state.commit(std::move(moved)));
+    EXPECT_EQ(state.livePointers(key), 1u);
+    auto movement = publicationPacket(streamMotion(ACTION_MOVE, {0}, streamOwners({{0, key}})));
+    auto stale = state.prepare(*movement);
+    ASSERT_TRUE(stale.ok());
+    state.clear();
+    EXPECT_FALSE(state.commit(std::move(*stale)));
+    EXPECT_EQ(state.livePointers(key), 0u);
+    exhaustPublicationRevisionForTest(state);
+    auto ordinary = state.prepare(*publicationPacket(streamMotion(ACTION_DOWN, {0})));
+    ASSERT_TRUE(ordinary.ok());
+    EXPECT_TRUE(state.commit(std::move(*ordinary)));
+    auto keyEvent = std::make_shared<KeyEntry>(InputEvent::nextId(), nullptr, ARBITRARY_TIME,
+            DEVICE_ID, AINPUT_SOURCE_KEYBOARD, DISPLAY_ID, POLICY_FLAG_TRUSTED,
+            AKEY_EVENT_ACTION_DOWN, 0, AKEYCODE_A, KEY_A, AMETA_NONE, 0, ARBITRARY_TIME);
+    DispatchEntry keyPacket(keyEvent, {}, ui::Transform(), ui::Transform(), 1.0f, gui::Uid{1000}, 0, 41);
+    auto ordinaryKey = state.prepare(keyPacket);
+    ASSERT_TRUE(ordinaryKey.ok());
+    EXPECT_TRUE(state.commit(std::move(*ordinaryKey)));
+    EXPECT_FALSE(state.prepare(*packet).ok()); // Only an actual private change refuses.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePublicationDepartingPointerKeepsPacketButNotActiveOwnership) {
+    ExternalDesktopPublishedMotion state;
+    const auto a = streamKey();
+    const auto b = streamKey(8);
+    const auto both = streamOwners({{0, a}, {1, b}});
+    auto first = state.prepare(*publicationPacket(streamMotion(ACTION_DOWN, {0}, streamOwners({{0, a}}))));
+    ASSERT_TRUE(first.ok());
+    ASSERT_TRUE(state.commit(std::move(*first)));
+    auto second = state.prepare(*publicationPacket(streamMotion(POINTER_1_DOWN, {0, 1}, both)));
+    ASSERT_TRUE(second.ok());
+    ASSERT_TRUE(state.commit(std::move(*second)));
+    auto up = publicationPacket(streamMotion(POINTER_0_UP, {0, 1}, both));
+    auto departure = state.prepare(*up);
+    ASSERT_TRUE(departure.ok());
+    ASSERT_TRUE(state.commit(std::move(*departure)));
+    EXPECT_TRUE(ExternalDesktopPublishedMotion::packetContains(*up, a));
+    EXPECT_TRUE(ExternalDesktopPublishedMotion::packetContains(*up, b));
+    EXPECT_EQ(state.livePointers(a), 0u);
+    EXPECT_EQ(state.livePointers(b), 1u);
+    auto stale = state.prepare(*publicationPacket(streamMotion(ACTION_UP, {0}, streamOwners({{0, a}}))));
+    EXPECT_FALSE(stale.ok());
+    EXPECT_EQ(state.livePointers(b), 1u);
+    auto terminal = state.prepare(*publicationPacket(streamMotion(ACTION_UP, {1}, streamOwners({{1, b}}))));
+    ASSERT_TRUE(terminal.ok());
+    ASSERT_TRUE(state.commit(std::move(*terminal)));
+    EXPECT_EQ(state.livePointers(b), 0u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopSnapshotPointerUpReleasesOnlyDepartedReservationAfterPacketAndClosing) {
+    ExternalDesktopPublishedMotion state;
+    const auto a = streamKey(), b = streamKey(8);
+    auto full = snapshotRowsForTest({{0, 0, a}, {1, 1, b}});
+    const auto departed = snapshotRowForTest(full, 0), survivor = snapshotRowForTest(full, 1);
+    auto first = state.prepare(*publicationPacket(streamMotion(ACTION_DOWN, {0}, streamOwners({{0,a}}))));
+    ASSERT_TRUE(first.ok()); ASSERT_TRUE(state.commit(std::move(*first)));
+    auto both = publicationPacket(streamMotion(POINTER_1_DOWN, {0,1}, streamOwners({{0,a},{1,b}})));
+    both->externalDesktopSubmissionReservation = full;
+    auto second = state.prepare(*both); ASSERT_TRUE(second.ok()); ASSERT_TRUE(state.commit(std::move(*second)));
+    both.reset();
+    auto sent = publicationPacket(streamMotion(POINTER_0_UP, {0,1}, streamOwners({{0,a},{1,b}})));
+    sent->externalDesktopSubmissionReservation = full;
+    auto closing = snapshotClosingOwnerForTest(full);
+    auto next = state.prepare(*sent); ASSERT_TRUE(next.ok());
+    EXPECT_EQ(state.livePointers(a), 1u); // preparation has not published or edited the old owner
+    ASSERT_TRUE(state.commit(std::move(*next)));
+    EXPECT_EQ(sent->externalDesktopSubmissionReservation, full); // original sent owner remains FULL
+    ExternalDesktopSubmissionReservationPtr retained;
+    state.forEach(b, [&](const auto& saved, const auto&) { retained = saved.submissionReservation; });
+    ASSERT_NE(retained, nullptr);
+    EXPECT_TRUE(snapshotRowForTest(retained, 0).expired());
+    EXPECT_EQ(snapshotRowForTest(retained, 1).lock(), survivor.lock());
+    full.reset(); EXPECT_FALSE(departed.expired());
+    sent.reset(); EXPECT_FALSE(departed.expired()); // independent closing owner still retains the row
+    closing.reset(); EXPECT_TRUE(departed.expired()); // old header is genuinely RED here
+    EXPECT_FALSE(survivor.expired());
+    EXPECT_EQ(state.livePointers(a), 0u); EXPECT_EQ(state.livePointers(b), 1u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopSnapshotSavedHoverMovePreservesOwnedAndOrdinarySurvivors) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "snapshot hover retention", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ExternalDesktopPublishedMotion state;
+    const auto a = streamKey(), b = streamKey(8);
+    auto full = snapshotRowsForTest({{0, 0, a}, {1, 1, b}});
+    const auto departed = snapshotRowForTest(full, 0), survivor = snapshotRowForTest(full, 1);
+    auto entering = publicationPacket(streamMotion(ACTION_HOVER_ENTER, {0,1,2},
+            streamOwners({{0,a},{1,b},{2,std::nullopt}}), AINPUT_SOURCE_MOUSE));
+    entering->externalDesktopSubmissionReservation = full;
+    auto first = state.prepare(*entering); ASSERT_TRUE(first.ok()); ASSERT_TRUE(state.commit(std::move(*first)));
+    entering.reset();
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    auto cancellation = state.prepareCancellations(a, generator);
+    ASSERT_TRUE(cancellation.ok()); ASSERT_EQ(cancellation->size(), 1u);
+    auto sent = std::move(cancellation->front().packet);
+    ASSERT_EQ(static_cast<const MotionEntry&>(*sent->eventEntry).action, ACTION_HOVER_MOVE);
+    ASSERT_TRUE(bindSnapshotHoverForTest(state, *sent, cancellation->front().removedHoverOwners, connection));
+    auto sentBefore = sent->externalDesktopSubmissionReservation;
+    ASSERT_NE(sentBefore, nullptr);
+    EXPECT_EQ(snapshotRowForTest(sentBefore, 0).lock(), departed.lock());
+    EXPECT_EQ(snapshotRowForTest(sentBefore, 1).lock(), survivor.lock());
+    auto closing = snapshotClosingOwnerForTest(full);
+    auto next = state.prepare(*sent); ASSERT_TRUE(next.ok()); ASSERT_TRUE(state.commit(std::move(*next)));
+    EXPECT_EQ(sent->externalDesktopSubmissionReservation, sentBefore);
+    EXPECT_EQ(snapshotRowForTest(sent->externalDesktopSubmissionReservation, 0).lock(), departed.lock());
+    EXPECT_EQ(snapshotRowForTest(sent->externalDesktopSubmissionReservation, 1).lock(), survivor.lock());
+    state.forEach(b, [&](const auto& saved, const auto& ids) {
+        EXPECT_EQ(ids, std::bitset<32>(2));
+        ASSERT_NE(saved.submissionReservation, nullptr);
+        EXPECT_TRUE(snapshotRowForTest(saved.submissionReservation, 0).expired());
+        EXPECT_EQ(snapshotRowForTest(saved.submissionReservation, 1).lock(), survivor.lock());
+        EXPECT_TRUE(snapshotRowForTest(saved.submissionReservation, 2).expired());
+        ASSERT_EQ(saved.properties.size(), 2u);
+        EXPECT_EQ(saved.properties[0].id, 1); EXPECT_EQ(saved.properties[1].id, 2);
+        expectStreamOwner(saved.ownership, 1, b);
+        EXPECT_FALSE(ExternalDesktopPointerOwnership::keyAt(saved.ownership, 2));
+    });
+    sentBefore.reset(); // fixture observation must not become a new retention owner
+    full.reset(); EXPECT_FALSE(departed.expired());
+    sent.reset(); EXPECT_FALSE(departed.expired());
+    closing.reset(); EXPECT_TRUE(departed.expired());
+    EXPECT_FALSE(survivor.expired());
+    EXPECT_EQ(state.livePointers(a), 0u); EXPECT_EQ(state.livePointers(b), 1u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopSnapshotReservationRejectsMissingWrongKeyAndWrongIdAtomically) {
+    const auto a = streamKey(), b = streamKey(8);
+    for (int defect = 0; defect < 3; ++defect) {
+        ExternalDesktopPublishedMotion state;
+        auto packet = publicationPacket(streamMotion(ACTION_HOVER_ENTER, {0,1},
+                streamOwners({{0,a},{1,b}}), AINPUT_SOURCE_MOUSE));
+        if (defect == 0) packet->externalDesktopSubmissionReservation = snapshotRowsForTest({{0,0,a}});
+        if (defect == 1) packet->externalDesktopSubmissionReservation = snapshotRowsForTest({{0,0,a},{1,1,streamKey(9)}});
+        if (defect == 2) packet->externalDesktopSubmissionReservation = snapshotRowsForTest({{0,0,a},{1,2,b}});
+        const auto row = snapshotRowForTest(packet->externalDesktopSubmissionReservation, 0);
+        const auto revision = state.revision();
+        EXPECT_FALSE(state.prepare(*packet).ok());
+        EXPECT_EQ(state.revision(), revision);
+        EXPECT_EQ(state.livePointers(a), 0u); EXPECT_EQ(state.livePointers(b), 0u);
+        packet.reset(); EXPECT_TRUE(row.expired()); // no partially prepared retained-prefix leak
+    }
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopSnapshotNullReservationSemanticsRemainUnchanged) {
+    ExternalDesktopPublishedMotion state;
+    const auto a = streamKey();
+    auto packet = publicationPacket(streamMotion(ACTION_DOWN, {0}, streamOwners({{0,a}})));
+    ASSERT_EQ(packet->externalDesktopSubmissionReservation, nullptr);
+    auto next = state.prepare(*packet); ASSERT_TRUE(next.ok()); ASSERT_TRUE(state.commit(std::move(*next)));
+    state.forEach(a, [&](const auto& saved, const auto&) { EXPECT_EQ(saved.submissionReservation, nullptr); });
+    EXPECT_EQ(state.livePointers(a), 1u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePublicationCapacityNeverEvictsAnotherActiveStream) {
+    ExternalDesktopPublishedMotion state;
+    for (size_t i = 0; i < ExternalDesktopPublishedMotion::kMaxMementos; ++i) {
+        auto key = streamKey(i + 1);
+        auto event = streamMotion(ACTION_DOWN, {0}, streamOwners({{0, key}}));
+        event->deviceId = static_cast<DeviceId>(i + 100);
+        auto prepared = state.prepare(*publicationPacket(event));
+        ASSERT_TRUE(prepared.ok());
+        ASSERT_TRUE(state.commit(std::move(*prepared)));
+    }
+    auto overflow = streamMotion(ACTION_DOWN, {0}, streamOwners({{0, streamKey(999)}}));
+    overflow->deviceId = 999;
+    EXPECT_FALSE(state.prepare(*publicationPacket(overflow)).ok());
+    for (size_t i = 0; i < ExternalDesktopPublishedMotion::kMaxMementos; ++i) {
+        EXPECT_EQ(state.livePointers(streamKey(i + 1)), 1u);
+    }
+    state.clear();
+    for (size_t i = 0; i < ExternalDesktopPublishedMotion::kMaxMementos; ++i) {
+        EXPECT_EQ(state.livePointers(streamKey(i + 1)), 0u);
+    }
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePublicationActualPublisherAndAcknowledgementsKeepTailSeparate) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "publication", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    const auto key = streamKey();
+    InputTarget target{connection};
+    target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(),
+                                                streamOwners({{0, key}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_DOWN, {0}), target));
+    auto [downSeq, down] = window->receiveEvent(); // Real socket read WITHOUT an ACK.
+    ASSERT_TRUE(downSeq.has_value());
+    ASSERT_NE(down, nullptr);
+    auto refs = publicationReferencesForTest(connection, key);
+    EXPECT_EQ(refs.queuedPackets, 0u);
+    EXPECT_EQ(refs.sentPackets, 1u);
+    EXPECT_EQ(sentTailJournalForTest(connection, key), 1u);
+    EXPECT_EQ(refs.livePointers, 1u);
+    EXPECT_FALSE(refs.drained());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_UP, {0}), target));
+    auto [upSeq, up] = window->receiveEvent();
+    ASSERT_TRUE(upSeq.has_value());
+    ASSERT_NE(up, nullptr);
+    refs = publicationReferencesForTest(connection, key);
+    EXPECT_EQ(refs.sentPackets, 2u);
+    EXPECT_EQ(sentTailJournalForTest(connection, key), 2u);
+    EXPECT_EQ(refs.livePointers, 0u);
+    EXPECT_FALSE(refs.drained());
+    window->finishEvent(*downSeq);
+    ASSERT_TRUE(waitForPublicationAckForTest(connection, *downSeq));
+    refs = publicationReferencesForTest(connection, key);
+    EXPECT_EQ(refs.sentPackets, 1u);
+    EXPECT_EQ(sentTailJournalForTest(connection, key), 1u);
+    EXPECT_FALSE(refs.drained()); // One actual ACK is not the whole release tail.
+    window->finishEvent(*upSeq);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    refs = publicationReferencesForTest(connection, key);
+    EXPECT_TRUE(refs.drained()); // Delivery bookkeeping ONLY, not claim retirement.
+    EXPECT_EQ(sentTailJournalForTest(connection, key), 0u);
+    auto invalid = key;
+    invalid.domain = 0;
+    EXPECT_FALSE(publicationReferencesForTest(connection, invalid).drained());
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePublicationActualAbortIsNotAClientTeardownProof) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "abort", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    const auto key = streamKey();
+    InputTarget target{connection};
+    target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(),
+                                                streamOwners({{0, key}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_DOWN, {0}), target));
+    EXPECT_EQ(publicationReferencesForTest(connection, key).sentPackets, 1u);
+    abortPublicationForTest(connection);
+    EXPECT_FALSE(publicationReferencesForTest(connection, key).drained());
+    EXPECT_EQ(sentTailJournalForTest(connection, key), 1u); // abort erased queue, NOT actual sent evidence
+    // The real socket can still contain an already-published event. Refusing a
+    // drainage claim is mandatory until registration/channel teardown is fenced.
+    auto [sequence, event] = window->receiveEvent();
+    EXPECT_TRUE(sequence.has_value());
+    EXPECT_NE(event, nullptr);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePublisherLocalFdProofFollowsActualMemberDestruction) {
+    publisherLocalFdOrderingForTest();
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePublicationActualWouldBlockRetainsOldGeometryAndQueuedReference) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "pipe-full", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    const auto key = streamKey();
+    InputTarget target{connection};
+    target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(),
+                                                streamOwners({{0, key}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_DOWN, {0}), target));
+    float lastPublished = 1;
+    bool blocked = false;
+    // Bounded real socket fill, not a mocked status or unexecuted preparation.
+    // No consumer reads/ACKs during this loop.
+    for (size_t i = 0; i < 512; ++i) {
+        const float x = static_cast<float>(1000 + i);
+        auto event = streamMotion(ACTION_MOVE, {0});
+        ASSERT_EQ(OK, event->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, x));
+        ASSERT_TRUE(publishStreamForTest(event, target));
+        const auto refs = publicationReferencesForTest(connection, key);
+        ASSERT_TRUE(refs.valid);
+        ASSERT_GE(refs.sentPackets, 1u);
+        if (refs.queuedPackets != 0) {
+            EXPECT_EQ(refs.queuedPackets, 1u);
+            blocked = true;
+            break;
+        }
+        lastPublished = x;
+    }
+    ASSERT_TRUE(blocked) << "Real socket did not fill within the bounded fixture";
+    ASSERT_TRUE(retryBlockedPublicationForTest(connection));
+    const auto actual = publishedXForTest(connection, key);
+    ASSERT_TRUE(actual.has_value());
+    EXPECT_FLOAT_EQ(*actual, lastPublished);
+    const auto refs = publicationReferencesForTest(connection, key);
+    EXPECT_EQ(refs.queuedPackets, 1u);
+    EXPECT_EQ(refs.livePointers, 1u);
+    EXPECT_FALSE(refs.drained());
+    abortPublicationForTest(connection);
+    EXPECT_FALSE(publicationReferencesForTest(connection, key).drained());
+}
+
+// Unsent-only owner substep. These are actual queues/InputState/publisher
+// assertions, not a substitute model or proof of published cancellation/drain.
+TEST_F(InputDispatcherTest, ExternalDesktopStageUnsentRebasesDownKeepsNullAndPrivateSiblingAndSharedRaw) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "unsent split", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    const auto a = streamKey(), b = streamKey(8);
+    auto down = streamMotion(ACTION_DOWN, {0}, streamOwners({{0,a}}));
+    auto firstSibling = streamMotion(POINTER_1_DOWN, {0,1}, streamOwners({{0,a},{1,std::nullopt}}));
+    firstSibling->eventTime += 1;
+    auto secondSibling = streamMotion(POINTER_2_DOWN, {0,1,2}, streamOwners({{0,a},{1,std::nullopt},{2,b}}));
+    secondSibling->eventTime += 2;
+    auto departing = streamMotion(POINTER_0_UP, {0,1,2}, streamOwners({{0,a},{1,std::nullopt},{2,b}}));
+    departing->eventTime += 3;
+    auto moving = streamMotion(ACTION_MOVE, {1,2}, streamOwners({{1,std::nullopt},{2,b}}));
+    moving->eventTime += 4;
+    for (auto& point : moving->pointerCoords) {
+        ASSERT_EQ(OK, point.setAxisValue(AMOTION_EVENT_AXIS_X, point.getX() + 100.0f));
+        ASSERT_EQ(OK, point.setAxisValue(AMOTION_EVENT_AXIS_Y, point.getY() + 200.0f));
+    }
+    ASSERT_TRUE(queueUnsentForTest(connection, window, down));
+    const auto keySeq = queueUnsentKeyForTest(connection, window);
+    ASSERT_TRUE(keySeq.has_value());
+    ASSERT_TRUE(queueUnsentForTest(connection, window, firstSibling));
+    ASSERT_TRUE(queueUnsentForTest(connection, window, secondSibling));
+    ASSERT_TRUE(queueUnsentForTest(connection, window, departing));
+    ASSERT_TRUE(queueUnsentForTest(connection, window, moving));
+    ASSERT_TRUE(removeUnsentForTest(connection, a));
+    const auto sequences = unsentSequencesForTest(connection);
+    ASSERT_EQ(sequences.size(), 5u);
+    EXPECT_EQ(sequences.front(), *keySeq); // key packet/seq and key tracking survive.
+    const auto packets = unsentMotionsForTest(connection);
+    ASSERT_EQ(packets.size(), 4u);
+    EXPECT_EQ(packets[0]->action, ACTION_DOWN);
+    ASSERT_EQ(packets[0]->pointerProperties.size(), 1u);
+    EXPECT_EQ(packets[0]->pointerProperties[0].id, 1);
+    EXPECT_EQ(packets[1]->action, POINTER_1_DOWN);
+    EXPECT_EQ(packets[2]->action, ACTION_MOVE);
+    EXPECT_EQ(packets[3]->action, ACTION_MOVE);
+    for (const auto& event : packets) EXPECT_EQ(event->downTime, firstSibling->eventTime);
+    expectStreamOwner(packets[0]->externalDesktopPointerOwnership, 1, std::nullopt);
+    expectStreamOwner(packets[1]->externalDesktopPointerOwnership, 1, std::nullopt);
+    expectStreamOwner(packets[1]->externalDesktopPointerOwnership, 2, b);
+    EXPECT_EQ(firstSibling->action, POINTER_1_DOWN);
+    EXPECT_EQ(firstSibling->pointerProperties.size(), 2u);
+    EXPECT_EQ(firstSibling->downTime, ARBITRARY_TIME);
+    EXPECT_EQ(departing->action, POINTER_0_UP);
+    EXPECT_EQ(moving->downTime, ARBITRARY_TIME); // raw event shared by other targets unchanged.
+    EXPECT_EQ(enqueuedPointerCountForTest(connection, *packets.back()), 2u);
+    UnsentSampleTrace samples(*this, *window, packets);
+    publishRemainingUnsentForTest(connection);
+    auto [keyReceivedSeq, keyReceived] = window->receiveEvent();
+    ASSERT_TRUE(keyReceivedSeq.has_value()); ASSERT_NE(keyReceived, nullptr);
+    EXPECT_EQ(*keyReceivedSeq, *keySeq);
+    EXPECT_EQ(keyReceived->getType(), InputEventType::KEY);
+    window->finishEvent(*keyReceivedSeq);
+    ASSERT_TRUE(waitForPublicationAckForTest(connection, *keySeq));
+    while (samples.sampleCount() < packets.size()) {
+        const size_t before = samples.sampleCount();
+        auto [seq, event] = window->receiveEvent();
+        ASSERT_TRUE(seq.has_value()); ASSERT_NE(event, nullptr);
+        ASSERT_EQ(event->getType(), InputEventType::MOTION);
+        ASSERT_GT(samples.sampleCount(), before);
+        EXPECT_EQ(*seq, sequences[samples.sampleCount()]);
+        window->finishEvent(*seq);
+        for (size_t packet = before; packet < samples.sampleCount(); ++packet) {
+            ASSERT_TRUE(waitForPublicationAckForTest(connection, sequences[packet + 1]));
+        }
+    }
+    EXPECT_EQ(samples.sampleCount(), packets.size());
+    EXPECT_EQ(samples.receivedEvents() + samples.historicalSamples(), packets.size());
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageUnsentKeepsPublishedOrdinaryPredecessorAndSentPacketExact) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "ordinary delivered peer", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    InputTarget ordinary{connection}; ordinary.windowHandle = window;
+    ASSERT_TRUE(ordinary.addPointers(std::bitset<32>(1), ui::Transform()).ok());
+    auto down = streamMotion(ACTION_DOWN, {0});
+    ASSERT_TRUE(publishStreamForTest(down, ordinary));
+    auto [seq, event] = window->receiveEvent();
+    ASSERT_TRUE(seq.has_value()); ASSERT_NE(event, nullptr);
+    const auto sentBefore = unsentSequencesForTest(connection, true);
+    const auto a = streamKey();
+    auto add = streamMotion(POINTER_1_DOWN, {0,1}, streamOwners({{0,std::nullopt},{1,a}}));
+    auto move = streamMotion(ACTION_MOVE, {0,1}, streamOwners({{0,std::nullopt},{1,a}}));
+    add->eventTime += 1;
+    move->eventTime += 2;
+    for (auto& point : move->pointerCoords) {
+        ASSERT_EQ(OK, point.setAxisValue(AMOTION_EVENT_AXIS_X, point.getX() + 100.0f));
+        ASSERT_EQ(OK, point.setAxisValue(AMOTION_EVENT_AXIS_Y, point.getY() + 200.0f));
+    }
+    ASSERT_TRUE(queueUnsentForTest(connection, window, add));
+    ASSERT_TRUE(queueUnsentForTest(connection, window, move));
+    ASSERT_TRUE(removeUnsentForTest(connection, a));
+    EXPECT_EQ(unsentSequencesForTest(connection, true), sentBefore);
+    auto delivered = deliveredMotionForTest(connection, *down);
+    ASSERT_TRUE(delivered.has_value()); ASSERT_EQ(delivered->first.size(), 1u);
+    EXPECT_EQ(delivered->first[0].id, 0);
+    const auto packets = unsentMotionsForTest(connection);
+    ASSERT_EQ(packets.size(), 2u);
+    for (const auto& packet : packets) {
+        EXPECT_EQ(packet->action, ACTION_MOVE);
+        ASSERT_EQ(packet->pointerProperties.size(), 1u);
+        EXPECT_EQ(packet->pointerProperties[0].id, 0);
+        EXPECT_EQ(packet->externalDesktopPointerOwnership, nullptr);
+    }
+    EXPECT_EQ(enqueuedPointerCountForTest(connection, *down), 1u);
+    const auto queuedSequences = unsentSequencesForTest(connection);
+    ASSERT_EQ(queuedSequences.size(), packets.size());
+    UnsentSampleTrace samples(*this, *window, packets);
+    // The real ACK may now start the surviving queue; it was not manufactured
+    // by removal and never treated as permission to release a lifetime claim.
+    window->finishEvent(*seq);
+    ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    while (samples.sampleCount() < packets.size()) {
+        const size_t before = samples.sampleCount();
+        auto [nextSeq, next] = window->receiveEvent();
+        ASSERT_TRUE(nextSeq.has_value()); ASSERT_NE(next, nullptr);
+        ASSERT_EQ(next->getType(), InputEventType::MOTION);
+        ASSERT_GT(samples.sampleCount(), before);
+        EXPECT_EQ(*nextSeq, queuedSequences[samples.sampleCount() - 1]);
+        window->finishEvent(*nextSeq);
+        for (size_t packet = before; packet < samples.sampleCount(); ++packet) {
+            ASSERT_TRUE(waitForPublicationAckForTest(connection, queuedSequences[packet]));
+        }
+    }
+    EXPECT_EQ(samples.sampleCount(), packets.size());
+    EXPECT_EQ(samples.receivedEvents() + samples.historicalSamples(), packets.size());
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageUnsentPublishedPrivateOwnershipRefusesWithoutCancelOrErase) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "published not unsent", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    const auto a = streamKey();
+    InputTarget target{connection}; target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0,a}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_DOWN, {0}), target));
+    auto [seq, event] = window->receiveEvent();
+    ASSERT_TRUE(seq.has_value()); ASSERT_NE(event, nullptr);
+    ASSERT_TRUE(queueUnsentForTest(connection, window, streamMotion(ACTION_MOVE, {0}, streamOwners({{0,a}}))));
+    const auto queued = unsentSequencesForTest(connection);
+    const auto sent = unsentSequencesForTest(connection, true);
+    EXPECT_FALSE(removeUnsentForTest(connection, a));
+    EXPECT_EQ(unsentSequencesForTest(connection), queued);
+    EXPECT_EQ(unsentSequencesForTest(connection, true), sent);
+    EXPECT_EQ(publicationReferencesForTest(connection, a).livePointers, 1u);
+    abortPublicationForTest(connection); // actual abort is still not client teardown proof.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageUnsentStickyCoverageLossRefusesAndKeepsAdvancedQueue) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "coverage lost", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    const auto a = streamKey();
+    auto down = streamMotion(ACTION_DOWN, {0}, streamOwners({{0,a}}));
+    ASSERT_TRUE(queueUnsentForTest(connection, window, down));
+    const auto before = unsentSequencesForTest(connection);
+    loseUnsentCoverageForTest(connection);
+    EXPECT_FALSE(removeUnsentForTest(connection, a));
+    EXPECT_EQ(unsentSequencesForTest(connection), before);
+    EXPECT_EQ(enqueuedPointerCountForTest(connection, *down), 1u);
+    EXPECT_FALSE(deliveredMotionCoverageForTest(connection));
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageUnsentPreparedQueueIsOwnerAndAdvancedStateBound) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto first = sp<FakeWindowHandle>::make(application, mDispatcher, "prepared unsent first", DISPLAY_ID);
+    auto second = sp<FakeWindowHandle>::make(application, mDispatcher, "prepared unsent second", DISPLAY_ID);
+    auto a = streamConnection(first), b = streamConnection(second);
+    const auto key = streamKey();
+    ASSERT_TRUE(queueUnsentForTest(a, first, streamMotion(ACTION_DOWN, {0}, streamOwners({{0,key}}))));
+    const auto before = unsentSequencesForTest(a);
+    unsentStaleOwnerContractsForTest(a, b, key);
+    EXPECT_EQ(unsentSequencesForTest(a), before);
+    EXPECT_TRUE(unsentSequencesForTest(b).empty());
+    abortPublicationForTest(a);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageUnsentUsesRealForegroundReleaseAndRetainsReplacementReference) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "injection references", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    const auto key = streamKey();
+    auto removedState = std::make_shared<InjectionState>(std::nullopt, false);
+    auto retainedState = std::make_shared<InjectionState>(std::nullopt, false);
+    auto down = streamMotion(ACTION_DOWN, {0}, streamOwners({{0,key}}));
+    down->injectionState = removedState;
+    auto sibling = streamMotion(POINTER_1_DOWN, {0,1}, streamOwners({{0,key},{1,std::nullopt}}));
+    sibling->injectionState = retainedState;
+    ASSERT_TRUE(queueUnsentForTest(connection, window, down, true));
+    ASSERT_TRUE(queueUnsentForTest(connection, window, sibling, true));
+    ASSERT_EQ(unsentInjectionReferencesForTest(removedState), 1);
+    ASSERT_EQ(unsentInjectionReferencesForTest(retainedState), 1);
+    ASSERT_TRUE(removeUnsentForTest(connection, key));
+    EXPECT_EQ(unsentInjectionReferencesForTest(removedState), 0);
+    EXPECT_EQ(unsentInjectionReferencesForTest(retainedState), 1);
+    abortPublicationForTest(connection);
+    EXPECT_EQ(unsentInjectionReferencesForTest(retainedState), 0);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageUnsentQueueBoundRefusesWithoutEvictionOrEmptyCoverageClaim) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "unsent bounded owner", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    const auto key = streamKey();
+    ASSERT_TRUE(queueUnsentForTest(connection, window, streamMotion(ACTION_DOWN, {0}, streamOwners({{0,key}}))));
+    for (size_t i = 0; i < Connection::kExternalDesktopMaxPreparedQueuePackets; ++i) {
+        ASSERT_TRUE(queueUnsentForTest(connection, window, streamMotion(ACTION_MOVE, {0}, streamOwners({{0,key}}))));
+    }
+    const auto before = unsentSequencesForTest(connection);
+    ASSERT_EQ(before.size(), Connection::kExternalDesktopMaxPreparedQueuePackets + 1);
+    EXPECT_FALSE(removeUnsentForTest(connection, key));
+    EXPECT_EQ(unsentSequencesForTest(connection), before);
+    EXPECT_TRUE(deliveredMotionCoverageForTest(connection)); // no fabricated empty/recovery transition.
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageSavedCancelOwnsSuccessfulFlagsTimeAndExcludesDepartedGeometry) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    ExternalDesktopPublishedMotion state;
+    const auto a = streamKey(), b = streamKey(8);
+    auto down = publicationPacket(streamMotion(ACTION_DOWN, {0}, streamOwners({{0,a}})), 7);
+    auto first = state.prepare(*down); ASSERT_TRUE(first.ok()); ASSERT_TRUE(state.commit(std::move(*first)));
+    auto both = publicationPacket(streamMotion(POINTER_1_DOWN, {0,1}, streamOwners({{0,a},{1,b}})), 7);
+    auto second = state.prepare(*both); ASSERT_TRUE(second.ok()); ASSERT_TRUE(state.commit(std::move(*second)));
+    auto leaving = streamMotion(POINTER_0_UP, {0,1}, streamOwners({{0,a},{1,b}}));
+    leaving->eventTime += 2;
+    ui::Transform geometry; geometry.set(7.0f,-7.0f);
+    DispatchEntry packet(leaving, InputTarget::Flags::ZERO_COORDS, geometry, geometry,
+                         3.0f, gui::Uid{1000}, 29, 41);
+    auto third = state.prepare(packet); ASSERT_TRUE(third.ok()); ASSERT_TRUE(state.commit(std::move(*third)));
+    ASSERT_EQ(OK, leaving->pointerCoords[1].setAxisValue(AMOTION_EVENT_AXIS_X, 999));
+    auto prepared = state.prepareCancellations(b, generator);
+    ASSERT_TRUE(prepared.ok()); ASSERT_EQ(prepared->size(), 1u);
+    const auto& cancel = prepared->front();
+    EXPECT_EQ(cancel.event->action, ACTION_CANCEL);
+    ASSERT_EQ(cancel.event->pointerProperties.size(), 1u);
+    EXPECT_EQ(cancel.event->pointerProperties[0].id, 1);
+    EXPECT_FLOAT_EQ(cancel.event->pointerCoords[0].getX(), 11);
+    EXPECT_EQ(cancel.event->eventTime, ARBITRARY_TIME + 2);
+    EXPECT_TRUE(cancel.packet->targetFlags.test(InputTarget::Flags::ZERO_COORDS));
+    EXPECT_FLOAT_EQ(cancel.packet->globalScaleFactor, 3);
+    EXPECT_EQ(cancel.packet->transform, geometry);
+    EXPECT_EQ(cancel.packet->rawTransform, geometry);
+    expectStreamOwner(cancel.event->externalDesktopPointerOwnership, 1, b);
+    EXPECT_EQ(state.livePointers(b), 1u); // preparation is not publication.
+    EXPECT_EQ(leaving->action, POINTER_0_UP);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageSavedCancelPartialPointerUsesOldGeometryThenReplaysPeerQueue) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "saved partial", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    const auto a = streamKey(), b = streamKey(8);
+    ui::Transform oldGeometry; oldGeometry.set(7.0f,-7.0f);
+    InputTarget one{connection}; one.windowHandle = window; one.globalScaleFactor = 2;
+    ASSERT_TRUE(one.addPointersWithOwnership(std::bitset<32>(1), oldGeometry, streamOwners({{0,a}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN,{0}),one,window),nullptr);
+    InputTarget two{connection}; two.windowHandle = window; two.globalScaleFactor = 2;
+    ASSERT_TRUE(two.addPointersWithOwnership(std::bitset<32>(3),oldGeometry,streamOwners({{0,a},{1,std::nullopt}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(POINTER_1_DOWN,{0,1}),two,window),nullptr);
+    InputTarget three{connection}; three.windowHandle = window; three.globalScaleFactor = 2;
+    ASSERT_TRUE(three.addPointersWithOwnership(std::bitset<32>(7),oldGeometry,streamOwners({{0,a},{1,std::nullopt},{2,b}})).ok());
+    auto published = publishAndAckSavedForTest(streamMotion(POINTER_2_DOWN,{0,1,2}),three,window);
+    ASSERT_NE(published,nullptr);
+    auto future = streamMotion(ACTION_MOVE,{0,1,2},streamOwners({{0,a},{1,std::nullopt},{2,b}}));
+    ASSERT_EQ(OK,future->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X,999));
+    ASSERT_TRUE(queueUnsentForTest(connection,window,future)); // different target transform31,-17.
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,a));
+    const auto packets = unsentMotionsForTest(connection);
+    ASSERT_EQ(packets.size(),2u);
+    EXPECT_EQ(packets[0]->action,POINTER_0_UP);
+    EXPECT_TRUE(packets[0]->flags.test(MotionFlag::CANCELED));
+    ASSERT_EQ(packets[0]->pointerProperties.size(),3u);
+    expectStreamOwner(packets[0]->externalDesktopPointerOwnership,0,a); // departing identity remains in packet.
+    EXPECT_EQ(packets[1]->action,ACTION_MOVE);
+    ASSERT_EQ(packets[1]->pointerProperties.size(),2u);
+    expectStreamOwner(packets[1]->externalDesktopPointerOwnership,1,std::nullopt);
+    expectStreamOwner(packets[1]->externalDesktopPointerOwnership,2,b);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,1u);
+    EXPECT_EQ(future->pointerProperties.size(),3u);
+    EXPECT_FLOAT_EQ(future->pointerCoords[0].getX(),999);
+    publishRemainingUnsentForTest(connection);
+    auto [cancelSeq,cancel] = window->receiveEvent();
+    ASSERT_TRUE(cancelSeq.has_value()); ASSERT_NE(cancel,nullptr);
+    const auto& actual = static_cast<const MotionEvent&>(*cancel);
+    EXPECT_EQ(actual.getAction(),POINTER_0_UP);
+    for (size_t i=0;i<3;++i) {
+        EXPECT_EQ(actual.getPointerId(i),published->getPointerId(i));
+        EXPECT_FLOAT_EQ(actual.getX(i),published->getX(i));
+        EXPECT_FLOAT_EQ(actual.getY(i),published->getY(i));
+    }
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,1u);
+    window->finishEvent(*cancelSeq);
+    ASSERT_TRUE(waitForPublicationAckForTest(connection,*cancelSeq));
+    auto [peerSeq,peer] = window->receiveEvent();
+    ASSERT_TRUE(peerSeq.has_value()); ASSERT_NE(peer,nullptr);
+    const auto& remaining = static_cast<const MotionEvent&>(*peer);
+    EXPECT_EQ(remaining.getAction(),ACTION_MOVE);
+    EXPECT_EQ(remaining.getPointerCount(),2u);
+    EXPECT_EQ(remaining.getPointerId(0),1);
+    EXPECT_EQ(remaining.getPointerId(1),2);
+    window->finishEvent(*peerSeq);
+    ASSERT_TRUE(waitForPublicationAckForTest(connection,*peerSeq));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageSavedCancelRetainsBothRealSentTailsUntilEachActualAck) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application,mDispatcher,"saved tails",DISPLAY_ID);
+    auto connection = streamConnection(window);
+    const auto key = streamKey();
+    InputTarget target{connection}; target.windowHandle = window;
+    target.flags |= InputTarget::Flags::ZERO_COORDS;
+    target.globalScaleFactor = 3;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1),ui::Transform(),streamOwners({{0,key}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_DOWN,{0}),target));
+    auto [downSeq,down] = window->receiveEvent();
+    ASSERT_TRUE(downSeq.has_value()); ASSERT_NE(down,nullptr);
+    const auto sentBefore = unsentSequencesForTest(connection,true);
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,key));
+    EXPECT_EQ(unsentSequencesForTest(connection,true),sentBefore);
+    EXPECT_EQ(publicationReferencesForTest(connection,key).livePointers,1u);
+    publishRemainingUnsentForTest(connection);
+    auto [cancelSeq,cancel] = window->receiveEvent();
+    ASSERT_TRUE(cancelSeq.has_value()); ASSERT_NE(cancel,nullptr);
+    const auto& motion = static_cast<const MotionEvent&>(*cancel);
+    EXPECT_EQ(motion.getAction(),ACTION_CANCEL);
+    EXPECT_TRUE(motion.getFlags().test(MotionFlag::CANCELED));
+    EXPECT_FLOAT_EQ(motion.getX(0),0); EXPECT_FLOAT_EQ(motion.getY(0),0);
+    EXPECT_EQ(publicationReferencesForTest(connection,key).livePointers,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,key).sentPackets,2u);
+    window->finishEvent(*cancelSeq); // ACK only the cancel, not the original successful DOWN.
+    ASSERT_TRUE(waitForPublicationAckForTest(connection,*cancelSeq));
+    EXPECT_EQ(publicationReferencesForTest(connection,key).sentPackets,1u);
+    EXPECT_FALSE(publicationReferencesForTest(connection,key).drained());
+    window->finishEvent(*downSeq);
+    ASSERT_TRUE(waitForPublicationAckForTest(connection,*downSeq));
+    EXPECT_EQ(publicationReferencesForTest(connection,key).sentPackets,0u);
+    // This packet reference count still does NOT prove FD teardown/claim release.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageSavedCancelWholeHoverKeepsTouchSiblingAndAcceptsNextHoverLifetime) {
+    SCOPED_FLAG_OVERRIDE(enable_multi_device_same_window_stream,true);
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application,mDispatcher,"saved hover and touch",DISPLAY_ID);
+    auto connection = streamConnection(window);
+    const auto hoverKey=streamKey(), touchKey=streamKey(8), nextHover=streamKey(9);
+    InputTarget touch{connection};touch.windowHandle=window;
+    ASSERT_TRUE(touch.addPointersWithOwnership(std::bitset<32>(1),ui::Transform(),streamOwners({{0,touchKey}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN,{0},nullptr,AINPUT_SOURCE_TOUCHSCREEN,DISPLAY_ID,DeviceId{2}),touch,window),nullptr);
+    InputTarget hover{connection};hover.windowHandle=window;
+    ASSERT_TRUE(hover.addPointersWithOwnership(std::bitset<32>(1),ui::Transform(),streamOwners({{0,hoverKey}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0},nullptr,AINPUT_SOURCE_MOUSE,DISPLAY_ID,DeviceId{3}),hover,window),nullptr);
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,hoverKey));
+    publishRemainingUnsentForTest(connection);
+    auto [seq,event]=window->receiveEvent();
+    ASSERT_TRUE(seq.has_value());ASSERT_NE(event,nullptr);
+    EXPECT_EQ(static_cast<const MotionEvent&>(*event).getAction(),AMOTION_EVENT_ACTION_HOVER_EXIT);
+    EXPECT_EQ(publicationReferencesForTest(connection,touchKey).livePointers,1u);
+    window->finishEvent(*seq);ASSERT_TRUE(waitForPublicationAckForTest(connection,*seq));
+    InputTarget successor{connection};successor.windowHandle=window;
+    ASSERT_TRUE(successor.addPointersWithOwnership(std::bitset<32>(1),ui::Transform(),streamOwners({{0,nextHover}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0},nullptr,AINPUT_SOURCE_MOUSE,DISPLAY_ID,DeviceId{3}),successor,window),nullptr);
+    EXPECT_EQ(publicationReferencesForTest(connection,nextHover).livePointers,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,touchKey).livePointers,1u);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageSavedCancelMixedMultiHoverSubsetUsesScopedMoveWithoutBroadExit) {
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"valid multihover open",DISPLAY_ID);
+    auto connection=streamConnection(window);
+    const auto a=streamKey(), b=streamKey(8);
+    InputTarget target{connection};target.windowHandle=window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3),ui::Transform(),streamOwners({{0,a},{1,b}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0,1},nullptr,AINPUT_SOURCE_MOUSE),target,window),nullptr);
+    rejectUnscopedHoverShrinkForTest(connection,streamMotion(AMOTION_EVENT_ACTION_HOVER_MOVE,{1},
+            streamOwners({{1,b}}),AINPUT_SOURCE_MOUSE));
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,a));
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).livePointers,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).queuedPackets,1u);
+    const auto queued=unsentMotionsForTest(connection);
+    ASSERT_EQ(queued.size(),1u);
+    EXPECT_EQ(queued[0]->action,AMOTION_EVENT_ACTION_HOVER_MOVE);
+    ASSERT_EQ(queued[0]->pointerProperties.size(),1u);
+    EXPECT_EQ(queued[0]->pointerProperties[0].id,1);
+    expectStreamOwner(queued[0]->externalDesktopPointerOwnership,1,b);
+    publishRemainingUnsentForTest(connection);
+    auto [seq,event]=window->receiveEvent();
+    ASSERT_TRUE(seq.has_value());ASSERT_NE(event,nullptr);
+    const auto& move=static_cast<const MotionEvent&>(*event);
+    EXPECT_EQ(move.getAction(),AMOTION_EVENT_ACTION_HOVER_MOVE);
+    EXPECT_EQ(move.getPointerCount(),1u);
+    EXPECT_EQ(move.getPointerId(0),1);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).livePointers,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,1u); // removed ID is NOT in payload.
+    window->finishEvent(*seq);ASSERT_TRUE(waitForPublicationAckForTest(connection,*seq));
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,0u);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageHoverRetirementKeepsOrdinarySurvivorAndRemovedKeyTail) {
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"hover ordinary survivor",DISPLAY_ID);
+    auto connection=streamConnection(window);
+    const auto a=streamKey();
+    InputTarget target{connection};target.windowHandle=window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3),ui::Transform(),streamOwners({{0,a},{1,std::nullopt}})).ok());
+    auto old=publishAndAckSavedForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0,1},nullptr,AINPUT_SOURCE_MOUSE),target,window);
+    ASSERT_NE(old,nullptr);
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,a));
+    const auto packets=unsentMotionsForTest(connection);
+    ASSERT_EQ(packets.size(),1u);
+    EXPECT_EQ(packets[0]->externalDesktopPointerOwnership,nullptr);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).queuedPackets,1u);
+    publishRemainingUnsentForTest(connection);
+    auto [seq,event]=window->receiveEvent();ASSERT_TRUE(seq.has_value());ASSERT_NE(event,nullptr);
+    const auto& move=static_cast<const MotionEvent&>(*event);
+    EXPECT_EQ(move.getAction(),AMOTION_EVENT_ACTION_HOVER_MOVE);
+    ASSERT_EQ(move.getPointerCount(),1u);EXPECT_EQ(move.getPointerId(0),1);
+    EXPECT_FLOAT_EQ(move.getX(0),old->getX(1));EXPECT_FLOAT_EQ(move.getY(0),old->getY(1));
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,1u);
+    window->finishEvent(*seq);ASSERT_TRUE(waitForPublicationAckForTest(connection,*seq));
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,0u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageHoverRetirementCoalescesQueuedOwnersWithoutLosingNullOrPrivatePeer) {
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"coalesced hover owners",DISPLAY_ID);
+    auto connection=streamConnection(window);
+    const auto a=streamKey(),b=streamKey(8),c=streamKey(9);
+    InputTarget target{connection};target.windowHandle=window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(15),ui::Transform(),streamOwners({{0,a},{1,b},{2,c},{3,std::nullopt}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0,1,2,3},nullptr,AINPUT_SOURCE_MOUSE),target,window),nullptr);
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,a));
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,b));
+    const auto packets=unsentMotionsForTest(connection);
+    ASSERT_EQ(packets.size(),1u); // one combined retained-intent witness, not two conflicting packets.
+    EXPECT_EQ(packets[0]->action,AMOTION_EVENT_ACTION_HOVER_MOVE);
+    ASSERT_EQ(packets[0]->pointerProperties.size(),2u);
+    EXPECT_EQ(packets[0]->pointerProperties[0].id,2);EXPECT_EQ(packets[0]->pointerProperties[1].id,3);
+    expectStreamOwner(packets[0]->externalDesktopPointerOwnership,2,c);
+    expectStreamOwner(packets[0]->externalDesktopPointerOwnership,3,std::nullopt);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).queuedPackets,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).queuedPackets,1u);
+    publishRemainingUnsentForTest(connection);
+    auto [seq,event]=window->receiveEvent();ASSERT_TRUE(seq.has_value());ASSERT_NE(event,nullptr);
+    EXPECT_EQ(static_cast<const MotionEvent&>(*event).getAction(),AMOTION_EVENT_ACTION_HOVER_MOVE);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).livePointers,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,c).livePointers,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).sentPackets,1u);
+    window->finishEvent(*seq);ASSERT_TRUE(waitForPublicationAckForTest(connection,*seq));
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).sentPackets,0u);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageHoverRetirementLastQueuedOwnerBecomesOneExitWithAllTails) {
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"coalesced last hover",DISPLAY_ID);
+    auto connection=streamConnection(window);
+    const auto a=streamKey(),b=streamKey(8);
+    InputTarget target{connection};target.windowHandle=window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3),ui::Transform(),streamOwners({{0,a},{1,b}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0,1},nullptr,AINPUT_SOURCE_MOUSE),target));
+    auto [oldSeq,old]=window->receiveEvent();ASSERT_TRUE(oldSeq.has_value());ASSERT_NE(old,nullptr);
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,a));ASSERT_TRUE(queueSavedCancellationForTest(connection,b));
+    const auto packets=unsentMotionsForTest(connection);ASSERT_EQ(packets.size(),1u);
+    EXPECT_EQ(packets[0]->action,AMOTION_EVENT_ACTION_HOVER_EXIT);
+    publishRemainingUnsentForTest(connection);
+    auto [seq,event]=window->receiveEvent();ASSERT_TRUE(seq.has_value());ASSERT_NE(event,nullptr);
+    EXPECT_EQ(static_cast<const MotionEvent&>(*event).getAction(),AMOTION_EVENT_ACTION_HOVER_EXIT);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,2u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).sentPackets,2u);
+    window->finishEvent(*seq);ASSERT_TRUE(waitForPublicationAckForTest(connection,*seq));
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).sentPackets,1u);
+    window->finishEvent(*oldSeq);ASSERT_TRUE(waitForPublicationAckForTest(connection,*oldSeq));
+    EXPECT_EQ(publicationReferencesForTest(connection,a).sentPackets,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).sentPackets,0u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageHoverRetirementRejectsMissingWrongOwnerAndReusedPacketWitness) {
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"hover witness first",DISPLAY_ID);
+    auto other=sp<FakeWindowHandle>::make(application,mDispatcher,"hover witness other",DISPLAY_ID);
+    auto connection=streamConnection(window),second=streamConnection(other);
+    const auto a=streamKey(),b=streamKey(8);
+    InputTarget target{connection};target.windowHandle=window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3),ui::Transform(),streamOwners({{0,a},{1,b}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0,1},nullptr,AINPUT_SOURCE_MOUSE),target,window),nullptr);
+    rejectUnscopedHoverShrinkForTest(connection,streamMotion(AMOTION_EVENT_ACTION_HOVER_MOVE,{1},streamOwners({{1,b}}),AINPUT_SOURCE_MOUSE));
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,a));
+    rejectReusedHoverPacketCapabilityForTest(connection,second);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,b).livePointers,1u);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageHoverRetirementRebindsUnrelatedQueuedWitnessAfterContactRevisionChanges) {
+    SCOPED_FLAG_OVERRIDE(enable_multi_device_same_window_stream,true);
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"hover revision rebind",DISPLAY_ID);
+    auto connection=streamConnection(window);
+    const auto a=streamKey(),c=streamKey(9);
+    InputTarget one{connection};one.windowHandle=window;
+    ASSERT_TRUE(one.addPointersWithOwnership(std::bitset<32>(1),ui::Transform(),streamOwners({{0,a}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN,{0}),one,window),nullptr);
+    InputTarget two{connection};two.windowHandle=window;
+    ASSERT_TRUE(two.addPointersWithOwnership(std::bitset<32>(3),ui::Transform(),streamOwners({{0,a},{1,a}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(POINTER_1_DOWN,{0,1}),two,window),nullptr);
+    InputTarget three{connection};three.windowHandle=window;
+    ASSERT_TRUE(three.addPointersWithOwnership(std::bitset<32>(7),ui::Transform(),streamOwners({{0,a},{1,a},{2,std::nullopt}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(POINTER_2_DOWN,{0,1,2}),three,window),nullptr);
+    InputTarget hover{connection};hover.windowHandle=window;
+    ASSERT_TRUE(hover.addPointersWithOwnership(std::bitset<32>(3),ui::Transform(),streamOwners({{0,c},{1,std::nullopt}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0,1},nullptr,AINPUT_SOURCE_MOUSE,DISPLAY_ID,DeviceId{88}),hover,window),nullptr);
+    ASSERT_TRUE(queueUnsentForTest(connection,window,streamMotion(ACTION_MOVE,{0,1,2},streamOwners({{0,a},{1,a},{2,std::nullopt}}))));
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,c));
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,a));
+    ASSERT_EQ(unsentMotionsForTest(connection).size(),4u);
+    publishRemainingUnsentForTest(connection);
+    for(size_t i=0;i<4;++i){
+        auto [seq,event]=window->receiveEvent();ASSERT_TRUE(seq.has_value());ASSERT_NE(event,nullptr);
+        window->finishEvent(*seq);ASSERT_TRUE(waitForPublicationAckForTest(connection,*seq));
+    }
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,0u);
+    EXPECT_EQ(publicationReferencesForTest(connection,c).livePointers,0u);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageHoverRetirementActualWouldBlockDoesNotCommitRosterShrink) {
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"hover retirement blocked",DISPLAY_ID);
+    auto connection=streamConnection(window);
+    const auto a=streamKey();
+    InputTarget target{connection};target.windowHandle=window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3),ui::Transform(),streamOwners({{0,a},{1,std::nullopt}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_ENTER,{0,1},nullptr,AINPUT_SOURCE_MOUSE),target));
+    bool blocked=false;
+    for(size_t i=0;i<512;++i){
+        ASSERT_TRUE(publishStreamForTest(streamMotion(AMOTION_EVENT_ACTION_HOVER_MOVE,{0,1},nullptr,AINPUT_SOURCE_MOUSE),target));
+        if(publicationReferencesForTest(connection,a).queuedPackets){blocked=true;break;}
+    }
+    ASSERT_TRUE(blocked);ASSERT_TRUE(queueSavedCancellationForTest(connection,a));
+    publishRemainingUnsentForTest(connection);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).livePointers,1u);
+    EXPECT_EQ(publicationReferencesForTest(connection,a).queuedPackets,1u);
+    const auto packets=unsentMotionsForTest(connection);ASSERT_EQ(packets.size(),2u);
+    EXPECT_EQ(packets[0]->action,AMOTION_EVENT_ACTION_HOVER_MOVE);
+    ASSERT_EQ(packets[0]->pointerProperties.size(),1u);EXPECT_EQ(packets[0]->pointerProperties[0].id,1);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferUsesNativeOriginAndPreservesOrdinaryDestinationPeer) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "transfer source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "transfer destination", DISPLAY_ID);
+    from->setOwnerInfo(gui::Pid{101}, gui::Uid{101});
+    to->setOwnerInfo(gui::Pid{202}, gui::Uid{202});
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto newKey = oldKey; newKey.windowLifetime += 1; newKey.presentationLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from; a.flags |= InputTarget::Flags::SPLIT;
+    a.firstDownTimeInTarget = ARBITRARY_TIME;
+    ui::Transform oldGeometry; oldGeometry.set(15, -7);
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), oldGeometry, streamOwners({{0, oldKey}})).ok());
+    InputTarget ordinary{destination}; ordinary.windowHandle = to;
+    ASSERT_TRUE(ordinary.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {1}), ordinary, to), nullptr);
+    auto physical = streamMotion(ACTION_MOVE, {0, 1});
+    splitPhysicalToTargetForTest(physical, a, true);
+    auto successful = receiveAndAckTransferForTest(from, source); ASSERT_NE(successful, nullptr);
+    EXPECT_FLOAT_EQ(successful->getX(0), 16);
+    InputTarget resolved{destination}; resolved.windowHandle = to;
+    ui::Transform freshGeometry; freshGeometry.set(77, -3);
+    ASSERT_TRUE(resolved.addPointersWithOwnership(std::bitset<32>(1), freshGeometry,
+            streamOwners({{0, newKey}})).ok());
+    ASSERT_TRUE(resolved.addPointersWithOwnership(std::bitset<32>(2), ui::Transform(), nullptr).ok());
+    auto capability = transferCapabilityDoubleForTest(from, to, resolved, std::bitset<32>(1), oldKey, newKey);
+    ASSERT_NE(capability, nullptr); expectTransferProvenanceForTest(*capability, physical);
+    const auto sourceSent = unsentSequencesForTest(source, true), destinationSent = unsentSequencesForTest(destination, true);
+    ASSERT_TRUE(transferForTest(*capability)); EXPECT_FALSE(transferForTest(*capability));
+    EXPECT_EQ(unsentSequencesForTest(source, true), sourceSent);
+    EXPECT_EQ(unsentSequencesForTest(destination, true), destinationSent);
+    const auto sourcePackets = unsentMotionsForTest(source), destinationPackets = unsentMotionsForTest(destination);
+    ASSERT_EQ(sourcePackets.size(), 1u); ASSERT_EQ(destinationPackets.size(), 1u);
+    EXPECT_EQ(sourcePackets[0]->action, ACTION_CANCEL);
+    EXPECT_EQ(destinationPackets[0]->action, POINTER_0_DOWN);
+    EXPECT_EQ(enqueuedPointerCountForTest(destination, *destinationPackets[0]), 2u);
+    EXPECT_EQ(enqueuedOwnerForTest(destination, *destinationPackets[0], false, 0), newKey);
+    EXPECT_EQ(enqueuedOwnerForTest(destination, *destinationPackets[0], false, 1), std::nullopt);
+    EXPECT_EQ(physical->externalDesktopPointerOwnership, nullptr);
+    EXPECT_EQ(physical->pointerProperties.size(), 2u);
+    EXPECT_FLOAT_EQ(physical->pointerCoords[0].getX(), 1);
+    // New control packet cannot be batched with its source's saved CANCEL.
+    publishRemainingUnsentForTest(source); publishRemainingUnsentForTest(destination);
+    auto cancel = receiveAndAckTransferForTest(from, source); ASSERT_NE(cancel, nullptr);
+    EXPECT_EQ(cancel->getAction(), ACTION_CANCEL); EXPECT_FLOAT_EQ(cancel->getX(0), 16);
+    // ACKing old source CANCEL does NOT dispose the destination arrival's
+    // old-key reference. This is not a release/physical-teardown proof.
+    EXPECT_EQ(publicationReferencesForTest(destination, oldKey).sentPackets, 1u);
+    auto down = receiveAndAckTransferForTest(to, destination); ASSERT_NE(down, nullptr);
+    EXPECT_EQ(down->getAction(), POINTER_0_DOWN); ASSERT_EQ(down->getPointerCount(), 2u);
+    EXPECT_FLOAT_EQ(down->getX(0), 78); EXPECT_FLOAT_EQ(down->getY(0), -1);
+    EXPECT_FLOAT_EQ(down->getX(1), 11); EXPECT_FLOAT_EQ(down->getY(1), 12);
+    EXPECT_EQ(publicationReferencesForTest(destination, oldKey).sentPackets, 0u);
+    EXPECT_EQ(publicationReferencesForTest(destination, newKey).livePointers, 1u);
+    abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferSameConnectionCoalescesCancelDownAndQueuedMixedOwners) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "same connection rebind", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    auto connection = streamConnection(window);
+    const auto oldKey = streamKey(), peer = streamKey(8); auto newKey = oldKey; newKey.presentationLifetime += 1;
+    InputTarget original{connection}; original.windowHandle = window;
+    ASSERT_TRUE(original.addPointersWithOwnership(std::bitset<32>(7), ui::Transform(),
+            streamOwners({{0, oldKey}, {1, peer}, {2, std::nullopt}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), original, window), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(POINTER_1_DOWN, {0, 1}), original, window), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(POINTER_2_DOWN, {0, 1, 2}), original, window), nullptr);
+    auto future = streamMotion(ACTION_MOVE, {0, 1, 2}); future->eventTime += 10;
+    queueMotionToTargetForTest(future, original);
+    const auto keySeq = queueUnsentKeyForTest(connection, window); ASSERT_TRUE(keySeq.has_value());
+    InputTarget target{connection}; target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(7), ui::Transform(),
+            streamOwners({{0, newKey}, {1, peer}, {2, std::nullopt}})).ok());
+    auto capability = transferCapabilityDoubleForTest(window, window, target, std::bitset<32>(1), oldKey, newKey);
+    ASSERT_NE(capability, nullptr); ASSERT_TRUE(transferForTest(*capability));
+    const auto packets = unsentMotionsForTest(connection); ASSERT_EQ(packets.size(), 3u);
+    EXPECT_EQ(packets[0]->action, POINTER_0_UP); EXPECT_TRUE(packets[0]->flags.test(MotionFlag::CANCELED));
+    EXPECT_EQ(packets[1]->action, POINTER_0_DOWN); EXPECT_EQ(packets[2]->action, ACTION_MOVE);
+    expectStreamOwner(packets[0]->externalDesktopPointerOwnership, 0, oldKey);
+    for (size_t i = 1; i < packets.size(); ++i) {
+        expectStreamOwner(packets[i]->externalDesktopPointerOwnership, 0, newKey);
+        expectStreamOwner(packets[i]->externalDesktopPointerOwnership, 1, peer);
+        expectStreamOwner(packets[i]->externalDesktopPointerOwnership, 2, std::nullopt);
+    }
+    EXPECT_EQ(enqueuedPointerCountForTest(connection, *packets.back()), 3u);
+    EXPECT_EQ(future->externalDesktopPointerOwnership, nullptr); // raw shared packet was not retagged
+    const auto queued = unsentSequencesForTest(connection);
+    EXPECT_NE(std::find(queued.begin(), queued.end(), *keySeq), queued.end());
+    EXPECT_EQ(publicationReferencesForTest(connection, oldKey).livePointers, 1u); // commit is not publication
+    EXPECT_EQ(publicationReferencesForTest(connection, newKey).livePointers, 0u);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferSelectedSubsetDoesNotCancelSameKeySibling) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "selected subset", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    auto connection = streamConnection(window);
+    const auto oldKey = streamKey(); auto newKey = oldKey; newKey.presentationLifetime += 1;
+    InputTarget old{connection}; old.windowHandle = window;
+    ASSERT_TRUE(old.addPointersWithOwnership(std::bitset<32>(3), ui::Transform(), streamOwners({{0, oldKey}, {1, oldKey}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), old, window), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(POINTER_1_DOWN, {0, 1}), old, window), nullptr);
+    InputTarget target{connection}; target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3), ui::Transform(), streamOwners({{0, newKey}, {1, oldKey}})).ok());
+    auto cap = transferCapabilityDoubleForTest(window, window, target, std::bitset<32>(1), oldKey, newKey);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    const auto packets = unsentMotionsForTest(connection); ASSERT_EQ(packets.size(), 2u);
+    EXPECT_EQ(packets[0]->action, POINTER_0_UP); EXPECT_EQ(packets[1]->action, POINTER_0_DOWN);
+    EXPECT_EQ(enqueuedOwnerForTest(connection, *packets[1], false, 0), newKey);
+    EXPECT_EQ(enqueuedOwnerForTest(connection, *packets[1], false, 1), oldKey);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferStaleSecondOwnerCannotPartiallyCommitSource) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "atomic source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "atomic destination", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    InputTarget b{destination}; b.windowHandle = to;
+    ASSERT_TRUE(b.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, next}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, b, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); transferStaleSecondOwnerForTest(*cap);
+    EXPECT_EQ(publicationReferencesForTest(source, oldKey).livePointers, 1u);
+    EXPECT_TRUE(unsentSequencesForTest(source).empty());
+    abortPublicationForTest(source);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferWrongEndpointOrInventedOriginRefusesWithoutMutation) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "binding source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "binding destination", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    InputTarget b{destination}; b.windowHandle = to;
+    ASSERT_TRUE(b.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, next}})).ok());
+    auto wrongEndpoint = transferCapabilityDoubleForTest(from, to, b, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(wrongEndpoint, nullptr); invalidateTransferEndpointDoubleForTest(*wrongEndpoint);
+    EXPECT_FALSE(transferForTest(*wrongEndpoint));
+    auto fakeOrigin = transferCapabilityDoubleForTest(from, to, b, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(fakeOrigin, nullptr); replaceTransferOriginDoubleForTest(*fakeOrigin);
+    EXPECT_FALSE(transferForTest(*fakeOrigin));
+    EXPECT_TRUE(unsentSequencesForTest(source).empty()); EXPECT_TRUE(unsentSequencesForTest(destination).empty());
+    EXPECT_EQ(publicationReferencesForTest(source, oldKey).livePointers, 1u);
+    EXPECT_EQ(enqueuedPointerCountForTest(source, *streamMotion(ACTION_MOVE, {0})), 1u);
+    EXPECT_EQ(enqueuedPointerCountForTest(destination, *streamMotion(ACTION_MOVE, {0})), 0u);
+    abortPublicationForTest(source);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferHoverSameConnectionKeepsTouchPrivateAndNullPeers) {
+    SCOPED_FLAG_OVERRIDE(enable_multi_device_same_window_stream, true);
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "hover rebind", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    auto connection = streamConnection(window);
+    const auto oldKey = streamKey(), peer = streamKey(8), touch = streamKey(9);
+    auto next = oldKey; next.presentationLifetime += 1;
+    InputTarget hovering{connection}; hovering.windowHandle = window;
+    ASSERT_TRUE(hovering.addPointersWithOwnership(std::bitset<32>(7), ui::Transform(),
+            streamOwners({{0, oldKey}, {1, peer}, {2, std::nullopt}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_HOVER_ENTER, {0, 1, 2}, nullptr, AINPUT_SOURCE_MOUSE), hovering, window), nullptr);
+    InputTarget touching{connection}; touching.windowHandle = window;
+    ASSERT_TRUE(touching.addPointersWithOwnership(std::bitset<32>(8), ui::Transform(), streamOwners({{3, touch}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {3}, nullptr, AINPUT_SOURCE_TOUCHSCREEN,
+            DISPLAY_ID, DeviceId{3}), touching, window), nullptr);
+    InputTarget target{connection}; target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(7), ui::Transform(),
+            streamOwners({{0, next}, {1, peer}, {2, std::nullopt}})).ok());
+    auto cap = transferCapabilityDoubleForTest(window, window, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    const auto packets = unsentMotionsForTest(connection); ASSERT_EQ(packets.size(), 2u);
+    EXPECT_EQ(packets[0]->action, ACTION_HOVER_MOVE); EXPECT_EQ(packets[0]->pointerProperties.size(), 2u);
+    EXPECT_EQ(packets[1]->action, ACTION_HOVER_MOVE); EXPECT_EQ(packets[1]->pointerProperties.size(), 3u);
+    EXPECT_EQ(enqueuedOwnerForTest(connection, *packets[1], true, 0), next);
+    EXPECT_EQ(enqueuedOwnerForTest(connection, *packets[1], true, 1), peer);
+    EXPECT_EQ(enqueuedOwnerForTest(connection, *packets[1], true, 2), std::nullopt);
+    EXPECT_EQ(enqueuedOwnerForTest(connection, *streamMotion(ACTION_MOVE, {3}, nullptr,
+            AINPUT_SOURCE_TOUCHSCREEN, DISPLAY_ID, DeviceId{3}), false, 3), touch);
+    // Native retirement then addition are two exact intents, not channel EXIT.
+    EXPECT_GE(publicationReferencesForTest(connection, oldKey).queuedPackets, 2u);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferHoverArrivesIntoOrdinaryPeerWithoutBroadExit) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "hover source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "hover ordinary recipient", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    InputTarget b{destination}; b.windowHandle = to;
+    ASSERT_TRUE(b.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_HOVER_ENTER, {0}, nullptr, AINPUT_SOURCE_MOUSE), a, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_HOVER_ENTER, {1}, nullptr, AINPUT_SOURCE_MOUSE), b, to), nullptr);
+    auto physical = streamMotion(ACTION_HOVER_MOVE, {0, 1}, nullptr, AINPUT_SOURCE_MOUSE);
+    splitPhysicalToTargetForTest(physical, a, true);
+    ASSERT_NE(receiveAndAckTransferForTest(from, source), nullptr);
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3), ui::Transform(),
+            streamOwners({{0, next}, {1, std::nullopt}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    const auto aPackets = unsentMotionsForTest(source), bPackets = unsentMotionsForTest(destination);
+    ASSERT_EQ(aPackets.size(), 1u); ASSERT_EQ(bPackets.size(), 1u);
+    EXPECT_EQ(aPackets[0]->action, ACTION_HOVER_EXIT); // last source pointer only
+    EXPECT_EQ(bPackets[0]->action, ACTION_HOVER_MOVE); ASSERT_EQ(bPackets[0]->pointerProperties.size(), 2u);
+    EXPECT_EQ(enqueuedOwnerForTest(destination, *bPackets[0], true, 0), next);
+    EXPECT_EQ(enqueuedOwnerForTest(destination, *bPackets[0], true, 1), std::nullopt);
+    EXPECT_EQ(bPackets[0]->pointerProperties[1].id, 1);
+    abortPublicationForTest(source); abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferEqualTimeSamplesKeepActualNativeQueueOrder) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "ambiguous raw ordering", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    auto connection = streamConnection(window);
+    const auto oldKey = streamKey(); auto next = oldKey; next.presentationLifetime += 1;
+    InputTarget old{connection}; old.windowHandle = window;
+    ASSERT_TRUE(old.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), old, window), nullptr);
+    auto first = streamMotion(ACTION_MOVE, {0}), second = streamMotion(ACTION_MOVE, {0});
+    ASSERT_EQ(first->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, 17), OK);
+    ASSERT_EQ(second->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, 29), OK);
+    queueMotionToTargetForTest(first, old);
+    queueMotionToTargetForTest(second, old); // different origins, same time, REAL queue order
+    InputTarget target{connection}; target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, next}})).ok());
+    auto cap = transferCapabilityDoubleForTest(window, window, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    const auto packets = unsentMotionsForTest(connection); ASSERT_EQ(packets.size(), 4u);
+    EXPECT_EQ(packets[0]->action, ACTION_CANCEL); EXPECT_EQ(packets[1]->action, ACTION_DOWN);
+    EXPECT_EQ(packets[2]->action, ACTION_MOVE); EXPECT_EQ(packets[3]->action, ACTION_MOVE);
+    EXPECT_FLOAT_EQ(packets[2]->pointerCoords[0].getX(), 17);
+    EXPECT_FLOAT_EQ(packets[3]->pointerCoords[0].getX(), 29);
+    EXPECT_EQ(enqueuedOwnerForTest(connection, *packets.back(), false, 0), next);
+    EXPECT_EQ(first->externalDesktopPointerOwnership, nullptr); EXPECT_EQ(second->externalDesktopPointerOwnership, nullptr);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferJoinsSharedQueuedOriginOnceWithoutLosingPeers) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "queued source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "queued ordinary peer", DISPLAY_ID);
+    from->setOwnerInfo(gui::Pid{101}, gui::Uid{101}); to->setOwnerInfo(gui::Pid{202}, gui::Uid{202});
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    InputTarget b{destination}; b.windowHandle = to;
+    ASSERT_TRUE(b.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {1}), b, to), nullptr);
+    auto physical = streamMotion(ACTION_MOVE, {0, 1});
+    splitPhysicalToTargetForTest(physical, a, true); ASSERT_NE(receiveAndAckTransferForTest(from, source), nullptr);
+    auto future = streamMotion(ACTION_MOVE, {0, 1}); future->eventTime += 10;
+    queueSharedPhysicalForBothForTest(future, a, b);
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3), ui::Transform(),
+            streamOwners({{0, next}, {1, std::nullopt}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    const auto aPackets = unsentMotionsForTest(source), bPackets = unsentMotionsForTest(destination);
+    ASSERT_EQ(aPackets.size(), 1u); EXPECT_EQ(aPackets[0]->action, ACTION_CANCEL);
+    ASSERT_EQ(bPackets.size(), 2u); EXPECT_EQ(bPackets[0]->action, POINTER_0_DOWN);
+    EXPECT_EQ(bPackets[1]->action, ACTION_MOVE); EXPECT_EQ(bPackets[1]->eventTime, future->eventTime);
+    expectStreamOwner(bPackets[1]->externalDesktopPointerOwnership, 0, next);
+    expectStreamOwner(bPackets[1]->externalDesktopPointerOwnership, 1, std::nullopt);
+    EXPECT_EQ(future->externalDesktopPointerOwnership, nullptr);
+    EXPECT_EQ(enqueuedPointerCountForTest(destination, *bPackets[1]), 2u);
+    abortPublicationForTest(source); abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferCannotRewindMoreRecentOrdinaryDestinationSuccess) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "older successful source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "newer ordinary recipient", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    InputTarget b{destination}; b.windowHandle = to;
+    ASSERT_TRUE(b.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {1}), b, to), nullptr);
+    auto physical = streamMotion(ACTION_MOVE, {0, 1});
+    splitPhysicalToTargetForTest(physical, a, true); ASSERT_NE(receiveAndAckTransferForTest(from, source), nullptr);
+    auto recent = streamMotion(ACTION_MOVE, {1}); recent->eventTime += 10;
+    ASSERT_NE(publishAndAckSavedForTest(recent, b, to), nullptr);
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3), ui::Transform(),
+            streamOwners({{0, next}, {1, std::nullopt}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); EXPECT_FALSE(transferForTest(*cap));
+    EXPECT_TRUE(unsentSequencesForTest(source).empty()); EXPECT_TRUE(unsentSequencesForTest(destination).empty());
+    EXPECT_EQ(enqueuedOwnerForTest(source, *physical, false, 0), oldKey);
+    EXPECT_EQ(enqueuedPointerCountForTest(destination, *recent), 1u);
+    EXPECT_EQ(publicationReferencesForTest(source, oldKey).livePointers, 1u);
+    abortPublicationForTest(source); abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferCannotRewindLaterEqualTimeOrdinaryRecipient) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "equal-time older source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "equal-time later recipient", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    InputTarget b{destination}; b.windowHandle = to;
+    ASSERT_TRUE(b.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {1}), b, to), nullptr);
+    auto olderPhysical = streamMotion(ACTION_MOVE, {0, 1});
+    splitPhysicalToTargetForTest(olderPhysical, a, true);
+    ASSERT_NE(receiveAndAckTransferForTest(from, source), nullptr);
+    auto laterRecipient = streamMotion(ACTION_MOVE, {1});
+    ASSERT_EQ(laterRecipient->eventTime, olderPhysical->eventTime);
+    ASSERT_NE(laterRecipient, olderPhysical);
+    ASSERT_EQ(laterRecipient->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, 91), OK);
+    ASSERT_EQ(laterRecipient->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_Y, 92), OK);
+    auto received = publishAndAckSavedForTest(laterRecipient, b, to);
+    ASSERT_NE(received, nullptr);
+    ASSERT_FLOAT_EQ(received->getX(0), 91); ASSERT_FLOAT_EQ(received->getY(0), 92);
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3), ui::Transform(),
+            streamOwners({{0, next}, {1, std::nullopt}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr);
+    const auto sourceBefore = unsentSequencesForTest(source), destinationBefore = unsentSequencesForTest(destination);
+    EXPECT_FALSE(transferForTest(*cap));
+    EXPECT_EQ(unsentSequencesForTest(source), sourceBefore);
+    EXPECT_EQ(unsentSequencesForTest(destination), destinationBefore);
+    EXPECT_EQ(enqueuedOwnerForTest(source, *olderPhysical, false, 0), oldKey);
+    EXPECT_EQ(enqueuedOwnerForTest(destination, *laterRecipient, false, 0), std::nullopt);
+    // If a broken implementation accepts the handoff, expose the concrete
+    // rewind independently: the actual queued recipient sample must not take
+    // pointer1 back from its received91/92 to the older source's11/12.
+    for (const auto& packet : unsentMotionsForTest(destination)) {
+        for (size_t i = 0; i < packet->pointerProperties.size(); ++i) {
+            if (packet->pointerProperties[i].id == 1) {
+                EXPECT_FLOAT_EQ(packet->pointerCoords[i].getX(), 91);
+                EXPECT_FLOAT_EQ(packet->pointerCoords[i].getY(), 92);
+            }
+        }
+    }
+    // No rewound packet is published even in the deliberately red baseline.
+    abortPublicationForTest(source); abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferSharedNativeOriginEqualTimeStillAdmits) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "shared native source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "shared native recipient", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    InputTarget b{destination}; b.windowHandle = to;
+    ASSERT_TRUE(b.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {1}), b, to), nullptr);
+    auto sharedPhysical = streamMotion(ACTION_MOVE, {0, 1});
+    queueSharedPhysicalForBothForTest(sharedPhysical, a, b);
+    publishRemainingUnsentForTest(source); publishRemainingUnsentForTest(destination);
+    auto sourceMove = receiveAndAckTransferForTest(from, source);
+    auto destinationMove = receiveAndAckTransferForTest(to, destination);
+    ASSERT_NE(sourceMove, nullptr); ASSERT_NE(destinationMove, nullptr);
+    ASSERT_EQ(sourceMove->getEventTime(), destinationMove->getEventTime());
+    ASSERT_FLOAT_EQ(destinationMove->getX(0), 11); ASSERT_FLOAT_EQ(destinationMove->getY(0), 12);
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3), ui::Transform(),
+            streamOwners({{0, next}, {1, std::nullopt}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    const auto packets = unsentMotionsForTest(destination); ASSERT_EQ(packets.size(), 1u);
+    EXPECT_EQ(packets[0]->action, POINTER_0_DOWN);
+    EXPECT_EQ(enqueuedOwnerForTest(destination, *packets[0], false, 0), next);
+    EXPECT_EQ(enqueuedOwnerForTest(destination, *packets[0], false, 1), std::nullopt);
+    EXPECT_FLOAT_EQ(packets[0]->pointerCoords[1].getX(), 11);
+    EXPECT_FLOAT_EQ(packets[0]->pointerCoords[1].getY(), 12);
+    abortPublicationForTest(source); abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferOlderRecipientPrefixKeepsIdentityBeforeArrival) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "newer native source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "older queued recipient", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    InputTarget b{destination}; b.windowHandle = to;
+    ASSERT_TRUE(b.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {1}), b, to), nullptr);
+    auto prefix = streamMotion(ACTION_MOVE, {1});
+    ASSERT_EQ(prefix->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, 51), OK);
+    ASSERT_EQ(prefix->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_Y, 52), OK);
+    queueMotionToTargetForTest(prefix, b);
+    const auto before = unsentSequencesForTest(destination); ASSERT_EQ(before.size(), 1u);
+    auto newerSource = streamMotion(ACTION_MOVE, {0, 1});
+    ASSERT_EQ(newerSource->eventTime, prefix->eventTime);
+    ASSERT_EQ(newerSource->pointerCoords[1].setAxisValue(AMOTION_EVENT_AXIS_X, 91), OK);
+    ASSERT_EQ(newerSource->pointerCoords[1].setAxisValue(AMOTION_EVENT_AXIS_Y, 92), OK);
+    splitPhysicalToTargetForTest(newerSource, a, true);
+    ASSERT_NE(receiveAndAckTransferForTest(from, source), nullptr);
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(3), ui::Transform(),
+            streamOwners({{0, next}, {1, std::nullopt}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    const auto after = unsentSequencesForTest(destination); ASSERT_EQ(after.size(), 2u);
+    EXPECT_EQ(after.front(), before.front()); // exact original packet/seq, not a reconstructed MOVE
+    const auto packets = unsentMotionsForTest(destination); ASSERT_EQ(packets.size(), 2u);
+    EXPECT_EQ(packets.front(), prefix);
+    EXPECT_EQ(packets[0]->action, ACTION_MOVE); EXPECT_EQ(packets[1]->action, POINTER_0_DOWN);
+    EXPECT_FLOAT_EQ(packets[0]->pointerCoords[0].getX(), 51);
+    EXPECT_FLOAT_EQ(packets[0]->pointerCoords[0].getY(), 52);
+    EXPECT_FLOAT_EQ(packets[1]->pointerCoords[1].getX(), 91);
+    EXPECT_FLOAT_EQ(packets[1]->pointerCoords[1].getY(), 92);
+    publishRemainingUnsentForTest(destination);
+    auto receivedPrefix = receiveAndAckTransferForTest(to, destination);
+    auto arrival = receiveAndAckTransferForTest(to, destination);
+    ASSERT_NE(receivedPrefix, nullptr); ASSERT_NE(arrival, nullptr);
+    EXPECT_EQ(receivedPrefix->getAction(), ACTION_MOVE);
+    EXPECT_FLOAT_EQ(receivedPrefix->getX(0), 51); EXPECT_FLOAT_EQ(receivedPrefix->getY(0), 52);
+    EXPECT_EQ(arrival->getAction(), POINTER_0_DOWN);
+    EXPECT_FLOAT_EQ(arrival->getX(1), 91); EXPECT_FLOAT_EQ(arrival->getY(1), 92);
+    abortPublicationForTest(source); abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferIngressExhaustionIsStickyButOrdinaryStillPublishes) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "ingress exhaustion source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "ingress exhaustion ordinary", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), a, from), nullptr);
+    exhaustNativeIngressForTest();
+    InputTarget ordinary{destination}; ordinary.windowHandle = to;
+    ASSERT_TRUE(ordinary.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    auto observed = publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {1}, nullptr,
+            AINPUT_SOURCE_TOUCHSCREEN, DISPLAY_ID, DeviceId{3}), ordinary, to);
+    ASSERT_NE(observed, nullptr); EXPECT_EQ(observed->getAction(), ACTION_DOWN);
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, next}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); EXPECT_FALSE(transferForTest(*cap));
+    EXPECT_TRUE(unsentSequencesForTest(source).empty()); EXPECT_TRUE(unsentSequencesForTest(destination).empty());
+    EXPECT_EQ(publicationReferencesForTest(source, oldKey).livePointers, 1u);
+    EXPECT_EQ(enqueuedPointerCountForTest(destination, *streamMotion(ACTION_MOVE, {1}, nullptr,
+            AINPUT_SOURCE_TOUCHSCREEN, DISPLAY_ID, DeviceId{3})), 1u);
+    abortPublicationForTest(source); abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferActualNotifyMotionOwnsNotificationIngressTicket) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "actual notify ingress", DISPLAY_ID);
+    window->setFrame(Rect{0, 0, 100, 100});
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    mDispatcher->notifyMotion(generateMotionArgs(ACTION_DOWN, AINPUT_SOURCE_TOUCHSCREEN,
+            DISPLAY_ID, {PointF{10, 10}}));
+    auto [seq, event] = window->receiveEvent();
+    ASSERT_TRUE(seq.has_value()); ASSERT_NE(event, nullptr);
+    ASSERT_EQ(event->getType(), InputEventType::MOTION);
+    const auto& down = static_cast<const MotionEvent&>(*event);
+    ASSERT_EQ(down.getAction(), ACTION_DOWN);
+    auto connection = streamConnection(window); ASSERT_NE(connection, nullptr);
+    expectActualNotifyIngressForTest(connection, *streamMotion(ACTION_MOVE, {0}, nullptr,
+            down.getSource(), down.getDisplayId(), down.getDeviceId()));
+    window->finishEvent(*seq); ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    // This used real notifyMotion/policy/dispatch/publisher, not a fixture
+    // TEST_DOUBLE stamp. It is still a unit input notification, not hardware
+    // contact-release, private authority/issuer or activated production input.
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageIngressOrdinaryInjectionReceivesAndAcksWithoutPrivateReaderPromotion) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "ordinary injected provenance", DISPLAY_ID);
+    window->setFrame(Rect{0, 0, 100, 100});
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    auto connection = streamConnection(window); ASSERT_NE(connection, nullptr);
+    const nsecs_t downTime = systemTime(SYSTEM_TIME_MONOTONIC);
+    for (const int32_t action : {ACTION_DOWN, ACTION_UP}) {
+        auto event = MotionEventBuilder(action, AINPUT_SOURCE_TOUCHSCREEN)
+                .deviceId(DeviceId{7}).displayId(DISPLAY_ID).downTime(downTime)
+                .eventTime(systemTime(SYSTEM_TIME_MONOTONIC))
+                .pointer(PointerBuilder(0, ToolType::FINGER).x(10).y(10)).build();
+        ASSERT_EQ(injectMotionEvent(*mDispatcher, event, INJECT_EVENT_TIMEOUT,
+                InputEventInjectionSync::WAIT_FOR_RESULT, {}, DEFAULT_POLICY_FLAGS & ~POLICY_FLAG_FILTERED),
+                InputEventInjectionResult::SUCCEEDED);
+        auto [seq, received] = window->receiveEvent();
+        ASSERT_TRUE(seq.has_value()); ASSERT_NE(received, nullptr);
+        ASSERT_EQ(received->getType(), InputEventType::MOTION);
+        const auto& motion = static_cast<const MotionEvent&>(*received);
+        EXPECT_EQ(motion.getAction(), action); EXPECT_EQ(motion.getDeviceId(), VIRTUAL_KEYBOARD_ID);
+        EXPECT_FLOAT_EQ(motion.getX(0), 10); EXPECT_FLOAT_EQ(motion.getY(0), 10);
+        expectOrdinaryProvenanceForTest(connection, motion, ExternalDesktopNativeIngress::Kind::INJECTED);
+        window->finishEvent(*seq); ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    }
+    // Native unit injection/ordinary delivery only, not Binder permission or
+    // any physical-release/private-stream/authority grant from injected UP.
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageIngressFilteredHostReturnStaysInjectedAndPreservesOrdinaryDevice) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "filtered native host return", DISPLAY_ID);
+    window->setFrame(Rect{0, 0, 100, 100});
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    auto connection = streamConnection(window); ASSERT_NE(connection, nullptr);
+    mDispatcher->setInputFilterEnabled(true);
+    const nsecs_t downTime = systemTime(SYSTEM_TIME_MONOTONIC);
+    for (const int32_t action : {ACTION_DOWN, ACTION_UP}) {
+        auto event = MotionEventBuilder(action, AINPUT_SOURCE_TOUCHSCREEN)
+                .deviceId(DeviceId{7}).displayId(DISPLAY_ID).downTime(downTime)
+                .eventTime(systemTime(SYSTEM_TIME_MONOTONIC))
+                .pointer(PointerBuilder(0, ToolType::FINGER).x(10).y(10)).build();
+        ASSERT_EQ(injectMotionEvent(*mDispatcher, event, INJECT_EVENT_TIMEOUT,
+                InputEventInjectionSync::WAIT_FOR_RESULT, {}, DEFAULT_POLICY_FLAGS | POLICY_FLAG_FILTERED),
+                InputEventInjectionResult::SUCCEEDED);
+        auto [seq, received] = window->receiveEvent();
+        ASSERT_TRUE(seq.has_value()); ASSERT_NE(received, nullptr);
+        ASSERT_EQ(received->getType(), InputEventType::MOTION);
+        const auto& motion = static_cast<const MotionEvent&>(*received);
+        EXPECT_EQ(motion.getAction(), action); EXPECT_EQ(motion.getDeviceId(), DeviceId{7});
+        EXPECT_FLOAT_EQ(motion.getX(0), 10); EXPECT_FLOAT_EQ(motion.getY(0), 10);
+        expectOrdinaryProvenanceForTest(connection, motion, ExternalDesktopNativeIngress::Kind::INJECTED);
+        window->finishEvent(*seq); ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    }
+    mFakePolicy->assertFilterInputEventWasNotCalled(); // FILTERED native host-return path bypasses recursion
+    mDispatcher->setInputFilterEnabled(false);
+    // Same native return API/flags used by IMS.InputFilterHost, but NOT an
+    // executed Java/Binder filter join or proof of reader physical UP.
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageIngressNativeFilterPassthroughRemainsNotifyNotReinjectionJoin) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "native filter passthrough", DISPLAY_ID);
+    window->setFrame(Rect{0, 0, 100, 100});
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    auto connection = streamConnection(window); ASSERT_NE(connection, nullptr);
+    mDispatcher->setInputFilterEnabled(true);
+    for (const int32_t action : {ACTION_DOWN, ACTION_UP}) {
+        const auto args = generateMotionArgs(action, AINPUT_SOURCE_TOUCHSCREEN, DISPLAY_ID, {PointF{10, 10}});
+        mDispatcher->notifyMotion(args);
+        auto [seq, received] = window->receiveEvent();
+        ASSERT_TRUE(seq.has_value()); ASSERT_NE(received, nullptr);
+        ASSERT_EQ(received->getType(), InputEventType::MOTION);
+        const auto& motion = static_cast<const MotionEvent&>(*received);
+        EXPECT_EQ(motion.getAction(), action);
+        expectOrdinaryProvenanceForTest(connection, motion, ExternalDesktopNativeIngress::Kind::NOTIFY_MOTION);
+        mFakePolicy->assertFilterInputEventWasCalled(args, vec2{10, 10});
+        window->finishEvent(*seq); ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    }
+    mDispatcher->setInputFilterEnabled(false);
+    // Existing real native FakePolicy callback returns passthrough=true. It
+    // releases/reacquires the actual dispatcher lock, but does not simulate
+    // asynchronous IInputFilter/Host Binder output or establish a return join.
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageTrustedTransferPreservesEverySentTailUntilItsRealAcknowledgement) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "sent source", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "sent arrival", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(); auto next = oldKey; next.windowLifetime += 1;
+    InputTarget a{source}; a.windowHandle = from;
+    ASSERT_TRUE(a.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, oldKey}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_DOWN, {0}), a)); // deliberately not ACKed
+    const auto sent = unsentSequencesForTest(source, true); ASSERT_EQ(sent.size(), 1u);
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, next}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    EXPECT_EQ(unsentSequencesForTest(source, true), sent);
+    publishRemainingUnsentForTest(source); publishRemainingUnsentForTest(destination);
+    EXPECT_EQ(publicationReferencesForTest(source, oldKey).sentPackets, 2u);
+    EXPECT_EQ(publicationReferencesForTest(destination, oldKey).sentPackets, 1u);
+    auto oldDown = receiveAndAckTransferForTest(from, source); ASSERT_NE(oldDown, nullptr);
+    EXPECT_EQ(oldDown->getAction(), ACTION_DOWN);
+    EXPECT_EQ(publicationReferencesForTest(source, oldKey).sentPackets, 1u);
+    auto oldCancel = receiveAndAckTransferForTest(from, source); ASSERT_NE(oldCancel, nullptr);
+    EXPECT_EQ(oldCancel->getAction(), ACTION_CANCEL);
+    EXPECT_EQ(publicationReferencesForTest(source, oldKey).sentPackets, 0u);
+    EXPECT_EQ(publicationReferencesForTest(destination, oldKey).sentPackets, 1u);
+    auto newDown = receiveAndAckTransferForTest(to, destination); ASSERT_NE(newDown, nullptr);
+    EXPECT_EQ(newDown->getAction(), ACTION_DOWN);
+    EXPECT_EQ(publicationReferencesForTest(destination, oldKey).sentPackets, 0u);
+    EXPECT_EQ(publicationReferencesForTest(destination, next).livePointers, 1u);
+    // No registration/FD teardown, physical release or RootClaim removal is
+    // inferred from these three actual ACKs. The new stream is still alive.
+    abortPublicationForTest(destination);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageSavedCancelLostCoverageRefusesWithoutReplacingAdvancedState) {
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"saved coverage",DISPLAY_ID);
+    auto connection=streamConnection(window);
+    const auto key=streamKey();
+    InputTarget target{connection};target.windowHandle=window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1),ui::Transform(),streamOwners({{0,key}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN,{0}),target,window),nullptr);
+    ASSERT_TRUE(queueUnsentForTest(connection,window,streamMotion(ACTION_MOVE,{0},streamOwners({{0,key}}))));
+    const auto queued=unsentSequencesForTest(connection);
+    loseUnsentCoverageForTest(connection);
+    EXPECT_FALSE(queueSavedCancellationForTest(connection,key));
+    EXPECT_EQ(unsentSequencesForTest(connection),queued);
+    EXPECT_EQ(publicationReferencesForTest(connection,key).livePointers,1u);
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageSavedCancelActualWouldBlockKeepsSuccessfulSnapshotUntilPublication) {
+    auto application=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(application,mDispatcher,"saved cancel blocked",DISPLAY_ID);
+    auto connection=streamConnection(window);
+    const auto key=streamKey();
+    InputTarget target{connection};target.windowHandle=window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1),ui::Transform(),streamOwners({{0,key}})).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_DOWN,{0}),target));
+    bool blocked=false;
+    for(size_t i=0;i<512;++i){
+        auto event=streamMotion(ACTION_MOVE,{0});
+        ASSERT_EQ(OK,event->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X,static_cast<float>(i+100)));
+        ASSERT_TRUE(publishStreamForTest(event,target));
+        if(publicationReferencesForTest(connection,key).queuedPackets){blocked=true;break;}
+    }
+    ASSERT_TRUE(blocked);
+    const auto before=publishedXForTest(connection,key);
+    ASSERT_TRUE(before.has_value());
+    ASSERT_TRUE(queueSavedCancellationForTest(connection,key));
+    publishRemainingUnsentForTest(connection); // real publisher still WOULD_BLOCK.
+    EXPECT_EQ(publicationReferencesForTest(connection,key).livePointers,1u);
+    EXPECT_EQ(publishedXForTest(connection,key),before);
+    const auto queued=unsentMotionsForTest(connection);
+    ASSERT_EQ(queued.size(),1u);
+    EXPECT_EQ(queued[0]->action,ACTION_CANCEL);
+    EXPECT_FLOAT_EQ(queued[0]->pointerCoords[0].getX(),*before);
+    abortPublicationForTest(connection); // no fake ACK or teardown proof.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePointerCoordsRejects31And64IncomingAxesWithoutMutation) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState state(generator);
+    const auto key=streamKey();
+    auto down=streamMotion(ACTION_DOWN,{0},streamOwners({{0,key}}));
+    ASSERT_TRUE(state.trackMotion(*down,{}));
+    auto before=state.copyExternalDesktopMotionProjection();ASSERT_TRUE(before.ok());
+    ExternalDesktopPublishedMotion publication;
+    auto packet=publicationPacket(down);
+    auto initial=publication.prepare(*packet);ASSERT_TRUE(initial.ok());
+    ASSERT_TRUE(publication.commit(std::move(*initial)));
+    for(uint64_t bits : { (uint64_t{1}<<31)-1,UINT64_MAX }) {
+        auto invalid=streamMotion(ACTION_MOVE,{0},streamOwners({{0,key}}));
+        invalid->pointerCoords[0].bits=bits; // adversarial TCB struct, never stock axis getters.
+        EXPECT_FALSE(state.prepareExternalDesktopPublishedMotion(*invalid,{}).ok());
+        EXPECT_TRUE(state.sameExternalDesktopMotionProjection(**before));
+        auto invalidPacket=publicationPacket(invalid);
+        EXPECT_FALSE(publication.prepare(*invalidPacket).ok());
+        EXPECT_EQ(publication.livePointers(key),1u);
+        EXPECT_EQ(invalid->pointerCoords[0].bits,bits);
+    }
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePointerCoordsRejects31And64StoredAxesBeforeComparison) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    for(uint64_t bits : { (uint64_t{1}<<31)-1,UINT64_MAX }) {
+        InputState state(generator);
+        auto down=streamMotion(ACTION_DOWN,{0});
+        ASSERT_TRUE(state.trackMotion(*down,{}));
+        auto valid=state.copyExternalDesktopMotionProjection();ASSERT_TRUE(valid.ok());
+        auto invalid=down->pointerCoords[0];invalid.bits=bits;
+        replaceStoredCoordsForTest(state,invalid);
+        EXPECT_FALSE(state.copyExternalDesktopMotionProjection().ok());
+        EXPECT_FALSE(state.sameExternalDesktopMotionProjection(state));
+        EXPECT_FALSE(state.sameExternalDesktopMotionProjection(**valid));
+        EXPECT_FALSE((*valid)->sameExternalDesktopMotionProjection(state));
+        EXPECT_FALSE(state.prepareExternalDesktopPublishedMotion(*streamMotion(ACTION_MOVE,{0}),{}).ok());
+        EXPECT_EQ(storedCoordsForTest(state).bits,bits);
+    }
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStagePointerCoordsThirtyAxesCopyIsBitExactForNaNAndNegativeZero) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState state(generator);
+    auto down=streamMotion(ACTION_DOWN,{0},streamOwners({{0,streamKey()}}));
+    PointerCoords point{};
+    ASSERT_EQ(point.values.size(),30u);
+    point.bits=(uint64_t{1}<<30)-1;
+    for(size_t i=0;i<point.values.size();++i) point.values[i]=static_cast<float>(i);
+    point.values[2]=std::bit_cast<float>(uint32_t{0x7fc01234});
+    point.values[3]=std::bit_cast<float>(uint32_t{0x80000000});
+    down->pointerCoords[0]=point;
+    auto initial=state.prepareExternalDesktopPublishedMotion(*down,{});ASSERT_TRUE(initial.ok());
+    ASSERT_TRUE(state.swapExternalDesktopMotionProjection(**initial));
+    auto copy=state.copyExternalDesktopMotionProjection();ASSERT_TRUE(copy.ok());
+    EXPECT_TRUE(state.sameExternalDesktopMotionProjection(**copy));
+    const auto retained=storedCoordsForTest(**copy);
+    EXPECT_EQ(std::bit_cast<uint32_t>(retained.values[2]),0x7fc01234u);
+    EXPECT_EQ(std::bit_cast<uint32_t>(retained.values[3]),0x80000000u);
+    auto different=retained;different.values[3]=0.0f;
+    replaceStoredCoordsForTest(**copy,different);
+    EXPECT_FALSE(state.sameExternalDesktopMotionProjection(**copy));
+    different=retained;different.values[2]=std::bit_cast<float>(uint32_t{0x7fc05678});
+    replaceStoredCoordsForTest(**copy,different);
+    EXPECT_FALSE(state.sameExternalDesktopMotionProjection(**copy));
+    EXPECT_EQ(storedCoordsForTest(state).bits,point.bits);
+}
+
+// Motion-checkpoint prerequisite ONLY. No selective queue mutation, cancellation
+// synthesis, stream issuance, private admission or channel teardown is inferred.
+TEST_F(InputDispatcherTest, ExternalDesktopStageDeliveredMotionCopyIsOwnedAndDoesNotReplaceKeys) {
+    IdGenerator generator(IdGenerator::Source::INPUT_DISPATCHER);
+    InputState state(generator);
+    KeyEntry key(InputEvent::nextId(), nullptr, ARBITRARY_TIME, DEVICE_ID, AINPUT_SOURCE_KEYBOARD,
+                 DISPLAY_ID, POLICY_FLAG_TRUSTED, AKEY_EVENT_ACTION_DOWN, 0, AKEYCODE_A,
+                 KEY_A, AMETA_NONE, 0, ARBITRARY_TIME);
+    ASSERT_TRUE(state.trackKey(key, 0));
+    auto down = streamMotion(ACTION_DOWN, {0});
+    auto prepared = state.prepareExternalDesktopPublishedMotion(*down, {});
+    ASSERT_TRUE(prepared.ok());
+    EXPECT_FALSE(state.getPointersOfLastEvent(*down, false).has_value());
+    ASSERT_EQ(OK, down->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, 999));
+    ASSERT_TRUE(state.swapExternalDesktopMotionProjection(**prepared));
+    auto saved = state.getPointersOfLastEvent(*down, false);
+    ASSERT_TRUE(saved.has_value());
+    EXPECT_FLOAT_EQ(saved->second[0].getX(), 1);
+    auto invalid = state.prepareExternalDesktopPublishedMotion(*streamMotion(ACTION_DOWN, {0, 0}), {});
+    EXPECT_FALSE(invalid.ok());
+    saved = state.getPointersOfLastEvent(*down, false);
+    ASSERT_TRUE(saved.has_value());
+    EXPECT_FLOAT_EQ(saved->second[0].getX(), 1);
+    std::unique_ptr<trace::EventTrackerInterface> tracker;
+    CancellationOptions keys(CancellationOptions::Mode::CANCEL_NON_POINTER_EVENTS, "keys retained", tracker);
+    auto keyUp = state.synthesizeCancellationEvents(ARBITRARY_TIME + 1, keys);
+    ASSERT_EQ(keyUp.size(), 1u);
+    EXPECT_EQ(keyUp[0]->type, EventEntry::Type::KEY);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageDeliveredOrdinaryPredecessorIsNotAdvancedEnqueueState) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "ordinary predecessor", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    InputTarget ordinary{connection};
+    ordinary.windowHandle = window;
+    ordinary.addPointers(std::bitset<32>(1), ui::Transform());
+    auto down = streamMotion(ACTION_DOWN, {0});
+    ASSERT_TRUE(publishStreamForTest(down, ordinary));
+    auto [seq, received] = window->receiveEvent();
+    ASSERT_TRUE(seq.has_value());
+    ASSERT_NE(received, nullptr);
+    ASSERT_TRUE(deliveredMotionCoverageForTest(connection));
+    auto delivered = deliveredMotionForTest(connection, *down);
+    ASSERT_TRUE(delivered.has_value());
+    ASSERT_EQ(delivered->first.size(), 1u);
+    EXPECT_EQ(delivered->first[0].id, 0);
+    EXPECT_EQ(publicationReferencesForTest(connection, streamKey()).livePointers, 0u);
+    InputTarget mixed{connection};
+    mixed.windowHandle = window;
+    ASSERT_TRUE(mixed.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), nullptr).ok());
+    ASSERT_TRUE(mixed.addPointersWithOwnership(std::bitset<32>(2), ui::Transform(),
+                                               streamOwners({{1, streamKey()}})).ok());
+    auto queued = enqueueStreamForTest(streamMotion(POINTER_1_DOWN, {0, 1}), mixed);
+    ASSERT_NE(queued, nullptr);
+    const auto& future = static_cast<const MotionEntry&>(*queued->eventEntry);
+    EXPECT_EQ(enqueuedPointerCountForTest(connection, future), 2u);
+    delivered = deliveredMotionForTest(connection, *down);
+    ASSERT_TRUE(delivered.has_value());
+    EXPECT_EQ(delivered->first.size(), 1u); // Never reconstruct from inputState's future two pointers.
+    abortPublicationForTest(connection);
+    EXPECT_FALSE(deliveredMotionCoverageForTest(connection));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageDeliveredPreparedStateIsOwnerBoundSingleUseAndStaleSafe) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto first = sp<FakeWindowHandle>::make(application, mDispatcher, "prepared first", DISPLAY_ID);
+    auto second = sp<FakeWindowHandle>::make(application, mDispatcher, "prepared second", DISPLAY_ID);
+    auto a = streamConnection(first), b = streamConnection(second);
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    // Direct owner preparation contract, NOT an assertion of socket publication.
+    deliveredPreparationContractForTest(a, b);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageDeliveredActualWouldBlockKeepsSuccessfulMotionCheckpoint) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "checkpoint pipe", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    const auto key = streamKey();
+    const auto owners = streamOwners({{0, key}});
+    InputTarget target{connection};
+    target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), owners).ok());
+    ASSERT_TRUE(publishStreamForTest(streamMotion(ACTION_DOWN, {0}), target));
+    float last = 1;
+    bool blocked = false;
+    for (size_t i = 0; i < 512; ++i) {
+        const float x = static_cast<float>(2000 + i);
+        auto moving = streamMotion(ACTION_MOVE, {0});
+        ASSERT_EQ(OK, moving->pointerCoords[0].setAxisValue(AMOTION_EVENT_AXIS_X, x));
+        ASSERT_TRUE(publishStreamForTest(moving, target));
+        if (publicationReferencesForTest(connection, key).queuedPackets != 0) {
+            blocked = true;
+            break;
+        }
+        last = x;
+    }
+    ASSERT_TRUE(blocked);
+    ASSERT_TRUE(retryBlockedPublicationForTest(connection));
+    auto query = streamMotion(ACTION_MOVE, {0}, owners);
+    const auto delivered = deliveredMotionForTest(connection, *query);
+    ASSERT_TRUE(delivered.has_value());
+    EXPECT_FLOAT_EQ(delivered->second[0].getX(), last);
+    EXPECT_TRUE(deliveredMotionCoverageForTest(connection));
+    EXPECT_FALSE(publicationReferencesForTest(connection, key).drained());
+    abortPublicationForTest(connection);
+    EXPECT_FALSE(deliveredMotionCoverageForTest(connection));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageDeliveredOverflowDoesNotBlockOrdinaryAndCannotRestoreEmpty) {
+    // Exercise the existing supported multi-device mode, not a substituted
+    // allocator or a weakened bound. The default/disabled path is unchanged.
+    SCOPED_FLAG_OVERRIDE(enable_multi_device_same_window_stream, true);
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "checkpoint bound", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    InputTarget ordinary{connection};
+    ordinary.windowHandle = window;
+    ordinary.addPointers(std::bitset<32>(1), ui::Transform());
+    for (size_t i = 0; i <= InputState::kExternalDesktopMaxPublishedMotionMementos; ++i) {
+        auto down = streamMotion(ACTION_DOWN, {0}, nullptr, AINPUT_SOURCE_TOUCHSCREEN,
+                                 DISPLAY_ID, static_cast<DeviceId>(100 + i));
+        ASSERT_TRUE(publishStreamForTest(down, ordinary));
+        auto [seq, received] = window->receiveEvent();
+        ASSERT_TRUE(seq.has_value()); // Real ordinary transport survives the tracking limit.
+        ASSERT_NE(received, nullptr);
+        EXPECT_EQ(deliveredMotionCoverageForTest(connection),
+                  i < InputState::kExternalDesktopMaxPublishedMotionMementos);
+        window->finishEvent(*seq);
+        ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    }
+    for (size_t i = 0; i <= InputState::kExternalDesktopMaxPublishedMotionMementos; ++i) {
+        auto up = streamMotion(ACTION_UP, {0}, nullptr, AINPUT_SOURCE_TOUCHSCREEN,
+                               DISPLAY_ID, static_cast<DeviceId>(100 + i));
+        ASSERT_TRUE(publishStreamForTest(up, ordinary));
+        auto [seq, received] = window->receiveEvent();
+        ASSERT_TRUE(seq.has_value());
+        ASSERT_NE(received, nullptr);
+        window->finishEvent(*seq);
+        ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    }
+    EXPECT_FALSE(deliveredMotionCoverageForTest(connection)); // All UP/ACK is not fresh coverage.
+    clearStreamStateForTest(connection); // Advanced enqueue-state clear cannot heal lost evidence.
+    EXPECT_FALSE(deliveredMotionCoverageForTest(connection));
+    abortPublicationForTest(connection);
+    EXPECT_FALSE(deliveredMotionCoverageForTest(connection));
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageRouteFactoryRefusesTagsHistoricalAndOwnedRootPathsButKeepsOrdinaryPeer) {
+    auto app=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(app,mDispatcher,"route default deny",DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()},{},0,0});
+    routeFactoryDefaultDenyForTest(window);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageRawMouseHoverMoveCreatesAndPreservesActualReaderReferentWithoutForgedEnter) {
+    rawMouseHoverMoveProvenanceForTest();
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopPhysicalOwnerCensusPinsKnownPacketsAndRefusesUnknownOwners) {
+    // Direct actual factory/census bodies; no claim of a hardware Reader or
+    // complete Android notification/dispatch/retirement execution.
+    physicalOwnerCensusForTest();
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopPhysicalPacketCensusReusesOnlyExpiredSlotsAndRefusesLiveOverflow) {
+    physicalPacketCensusCapacityForTest();
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageRouteProducerInvalidationClosesHeldRowsWithoutCancelOrReplacementAuthority) {
+    auto app=std::make_shared<FakeApplicationHandle>();
+    auto window=sp<FakeWindowHandle>::make(app,mDispatcher,"route retained tombstone",DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()},{},0,0});
+    routeProducerClosureForTest(window);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageClosingSelectedStaleUpKeepsPrivateNullPeersAndKeyQueue) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto from = sp<FakeWindowHandle>::make(app, mDispatcher, "closing old owner", DISPLAY_ID);
+    auto to = sp<FakeWindowHandle>::make(app, mDispatcher, "closing new owner", DISPLAY_ID);
+    mDispatcher->onWindowInfosChanged({{*from->getInfo(), *to->getInfo()}, {}, 0, 0});
+    auto source = streamConnection(from), destination = streamConnection(to);
+    const auto oldKey = streamKey(), peer = streamKey(8);
+    auto next = oldKey; ++next.windowLifetime;
+    InputTarget old{source}; old.windowHandle = from;
+    ASSERT_TRUE(old.addPointersWithOwnership(std::bitset<32>(7), ui::Transform(),
+            streamOwners({{0, oldKey}, {1, peer}, {2, std::nullopt}})).ok());
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {0}), old, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(POINTER_1_DOWN, {0, 1}), old, from), nullptr);
+    ASSERT_NE(publishAndAckSavedForTest(streamMotion(POINTER_2_DOWN, {0, 1, 2}), old, from), nullptr);
+    const auto keySeq = queueUnsentKeyForTest(source, from); ASSERT_TRUE(keySeq.has_value());
+    InputTarget target{destination}; target.windowHandle = to;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(), streamOwners({{0, next}})).ok());
+    auto cap = transferCapabilityDoubleForTest(from, to, target, std::bitset<32>(1), oldKey, next);
+    ASSERT_NE(cap, nullptr); ASSERT_TRUE(transferForTest(*cap));
+    EXPECT_EQ(submissionRowsForTest(source, oldKey), (std::pair<size_t, size_t>{1, 1}));
+    EXPECT_EQ(submissionRowsForTest(source, peer), (std::pair<size_t, size_t>{1, 0}));
+    auto stale = streamMotion(POINTER_0_UP, {0, 1, 2});
+    queueMotionToTargetForTest(stale, old); // actual enqueue, before InputState effects
+    const auto packets = unsentMotionsForTest(source); ASSERT_EQ(packets.size(), 2u);
+    EXPECT_EQ(packets.back()->action, ACTION_MOVE);
+    ASSERT_EQ(packets.back()->pointerProperties.size(), 2u);
+    EXPECT_EQ(packets.back()->pointerProperties[0].id, 1);
+    EXPECT_EQ(packets.back()->pointerProperties[1].id, 2);
+    expectStreamOwner(packets.back()->externalDesktopPointerOwnership, 1, peer);
+    expectStreamOwner(packets.back()->externalDesktopPointerOwnership, 2, std::nullopt);
+    EXPECT_EQ(stale->action, POINTER_0_UP); EXPECT_EQ(stale->pointerProperties.size(), 3u);
+    EXPECT_EQ(stale->externalDesktopPointerOwnership, nullptr); // immutable shared raw packet
+    EXPECT_EQ(enqueuedPointerCountForTest(source, *packets.back()), 2u);
+    const auto queued = unsentSequencesForTest(source);
+    EXPECT_NE(std::find(queued.begin(), queued.end(), *keySeq), queued.end());
+    const auto retained = submissionLedgerCountsForTest()[0];
+    abortPublicationForTest(source); abortPublicationForTest(destination);
+    EXPECT_EQ(submissionLedgerCountsForTest()[0], retained);
+    EXPECT_EQ(submissionRowsForTest(source, oldKey), (std::pair<size_t, size_t>{1, 1}));
+    // This is NOT the mandatory SAME-ID/new-owner collision composition and
+    // does not prove physical release, quiescence, FD teardown or claim drain.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageClosingSameKeyPointerIdScopesReservationToPhysicalStream) {
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "physical row scope", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    ASSERT_NE(connection, nullptr);
+    const auto key = streamKey();
+    InputTarget target{connection}; target.windowHandle = window;
+    ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(),
+            streamOwners({{0, key}})).ok());
+    auto touch = streamMotion(ACTION_DOWN, {0});
+    auto hover = streamMotion(ACTION_HOVER_MOVE, {0}, nullptr, AINPUT_SOURCE_MOUSE);
+    reserveSubmissionForTest(target, touch);
+    reserveSubmissionForTest(target, hover);
+    EXPECT_EQ(submissionRowsForTest(connection, key), (std::pair<size_t, size_t>{2, 0}));
+    ASSERT_TRUE(sealPhysicalSubmissionDoubleForTest(connection, key, std::bitset<32>(1), touch));
+    EXPECT_EQ(submissionRowsForTest(connection, key), (std::pair<size_t, size_t>{2, 1}));
+    // Same logical key, pointer ID and channel do not make hover the closed contact.
+    auto surviving = enqueueStreamForTest(hover, target);
+    ASSERT_NE(surviving, nullptr);
+    EXPECT_EQ(static_cast<const MotionEntry&>(*surviving->eventEntry).action, ACTION_HOVER_ENTER);
+    EXPECT_EQ(enqueueStreamForTest(touch, target), nullptr); // exact closed row never reopens
+    EXPECT_FALSE(sealPhysicalSubmissionDoubleForTest(connection, key, std::bitset<32>(1), touch));
+    EXPECT_EQ(submissionRowsForTest(connection, key), (std::pair<size_t, size_t>{2, 1}));
+    ASSERT_TRUE(sealPhysicalSubmissionDoubleForTest(connection, key, std::bitset<32>(1), hover));
+    EXPECT_EQ(submissionRowsForTest(connection, key), (std::pair<size_t, size_t>{2, 2}));
+    EXPECT_EQ(enqueueStreamForTest(hover, target), nullptr);
+    EXPECT_EQ(submissionRowsForTest(connection, key), (std::pair<size_t, size_t>{2, 2}));
+    // References remain retained; sealing is not physical release or claim retirement.
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageClosingActualRawUpAndResetAreDifferentFactsNotRetirement) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "raw physical scope", DISPLAY_ID);
+    window->setFrame(Rect{0, 0, 100, 100});
+    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
+    auto connection = streamConnection(window);
+    auto down = generateMotionArgs(ACTION_DOWN, AINPUT_SOURCE_TOUCHSCREEN, DISPLAY_ID, {PointF{10, 10}});
+    mDispatcher->notifyMotion(down);
+    ASSERT_NE(receiveAndAckTransferForTest(window, connection), nullptr);
+    auto query = streamMotion(ACTION_MOVE, {0}, nullptr, down.source, down.displayId, down.deviceId);
+    const auto first = physicalPointerForTest(connection, *query, 0); ASSERT_NE(first, nullptr);
+    EXPECT_EQ(physicalFactsForTest(first), (std::array<bool, 6>{true, false, false, false, false, false}));
+    auto up = down; up.action = ACTION_UP; ++up.id; up.eventTime += 10;
+    mDispatcher->notifyMotion(up);
+    ASSERT_NE(receiveAndAckTransferForTest(window, connection), nullptr);
+    EXPECT_EQ(physicalFactsForTest(first), (std::array<bool, 6>{true, true, false, false, false, false}));
+    down.id = up.id + 1; down.eventTime = up.eventTime + 10; down.downTime = down.eventTime;
+    mDispatcher->notifyMotion(down);
+    ASSERT_NE(receiveAndAckTransferForTest(window, connection), nullptr);
+    const auto second = physicalPointerForTest(connection, *query, 0); ASSERT_NE(second, nullptr);
+    EXPECT_NE(first, second); // native lifetime referent, not recycled pointer ID
+    mDispatcher->notifyDeviceReset({down.id + 1, down.eventTime + 10, down.deviceId});
+    auto cancel = receiveAndAckTransferForTest(window, connection); ASSERT_NE(cancel, nullptr);
+    EXPECT_EQ(cancel->getAction(), ACTION_CANCEL);
+    EXPECT_EQ(physicalFactsForTest(second), (std::array<bool, 6>{true, false, false, true, false, false}));
+    EXPECT_EQ(physicalFactsForTest(first), (std::array<bool, 6>{true, true, false, false, false, false}));
+    EXPECT_EQ(submissionLedgerCountsForTest()[1], 0u);
+    callbackInFlightContractForTest(); // actual RAII counter, not ACK/physical proof
+    abortPublicationForTest(connection);
+}
+
+TEST_F(InputDispatcherTest, ExternalDesktopStageClosingCapacityIsNonEvictingButOrdinaryStillReceivesAndAcks) {
+    auto app = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(app, mDispatcher, "submission bounds", DISPLAY_ID);
+    auto connection = streamConnection(window);
+    auto physical = streamMotion(ACTION_DOWN, {0});
+    for (size_t i = 0; i <= 256; ++i) {
+        InputTarget target{connection}; target.windowHandle = window;
+        ASSERT_TRUE(target.addPointersWithOwnership(std::bitset<32>(1), ui::Transform(),
+                streamOwners({{0, streamKey(i + 1)}})).ok());
+        reserveSubmissionForTest(target, physical); // actual bounded reservation, no InputState seeding
+    }
+    const auto before = submissionLedgerCountsForTest();
+    EXPECT_EQ(before[0], 256u); EXPECT_EQ(before[2], 0u);
+    InputTarget ordinary{connection}; ordinary.windowHandle = window;
+    ASSERT_TRUE(ordinary.addPointers(std::bitset<32>(2), ui::Transform()).ok());
+    auto received = publishAndAckSavedForTest(streamMotion(ACTION_DOWN, {1}), ordinary, window);
+    ASSERT_NE(received, nullptr); EXPECT_EQ(received->getAction(), ACTION_DOWN);
+    EXPECT_EQ(received->getPointerId(0), 1);
+    EXPECT_EQ(submissionLedgerCountsForTest()[0], 256u);
+    EXPECT_EQ(submissionLedgerCountsForTest()[2], 0u);
+    abortPublicationForTest(connection);
+    EXPECT_EQ(submissionLedgerCountsForTest()[0], 256u); // abort is not erasure/recovery
+}
+#endif
 
 /**
  * When a window unexpectedly disposes of its input channel, policy should be notified about the
@@ -7962,11 +12376,9 @@ TEST_F(InputDispatcherTest, TransferTouchOnDisplay_CloneSurface) {
 /**
  * When a focused window is moved from one display to another, it should either maintain focus,
  * or it should lose it and then gain it again.
- * This test reproduces a bug in the dispatcher - currently, even though dispatcher still thinks
- * that the window has focus after it's been moved, the last event that's written to the window's
- * input channel is focusEvent(hasFocus=false).
+ * In particular, retiring the source must not send a loss after the destination gain.
  */
-TEST_F(InputDispatcherTest, Focus_WindowMovedToAnotherDisplay_LosesFocus) {
+TEST_F(InputDispatcherTest, Focus_WindowMovedToAnotherDisplay_MaintainsFocus) {
     static constexpr auto DEFAULT = ui::LogicalDisplayId::DEFAULT;
     static constexpr auto EXTERNAL = ui::LogicalDisplayId{7};
 
@@ -8017,9 +12429,8 @@ TEST_F(InputDispatcherTest, Focus_WindowMovedToAnotherDisplay_LosesFocus) {
     // Window gains focus on the new display.
     ASSERT_NO_FATAL_FAILURE(window->consumeFocusEvent(true));
 
-    // TODO(b/438569310)
-    // BUG: the last event that is written to the window is FocusEvent(hasFocus=false)
-    ASSERT_NO_FATAL_FAILURE(window->consumeFocusEvent(false));
+    // No late source-display loss may undo that gain (b/438569310).
+    window->assertNoEvents();
 
     // The key is still delivered to the window correctly.
     mDispatcher->notifyKey(KeyArgsBuilder(AKEY_EVENT_ACTION_DOWN, AINPUT_SOURCE_KEYBOARD)
@@ -8035,6 +12446,78 @@ TEST_F(InputDispatcherTest, Focus_WindowMovedToAnotherDisplay_LosesFocus) {
 
     window->assertNoEvents();
 }
+
+struct FocusMoveParams {
+    int32_t source;
+    int32_t destination;
+    bool requestBeforeWindowUpdate;
+};
+
+class InputDispatcherFocusMoveTest : public InputDispatcherTest,
+                                   public testing::WithParamInterface<FocusMoveParams> {};
+
+TEST_P(InputDispatcherFocusMoveTest, FocusNotificationEndsWithGainAndKeysReachSameConnection) {
+    const auto [sourceId, destinationId, requestBeforeWindowUpdate] = GetParam();
+    const ui::LogicalDisplayId source{sourceId};
+    const ui::LogicalDisplayId destination{destinationId};
+    auto application = std::make_shared<FakeApplicationHandle>();
+    auto window = sp<FakeWindowHandle>::make(application, mDispatcher, "Moving Window", source);
+    auto phone = sp<FakeWindowHandle>::make(application, mDispatcher, "Unrelated Phone",
+                                             ui::LogicalDisplayId::DEFAULT);
+    window->setFocusable(true);
+    phone->setFocusable(true);
+    mDispatcher->setFocusedApplication(source, application);
+    mDispatcher->setFocusedApplication(ui::LogicalDisplayId::DEFAULT, application);
+    mDispatcher->onWindowInfosChanged({{*phone->getInfo(), *window->getInfo()}, {}, 0, 0});
+    setFocusedWindow(phone);
+    phone->consumeFocusEvent(true);
+    mDispatcher->setFocusedDisplay(source);
+    setFocusedWindow(window);
+    window->consumeFocusEvent(true);
+    const auto originalToken = window->getToken();
+
+    window->editInfo()->displayId = destination;
+    mDispatcher->setFocusedApplication(destination, application);
+    mDispatcher->setFocusedDisplay(destination);
+    if (requestBeforeWindowUpdate) {
+        setFocusedWindow(window);
+    }
+    mDispatcher->onWindowInfosChanged({{*phone->getInfo(), *window->getInfo()}, {}, 0, 0});
+    if (!requestBeforeWindowUpdate) {
+        setFocusedWindow(window);
+    }
+
+    // The display map processes ascending ids. If the source retires before a destination
+    // focus request can take effect, a loss followed by a gain is legitimate. The reverse
+    // order is not: the connection would believe itself unfocused while keys still target it.
+    if (!requestBeforeWindowUpdate || sourceId < destinationId) {
+        window->consumeFocusEvent(false);
+    }
+    window->consumeFocusEvent(true);
+    window->assertNoEvents();
+    EXPECT_EQ(originalToken, window->getToken());
+    phone->assertNoEvents();
+
+    for (int32_t action : {AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP}) {
+        mDispatcher->notifyKey(KeyArgsBuilder(action, AINPUT_SOURCE_KEYBOARD)
+                                      .displayId(ui::LogicalDisplayId::INVALID)
+                                      .build());
+        window->consumeKeyEvent(AllOf(WithKeyAction(action),
+                                      WithDisplayId(ui::LogicalDisplayId::INVALID)));
+    }
+    phone->assertNoEvents();
+
+    // Removing the final destination still sends a real loss. The patch must not leave
+    // a window focused just because it used to have a source-display attachment.
+    mDispatcher->onWindowInfosChanged({{*phone->getInfo()}, {}, 0, 0});
+    window->consumeFocusEvent(false);
+    window->assertNoEvents();
+    phone->assertNoEvents();
+}
+
+INSTANTIATE_TEST_SUITE_P(BothDisplayOrdersAndFocusRequestOrders, InputDispatcherFocusMoveTest,
+                        testing::Values(FocusMoveParams{4, 2, true}, FocusMoveParams{2, 4, true},
+                                        FocusMoveParams{4, 2, false}, FocusMoveParams{2, 4, false}));
 
 TEST_F(InputDispatcherTest, FocusedWindow_ReceivesFocusEventAndKeyEvent) {
     std::shared_ptr<FakeApplicationHandle> application = std::make_shared<FakeApplicationHandle>();
@@ -9893,6 +14376,473 @@ protected:
     sp<FakeWindowHandle> windowInSecondary;
 };
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+// Exercise the actual Dispatcher at the WindowInfo boundary. SF's genuine
+// owned PARK adds DROP_INPUT without necessarily changing focus or geometry;
+// this fixture supplies that resulting bit, NOT an invented Stage/SC authority
+// or a claim that the private SF producer ran in this test.
+class InputDispatcherHeldKeyDropTest : public InputDispatcherFocusOnTwoDisplaysTest {
+protected:
+    std::unique_ptr<FakeInputDispatcherPolicy> makePolicyForTest() override {
+        return std::make_unique<SavedKeyBalancePolicy>();
+    }
+    void notifyNoRepeatKey(ui::LogicalDisplayId display, int32_t action, int32_t keyCode,
+                           DeviceId device) {
+        mDispatcher->notifyKey(KeyArgsBuilder(action, AINPUT_SOURCE_KEYBOARD)
+                                       .displayId(display)
+                                       .deviceId(device)
+                                       .keyCode(keyCode)
+                                       .policyFlags(DEFAULT_POLICY_FLAGS | POLICY_FLAG_DISABLE_KEY_REPEAT)
+                                       .build());
+    }
+    void dropSecondaryWithoutFocusOrGeometryChange() {
+        const auto before = *windowInSecondary->getInfo();
+        windowInSecondary->setDropInput(true);
+        const auto& after = *windowInSecondary->getInfo();
+        ASSERT_EQ(before.token, after.token);
+        ASSERT_EQ(before.id, after.id);
+        ASSERT_EQ(before.frame, after.frame);
+        ASSERT_EQ(before.transform, after.transform);
+        mDispatcher->onWindowInfosChanged(
+                {{*windowInPrimary->getInfo(), after}, {}, 0, 0});
+        ASSERT_EQ(focusedTokenForBalanceTest(SECOND_DISPLAY_ID), before.token);
+    }
+    void holdPhoneKey() {
+        notifyNoRepeatKey(ui::LogicalDisplayId::DEFAULT, ACTION_DOWN, AKEYCODE_C, SECOND_DEVICE_ID);
+        ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInPrimary, true,
+                AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_C),
+                      WithDisplayId(ui::LogicalDisplayId::DEFAULT), WithDeviceId(SECOND_DEVICE_ID))));
+    }
+    void releasePhoneKey() {
+        notifyNoRepeatKey(ui::LogicalDisplayId::DEFAULT, ACTION_UP, AKEYCODE_C, SECOND_DEVICE_ID);
+        ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInPrimary, true,
+                AllOf(WithKeyAction(ACTION_UP), WithKeyCode(AKEYCODE_C), WithFlags(0),
+                      WithDisplayId(ui::LogicalDisplayId::DEFAULT), WithDeviceId(SECOND_DEVICE_ID))));
+        EXPECT_THAT(enqueuedKeyCodesForBalanceTest(streamConnection(windowInPrimary)), testing::IsEmpty());
+    }
+    void sharePhoneConnection() {
+        const auto oldSecondary = windowInSecondary;
+        windowInSecondary = windowInPrimary->clone(SECOND_DISPLAY_ID);
+        mDispatcher->setFocusedApplication(SECOND_DISPLAY_ID, application1);
+        mDispatcher->onWindowInfosChanged(
+                {{*windowInPrimary->getInfo(), *windowInSecondary->getInfo()}, {}, 0, 0});
+        ASSERT_NO_FATAL_FAILURE(oldSecondary->consumeFocusEvent(false));
+        setFocusedWindow(windowInSecondary);
+        ASSERT_NO_FATAL_FAILURE(windowInSecondary->consumeFocusEvent(true));
+        ASSERT_EQ(streamConnection(windowInPrimary), streamConnection(windowInSecondary));
+    }
+    void consumeExternalCancel(int32_t code = AKEYCODE_A,
+                               ui::LogicalDisplayId eventDisplay = SECOND_DISPLAY_ID) {
+        ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+                AllOf(WithKeyAction(ACTION_UP), WithKeyCode(code), WithFlags(AKEY_EVENT_FLAG_CANCELED),
+                      WithDisplayId(eventDisplay), WithDeviceId(DEVICE_ID))));
+    }
+};
+
+TEST_F(InputDispatcherHeldKeyDropTest, PublishedHeldKeyIsBalancedWhenSameFocusStartsDroppingInput) {
+    const auto external = streamConnection(windowInSecondary);
+    const auto phone = streamConnection(windowInPrimary);
+    ASSERT_NO_FATAL_FAILURE(holdPhoneKey());
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A), WithFlags(0),
+                  WithDisplayId(SECOND_DISPLAY_ID), WithDeviceId(DEVICE_ID))));
+    ASSERT_THAT(enqueuedKeyCodesForBalanceTest(external), UnorderedElementsAre(AKEYCODE_A));
+
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_A, DEVICE_ID);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    // Regression: on the old body target selection returns FAILED without a
+    // DropReason, so ordinary dropInboundEvent cancellation never runs. These
+    // two expectations demand balance rather than treating a dropped UP as it.
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(external), testing::IsEmpty());
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(phone), UnorderedElementsAre(AKEYCODE_C));
+    windowInPrimary->assertNoEvents();
+    ASSERT_NO_FATAL_FAILURE(releasePhoneKey());
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_UP), WithKeyCode(AKEYCODE_A),
+                  WithFlags(AKEY_EVENT_FLAG_CANCELED), WithDisplayId(SECOND_DISPLAY_ID),
+                  WithDeviceId(DEVICE_ID))));
+    windowInSecondary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, PublishedFallbackIsBalancedWhenSameFocusStartsDroppingInput) {
+    const auto external = streamConnection(windowInSecondary);
+    const auto phone = streamConnection(windowInPrimary);
+    mFakePolicy->setUnhandledKeyHandler([](const KeyEvent& event) {
+        return KeyEventBuilder(event).keyCode(AKEYCODE_B).build();
+    });
+    ASSERT_NO_FATAL_FAILURE(holdPhoneKey());
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, false,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A), WithFlags(0))));
+    ASSERT_NO_FATAL_FAILURE(mFakePolicy->assertUnhandledKeyReported(AKEYCODE_A));
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_B),
+                  WithFlags(AKEY_EVENT_FLAG_FALLBACK), WithDisplayId(SECOND_DISPLAY_ID),
+                  WithDeviceId(DEVICE_ID))));
+    ASSERT_THAT(enqueuedKeyCodesForBalanceTest(external), UnorderedElementsAre(AKEYCODE_A, AKEYCODE_B));
+    ASSERT_EQ(fallbackKeyForBalanceTest(external, AKEYCODE_A), std::optional<int32_t>(AKEYCODE_B));
+
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_A, DEVICE_ID);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(external), testing::IsEmpty());
+    EXPECT_EQ(fallbackKeyForBalanceTest(external, AKEYCODE_A), std::nullopt);
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(phone), UnorderedElementsAre(AKEYCODE_C));
+    windowInPrimary->assertNoEvents();
+    ASSERT_NO_FATAL_FAILURE(releasePhoneKey());
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_UP), WithKeyCode(AKEYCODE_A),
+                  WithFlags(AKEY_EVENT_FLAG_CANCELED), WithDisplayId(SECOND_DISPLAY_ID),
+                  WithDeviceId(DEVICE_ID))));
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_UP), WithKeyCode(AKEYCODE_B),
+                  WithFlags(AKEY_EVENT_FLAG_FALLBACK | AKEY_EVENT_FLAG_CANCELED),
+                  WithDisplayId(SECOND_DISPLAY_ID), WithDeviceId(DEVICE_ID))));
+    windowInSecondary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, SharedConnectionDropKeepsExplicitPhoneKeyAndItsRepeat) {
+    ASSERT_NO_FATAL_FAILURE(sharePhoneConnection());
+    const auto connection = streamConnection(windowInSecondary);
+    mDispatcher->setKeyRepeatConfiguration(10s, 10s, /*keyRepeatEnabled=*/true);
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A))));
+    mDispatcher->notifyKey(KeyArgsBuilder(ACTION_DOWN, AINPUT_SOURCE_KEYBOARD)
+                                   .displayId(ui::LogicalDisplayId::DEFAULT)
+                                   .deviceId(SECOND_DEVICE_ID).keyCode(AKEYCODE_C).build());
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInPrimary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_C),
+                  WithDisplayId(ui::LogicalDisplayId::DEFAULT))));
+    const auto phoneRepeat = repeatForBalanceTest();
+    ASSERT_NE(phoneRepeat.first, nullptr);
+    ASSERT_EQ(phoneRepeat.first->keyCode, AKEYCODE_C);
+
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_A, DEVICE_ID);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel());
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(connection), UnorderedElementsAre(AKEYCODE_C));
+    EXPECT_EQ(repeatForBalanceTest(), phoneRepeat); // exact entry AND timer untouched
+    ASSERT_NO_FATAL_FAILURE(releasePhoneKey());
+    EXPECT_EQ(repeatForBalanceTest().first, nullptr);
+    windowInPrimary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, BackgroundDropDoesNotCancelSharedInvalidDisplayPhoneKey) {
+    ASSERT_NO_FATAL_FAILURE(sharePhoneConnection());
+    mDispatcher->setFocusedDisplay(ui::LogicalDisplayId::DEFAULT);
+    mFakePolicy->assertFocusedDisplayNotified(ui::LogicalDisplayId::DEFAULT);
+    notifyNoRepeatKey(ui::LogicalDisplayId::INVALID, ACTION_DOWN, AKEYCODE_C, SECOND_DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInPrimary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_C),
+                  WithDisplayId(ui::LogicalDisplayId::INVALID))));
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A))));
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_A, DEVICE_ID);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel());
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(streamConnection(windowInPrimary)),
+                UnorderedElementsAre(AKEYCODE_C));
+    notifyNoRepeatKey(ui::LogicalDisplayId::INVALID, ACTION_UP, AKEYCODE_C, SECOND_DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInPrimary, true,
+            AllOf(WithKeyAction(ACTION_UP), WithKeyCode(AKEYCODE_C), WithFlags(0),
+                  WithDisplayId(ui::LogicalDisplayId::INVALID))));
+    windowInPrimary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, ForegroundDropCancelsSharedInvalidButNotExplicitPhoneKey) {
+    ASSERT_NO_FATAL_FAILURE(sharePhoneConnection());
+    ASSERT_NO_FATAL_FAILURE(holdPhoneKey());
+    notifyNoRepeatKey(ui::LogicalDisplayId::INVALID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A),
+                  WithDisplayId(ui::LogicalDisplayId::INVALID))));
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    notifyNoRepeatKey(ui::LogicalDisplayId::INVALID, ACTION_UP, AKEYCODE_A, DEVICE_ID);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel(AKEYCODE_A, ui::LogicalDisplayId::INVALID));
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(streamConnection(windowInPrimary)),
+                UnorderedElementsAre(AKEYCODE_C));
+    ASSERT_NO_FATAL_FAILURE(releasePhoneKey());
+    windowInPrimary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, ExactCanceledRepeatStopsAndDropClearDoesNotReviveIt) {
+    mDispatcher->setKeyRepeatConfiguration(10s, 10s, /*keyRepeatEnabled=*/true);
+    mDispatcher->notifyKey(KeyArgsBuilder(ACTION_DOWN, AINPUT_SOURCE_KEYBOARD)
+                                   .displayId(SECOND_DISPLAY_ID).deviceId(DEVICE_ID)
+                                   .keyCode(AKEYCODE_A).build());
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A))));
+    ASSERT_NE(repeatForBalanceTest().first, nullptr);
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    EXPECT_EQ(repeatForBalanceTest().first, nullptr);
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel());
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_A, DEVICE_ID);
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_B, DEVICE_ID);
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_B, DEVICE_ID);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    windowInSecondary->assertNoEvents(); // DROP never admits new keys
+
+    windowInSecondary->setDropInput(false);
+    mDispatcher->onWindowInfosChanged(
+            {{*windowInPrimary->getInfo(), *windowInSecondary->getInfo()}, {}, 0, 0});
+    EXPECT_EQ(repeatForBalanceTest().first, nullptr);
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(streamConnection(windowInSecondary)), testing::IsEmpty());
+    windowInSecondary->assertNoEvents(); // no old DOWN, repeat or fallback revival
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A), WithRepeatCount(0))));
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_UP), WithKeyCode(AKEYCODE_A), WithFlags(0))));
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, OwnedWindowGuardAllowsOnlySavedTerminalKeys) {
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A))));
+    // Informational tag is a DENIAL input to ownsNativeWindow, NOT authority.
+    windowInSecondary->editInfo()->stageTag = WindowInfo::StageTag{42, 7, 10, 1, 77};
+    ASSERT_TRUE(ownedWindowForBalanceTest(windowInSecondary));
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel()); // no zero-target/fresh-key admission path
+    windowInSecondary->setDropInput(false);
+    mDispatcher->onWindowInfosChanged(
+            {{*windowInPrimary->getInfo(), *windowInSecondary->getInfo()}, {}, 0, 0});
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_B, DEVICE_ID);
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_B, DEVICE_ID);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(streamConnection(windowInSecondary)), testing::IsEmpty());
+    windowInSecondary->assertNoEvents(); // addWindowTargetLocked owned/new-key guard unchanged
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, SharedSavedRecipientRejectsMissingForeignOrReplacedIdentity) {
+    const auto foreignConnection = streamConnection(windowInSecondary);
+    ASSERT_NO_FATAL_FAILURE(sharePhoneConnection());
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    const auto connection = streamConnection(windowInSecondary);
+    const auto token = windowInSecondary->getToken();
+    const auto id = windowInSecondary->getId();
+    EXPECT_FALSE(trySavedRecipientForBalanceTest(windowInSecondary, nullptr, token, id, SECOND_DISPLAY_ID));
+    EXPECT_FALSE(trySavedRecipientForBalanceTest(windowInSecondary, connection, nullptr, id, SECOND_DISPLAY_ID));
+    EXPECT_FALSE(trySavedRecipientForBalanceTest(windowInSecondary, foreignConnection, token, id, SECOND_DISPLAY_ID));
+    EXPECT_FALSE(trySavedRecipientForBalanceTest(windowInSecondary, connection, sp<BBinder>::make(), id, SECOND_DISPLAY_ID));
+    EXPECT_FALSE(trySavedRecipientForBalanceTest(windowInSecondary, connection, token, windowInPrimary->getId(), SECOND_DISPLAY_ID));
+    EXPECT_FALSE(trySavedRecipientForBalanceTest(windowInSecondary, connection, token, id, ui::LogicalDisplayId::DEFAULT));
+    EXPECT_FALSE(trySavedRecipientForBalanceTest(windowInSecondary, connection, token, id, SECOND_DISPLAY_ID, true));
+    EXPECT_TRUE(trySavedRecipientForBalanceTest(windowInSecondary, connection, token, id, SECOND_DISPLAY_ID));
+    windowInPrimary->assertNoEvents(); // no key supplied or synthesized from an empty state
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, LateUnhandledFinishedCannotReopenCanceledFallback) {
+    mFakePolicy->setUnhandledKeyHandler([](const KeyEvent& event) {
+        return KeyEventBuilder(event).keyCode(AKEYCODE_B).build();
+    });
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    const auto connection = streamConnection(windowInSecondary);
+    auto [seq, event] = windowInSecondary->receiveEvent();
+    ASSERT_TRUE(seq.has_value()); ASSERT_NE(event, nullptr);
+    ASSERT_EQ(event->getType(), InputEventType::KEY); // actual DOWN publication, ACK deliberately held
+    ASSERT_THAT(static_cast<const KeyEvent&>(*event),
+                AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A), WithDisplayId(SECOND_DISPLAY_ID)));
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel());
+    // Clear DROP before the old ACK too: a terminal packet cannot be revived
+    // merely because a later environment again accepts new input.
+    windowInSecondary->setDropInput(false);
+    mDispatcher->onWindowInfosChanged(
+            {{*windowInPrimary->getInfo(), *windowInSecondary->getInfo()}, {}, 0, 0});
+    windowInSecondary->finishEvent(*seq, false);
+    ASSERT_TRUE(waitForPublicationAckForTest(connection, *seq));
+    EXPECT_EQ(fallbackKeyForBalanceTest(connection, AKEYCODE_A), std::nullopt);
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(connection), testing::IsEmpty());
+    windowInSecondary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, CanceledMarkerIsOnRecipientPacketNotSharedKeyEvent) {
+    FakeMonitorReceiver monitor(*mDispatcher, "other key recipient", SECOND_DISPLAY_ID);
+    const auto monitorConnection = balanceConnectionForToken(monitor.getToken());
+    const auto windowConnection = streamConnection(windowInSecondary);
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    auto [windowSeq, event] = windowInSecondary->receiveEvent();
+    const auto monitorSeq = monitor.receiveEvent();
+    ASSERT_TRUE(windowSeq.has_value()); ASSERT_TRUE(monitorSeq.has_value());
+    ASSERT_NE(event, nullptr); ASSERT_EQ(event->getType(), InputEventType::KEY);
+    const auto beforeWindow = waitedKeyForBalanceTest(windowConnection, *windowSeq);
+    const auto beforeMonitor = waitedKeyForBalanceTest(monitorConnection, *monitorSeq);
+    ASSERT_TRUE(beforeWindow.has_value()); ASSERT_TRUE(beforeMonitor.has_value());
+    ASSERT_EQ(beforeWindow->first, beforeMonitor->first); // genuine shared EventEntry
+    ASSERT_FALSE(beforeWindow->second); ASSERT_FALSE(beforeMonitor->second);
+    ASSERT_NO_FATAL_FAILURE(dropSecondaryWithoutFocusOrGeometryChange());
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel());
+    const auto canceledWindow = waitedKeyForBalanceTest(windowConnection, *windowSeq);
+    const auto unchangedMonitor = waitedKeyForBalanceTest(monitorConnection, *monitorSeq);
+    ASSERT_TRUE(canceledWindow.has_value()); ASSERT_TRUE(unchangedMonitor.has_value());
+    EXPECT_TRUE(canceledWindow->second);
+    EXPECT_FALSE(unchangedMonitor->second);
+    EXPECT_EQ(canceledWindow->first, unchangedMonitor->first);
+    windowInSecondary->finishEvent(*windowSeq, false);
+    monitor.finishEvent(*monitorSeq);
+    ASSERT_TRUE(waitForPublicationAckForTest(windowConnection, *windowSeq));
+    ASSERT_TRUE(waitForPublicationAckForTest(monitorConnection, *monitorSeq));
+    windowInSecondary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, DropDuringUnlockedPolicyCannotRelatchFallbackOrCancelPhone) {
+    ASSERT_NO_FATAL_FAILURE(sharePhoneConnection());
+    ASSERT_NO_FATAL_FAILURE(holdPhoneKey());
+    mFakePolicy->setUnhandledKeyHandler([&](const KeyEvent& event) {
+        // Actual interruptible policy callback: InputDispatcher's mLock is
+        // released here, and the same original DOWN still awaits FINISHED.
+        windowInSecondary->setDropInput(true);
+        mDispatcher->onWindowInfosChanged(
+                {{*windowInPrimary->getInfo(), *windowInSecondary->getInfo()}, {}, 0, 0});
+        return KeyEventBuilder(event).keyCode(AKEYCODE_B).build();
+    });
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, false,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A))));
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel());
+    const auto connection = streamConnection(windowInSecondary);
+    EXPECT_EQ(fallbackKeyForBalanceTest(connection, AKEYCODE_A), std::nullopt);
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(connection), UnorderedElementsAre(AKEYCODE_C));
+    ASSERT_NO_FATAL_FAILURE(releasePhoneKey());
+    windowInPrimary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherHeldKeyDropTest, PendingSyntheticRepeatCannotSurviveInterceptDropThenClear) {
+    ASSERT_NO_FATAL_FAILURE(sharePhoneConnection());
+    ASSERT_NO_FATAL_FAILURE(holdPhoneKey());
+    const auto interceptedRepeats = std::make_shared<std::atomic<int>>(0);
+    static_cast<SavedKeyBalancePolicy&>(*mFakePolicy).beforeDispatch = [this, interceptedRepeats](const KeyEvent& event) {
+        if (event.getRepeatCount() == 0) return;
+        if (interceptedRepeats->fetch_add(1) != 0) return;
+        // Real repeat is mPendingEvent, without a DispatchEntry. Actual policy
+        // unlock allows this real WindowInfo update, NOT a seeded cancel flag.
+        windowInSecondary->setDropInput(true);
+        mDispatcher->onWindowInfosChanged(
+                {{*windowInPrimary->getInfo(), *windowInSecondary->getInfo()}, {}, 0, 0});
+        windowInSecondary->setDropInput(false);
+        mDispatcher->onWindowInfosChanged(
+                {{*windowInPrimary->getInfo(), *windowInSecondary->getInfo()}, {}, 0, 0});
+        notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_B, DEVICE_ID);
+    };
+    mDispatcher->setKeyRepeatConfiguration(40ms, 40ms, /*keyRepeatEnabled=*/true);
+    mDispatcher->notifyKey(KeyArgsBuilder(ACTION_DOWN, AINPUT_SOURCE_KEYBOARD)
+                                   .displayId(SECOND_DISPLAY_ID).deviceId(DEVICE_ID)
+                                   .keyCode(AKEYCODE_A).build());
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A), WithRepeatCount(0))));
+    ASSERT_NO_FATAL_FAILURE(consumeExternalCancel());
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_B), WithRepeatCount(0))));
+    EXPECT_EQ(interceptedRepeats->load(), 1);
+    EXPECT_THAT(enqueuedKeyCodesForBalanceTest(streamConnection(windowInSecondary)),
+                UnorderedElementsAre(AKEYCODE_B, AKEYCODE_C));
+    ASSERT_NO_FATAL_FAILURE(releasePhoneKey());
+    notifyNoRepeatKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_B, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consumePublishedKeyForBalanceTest(windowInSecondary, true,
+            AllOf(WithKeyAction(ACTION_UP), WithKeyCode(AKEYCODE_B), WithFlags(0))));
+    windowInPrimary->assertNoEvents(); // no old repeat, broad phone cancel or fallback
+}
+#endif
+
+// Public-socket regressions have NO experimental guard or private state access.
+// Actual v6-config compilation is not macro-disabled build/runtime qualification.
+class InputDispatcherOrdinaryKeyDropTest : public InputDispatcherFocusOnTwoDisplaysTest {
+protected:
+    std::unique_ptr<FakeInputDispatcherPolicy> makePolicyForTest() override {
+        return std::make_unique<SavedKeyBalancePolicy>();
+    }
+    void notifyKey(ui::LogicalDisplayId display, int32_t action, int32_t code, DeviceId device,
+                   bool repeat = false) {
+        mDispatcher->notifyKey(KeyArgsBuilder(action, AINPUT_SOURCE_KEYBOARD)
+                                       .displayId(display).deviceId(device).keyCode(code)
+                                       .policyFlags(DEFAULT_POLICY_FLAGS |
+                                                    (repeat ? 0 : POLICY_FLAG_DISABLE_KEY_REPEAT)).build());
+    }
+    void setSecondaryDrop(bool drop) {
+        windowInSecondary->setDropInput(drop);
+        mDispatcher->onWindowInfosChanged(
+                {{*windowInPrimary->getInfo(), *windowInSecondary->getInfo()}, {}, 0, 0});
+    }
+    void consume(const sp<FakeWindowHandle>& window, int32_t action, int32_t code, int32_t flags = 0,
+                 bool handled = true) {
+        const auto event = window->consumeKey(handled); // actual socket + FINISHED
+        ASSERT_NE(event, nullptr);
+        EXPECT_THAT(*event, AllOf(WithKeyAction(action), WithKeyCode(code), WithFlags(flags)));
+    }
+};
+
+TEST_F(InputDispatcherOrdinaryKeyDropTest, SameFocusDropBalancesRealOriginalAndFallback) {
+    notifyKey(ui::LogicalDisplayId::DEFAULT, ACTION_DOWN, AKEYCODE_C, SECOND_DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInPrimary, ACTION_DOWN, AKEYCODE_C));
+    mFakePolicy->setUnhandledKeyHandler([](const KeyEvent& event) {
+        return KeyEventBuilder(event).keyCode(AKEYCODE_B).build();
+    });
+    notifyKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_DOWN, AKEYCODE_A, 0, false));
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_DOWN, AKEYCODE_B, AKEY_EVENT_FLAG_FALLBACK));
+    setSecondaryDrop(true);
+    notifyKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_A, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_UP, AKEYCODE_A, AKEY_EVENT_FLAG_CANCELED));
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_UP, AKEYCODE_B,
+                                   AKEY_EVENT_FLAG_FALLBACK | AKEY_EVENT_FLAG_CANCELED));
+    windowInPrimary->assertNoEvents();
+    notifyKey(ui::LogicalDisplayId::DEFAULT, ACTION_UP, AKEYCODE_C, SECOND_DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInPrimary, ACTION_UP, AKEYCODE_C));
+    setSecondaryDrop(false);
+    windowInSecondary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherOrdinaryKeyDropTest, LateUnhandledFinishedAfterClearCannotRelatchFallback) {
+    mFakePolicy->setUnhandledKeyHandler([](const KeyEvent& event) {
+        return KeyEventBuilder(event).keyCode(AKEYCODE_B).build();
+    });
+    notifyKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID);
+    auto [seq, down] = windowInSecondary->receiveEvent();
+    ASSERT_TRUE(seq.has_value()); ASSERT_NE(down, nullptr);
+    ASSERT_EQ(down->getType(), InputEventType::KEY);
+    ASSERT_THAT(static_cast<const KeyEvent&>(*down),
+                AllOf(WithKeyAction(ACTION_DOWN), WithKeyCode(AKEYCODE_A)));
+    setSecondaryDrop(true);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_UP, AKEYCODE_A, AKEY_EVENT_FLAG_CANCELED));
+    setSecondaryDrop(false);
+    windowInSecondary->finishEvent(*seq, false); // actual old packet FINISHED
+    windowInSecondary->assertNoEvents();
+}
+
+TEST_F(InputDispatcherOrdinaryKeyDropTest, InterceptDropClearDiscardsOnlyOldSyntheticRepeat) {
+    notifyKey(ui::LogicalDisplayId::DEFAULT, ACTION_DOWN, AKEYCODE_C, SECOND_DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInPrimary, ACTION_DOWN, AKEYCODE_C));
+    const auto interceptedRepeats = std::make_shared<std::atomic<int>>(0);
+    static_cast<SavedKeyBalancePolicy&>(*mFakePolicy).beforeDispatch = [this, interceptedRepeats](const KeyEvent& event) {
+        if (event.getRepeatCount() == 0) return;
+        if (interceptedRepeats->fetch_add(1) != 0) return;
+        setSecondaryDrop(true);
+        setSecondaryDrop(false);
+        notifyKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_B, DEVICE_ID);
+    };
+    mDispatcher->setKeyRepeatConfiguration(40ms, 40ms, /*keyRepeatEnabled=*/true);
+    notifyKey(SECOND_DISPLAY_ID, ACTION_DOWN, AKEYCODE_A, DEVICE_ID, /*repeat=*/true);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_DOWN, AKEYCODE_A));
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_UP, AKEYCODE_A, AKEY_EVENT_FLAG_CANCELED));
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_DOWN, AKEYCODE_B));
+    EXPECT_EQ(interceptedRepeats->load(), 1);
+    windowInPrimary->assertNoEvents(); // no broad dropInboundEvent cancellation
+    notifyKey(ui::LogicalDisplayId::DEFAULT, ACTION_UP, AKEYCODE_C, SECOND_DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInPrimary, ACTION_UP, AKEYCODE_C));
+    notifyKey(SECOND_DISPLAY_ID, ACTION_UP, AKEYCODE_B, DEVICE_ID);
+    ASSERT_NO_FATAL_FAILURE(consume(windowInSecondary, ACTION_UP, AKEYCODE_B));
+    windowInSecondary->assertNoEvents();
+}
+
 TEST_F(InputDispatcherFocusOnTwoDisplaysTest, SetInputWindow_MultiDisplayTouch) {
     // Test touch down on primary display.
     ASSERT_EQ(InputEventInjectionResult::SUCCEEDED,
@@ -11325,6 +16275,63 @@ TEST_F(InputDispatcherSingleWindowAnr, SpyWindowAnr) {
             AllOf(WithMotionAction(ACTION_CANCEL), WithDisplayId(ui::LogicalDisplayId::DEFAULT)));
     ASSERT_TRUE(mDispatcher->waitForIdle());
     mFakePolicy->assertNotifyWindowResponsiveWasCalled(spy->getToken(), mWindow->getPid());
+}
+
+// Withdrawal can enqueue HOVER_EXIT after the old observer has stopped. With
+// no live WindowInfo and no foreground delivery, its missing ACK must not
+// produce an application ANR/dialog on another display.
+TEST_F(InputDispatcherSingleWindowAnr, WithdrawnSpyTerminalHoverDoesNotAnr) {
+    sp<FakeWindowHandle> spy = addSpyWindow();
+    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED,
+              injectMotionEvent(*mDispatcher,
+                                MotionEventBuilder(ACTION_HOVER_ENTER, AINPUT_SOURCE_MOUSE)
+                                        .pointer(PointerBuilder(0, ToolType::MOUSE)
+                                                         .x(WINDOW_LOCATION.x)
+                                                         .y(WINDOW_LOCATION.y))
+                                        .build()));
+    mWindow->consumeMotionEvent(WithMotionAction(ACTION_HOVER_ENTER));
+    spy->consumeMotionEvent(WithMotionAction(ACTION_HOVER_ENTER));
+
+    mDispatcher->onWindowInfosChanged({{*mWindow->getInfo()}, {}, 0, 0});
+    const auto [sequenceNum, event] = spy->receiveEvent();
+    ASSERT_TRUE(sequenceNum);
+    ASSERT_NE(event, nullptr);
+    ASSERT_EQ(event->getType(), InputEventType::MOTION);
+    ASSERT_EQ(static_cast<MotionEvent&>(*event).getAction(), ACTION_HOVER_EXIT);
+
+    // The terminal event is synthesized after WindowInfo removal, so its
+    // deadline uses the dispatcher's default, not the former spy's timeout.
+    std::this_thread::sleep_for(DISPATCHING_TIMEOUT + SPY_TIMEOUT);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    ASSERT_NO_FATAL_FAILURE(mFakePolicy->assertNotifyAnrWasNotCalled());
+    // The real pending event remains acknowledgeable; do not fake completion.
+    spy->finishEvent(*sequenceNum);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    mFakePolicy->assertNotifyAnrWasNotCalled();
+}
+
+TEST_F(InputDispatcherSingleWindowAnr, WithdrawnSpyPendingTouchDoesNotAnrOrBlockForegroundKey) {
+    sp<FakeWindowHandle> spy = addSpyWindow();
+    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED,
+              injectMotionDown(*mDispatcher, AINPUT_SOURCE_TOUCHSCREEN,
+                               ui::LogicalDisplayId::DEFAULT, WINDOW_LOCATION));
+    mWindow->consumeMotionDown();
+    const auto [sequenceNum, event] = spy->receiveEvent();
+    ASSERT_TRUE(sequenceNum);
+    ASSERT_NE(event, nullptr);
+    ASSERT_EQ(event->getType(), InputEventType::MOTION);
+    ASSERT_EQ(static_cast<MotionEvent&>(*event).getAction(), ACTION_DOWN);
+
+    mDispatcher->onWindowInfosChanged({{*mWindow->getInfo()}, {}, 0, 0});
+    std::this_thread::sleep_for(SPY_TIMEOUT * 2);
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    ASSERT_NO_FATAL_FAILURE(mFakePolicy->assertNotifyAnrWasNotCalled());
+    ASSERT_EQ(InputEventInjectionResult::SUCCEEDED, injectKeyDownNoRepeat(*mDispatcher));
+    mWindow->consumeKeyDown(ui::LogicalDisplayId::INVALID);
+    spy->finishEvent(*sequenceNum);
+    spy->consumeMotionEvent(WithMotionAction(ACTION_CANCEL));
+    ASSERT_TRUE(mDispatcher->waitForIdle());
+    mFakePolicy->assertNotifyAnrWasNotCalled();
 }
 
 // If an app is not responding to a key event, spy windows should continue to receive

@@ -27,6 +27,7 @@
 #include "Client.h"
 #include "FrontEnd/LayerCreationArgs.h"
 #include "FrontEnd/LayerHandle.h"
+#include "FrontEnd/ExternalDesktopOwnedInputBlock.h"
 #include "Layer.h"
 #include "SurfaceFlinger.h"
 
@@ -43,6 +44,7 @@ const String16 sAccessSurfaceFlinger("android.permission.ACCESS_SURFACE_FLINGER"
 Client::Client(const sp<SurfaceFlinger>& flinger)
     : mFlinger(flinger)
 {
+    setRequestingSid(true); // missing kernel SID must fail closed at the private factory
 }
 
 status_t Client::initCheck() const {
@@ -107,6 +109,42 @@ binder::Status Client::mirrorSurface(const sp<IBinder>& mirrorFromHandle,
     status_t status = mFlinger->mirrorLayer(args, mirrorFromHandle, stopAtHandle, cropByHandle,
                                             *outResult);
     return binderStatusFromStatusT(status);
+}
+
+binder::Status Client::mirrorExternalDesktopBlockedSurface(const sp<IBinder>& mirrorFromHandle,
+                                                 gui::CreateSurfaceResult* outResult) {
+    const auto* ipc = IPCThreadState::self();
+    if (!surfaceflinger::externalDesktopOwnedBlockCreator(ipc->getCallingUid(), ipc->getCallingSid())) {
+        return binderStatusFromStatusT(PERMISSION_DENIED);
+    }
+    LayerCreationArgs args(mFlinger.get(), sp<Client>::fromExisting(this), "ExternalDesktopBlockedMirrorRoot",
+                           0 /* flags */, gui::LayerMetadata());
+    args.createExternalDesktopOwnedInputBlock = true; // NOT a metadata/transaction flag
+    return binderStatusFromStatusT(mFlinger->mirrorLayer(args, mirrorFromHandle,
+                                                       nullptr, nullptr, *outResult));
+}
+
+binder::Status Client::setExternalDesktopOwnedInputBlocks(const std::vector<sp<IBinder>>& roots,
+        const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+        int64_t epoch, bool blocked) {
+    const auto* ipc = IPCThreadState::self();
+    if (!surfaceflinger::externalDesktopOwnedBlockCreator(ipc->getCallingUid(), ipc->getCallingSid())) {
+        return binderStatusFromStatusT(PERMISSION_DENIED);
+    }
+    return binderStatusFromStatusT(mFlinger->setExternalDesktopOwnedInputBlocks(roots, origins, revisions,
+                                                                   epoch, blocked));
+}
+
+binder::Status Client::transitionExternalDesktopRootStates(const std::vector<sp<IBinder>>& roots,
+        const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+        int32_t operation, int64_t generation, int64_t atlas, int64_t geometry,
+        int64_t epoch, const std::vector<int64_t>& presentations) {
+    const auto* ipc = IPCThreadState::self();
+    if (!surfaceflinger::externalDesktopOwnedBlockCreator(ipc->getCallingUid(), ipc->getCallingSid())) {
+        return binderStatusFromStatusT(PERMISSION_DENIED);
+    }
+    return binderStatusFromStatusT(mFlinger->transitionExternalDesktopRootStates(roots, origins, revisions,
+            operation, generation, atlas, geometry, epoch, presentations));
 }
 
 binder::Status Client::mirrorLayerStack(int64_t displayId,

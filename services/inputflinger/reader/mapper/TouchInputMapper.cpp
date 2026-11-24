@@ -204,6 +204,15 @@ void TouchInputMapper::populateDeviceInfo(InputDeviceInfo& info) {
     }
 
     info.setUsiVersion(mParameters.usiVersion);
+
+    if (mDeviceMode == DeviceMode::POINTER) {
+        if (mCursorScrollAccumulator.haveRelativeVWheel()) {
+            info.addMotionRange(AMOTION_EVENT_AXIS_VSCROLL, mSource, -1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+        }
+        if (mCursorScrollAccumulator.haveRelativeHWheel()) {
+            info.addMotionRange(AMOTION_EVENT_AXIS_HSCROLL, mSource, -1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
 }
 
 void TouchInputMapper::dump(std::string& dump) {
@@ -296,6 +305,8 @@ std::list<NotifyArgs> TouchInputMapper::reconfigure(nsecs_t when,
 
         // Configure common accumulators.
         mTouchButtonAccumulator.configure();
+        mCursorScrollAccumulator.configure(getDeviceContext());
+        mCursorScrollAccumulator.finishSync();
 
         // Configure absolute axis information.
         configureRawPointerAxes();
@@ -303,6 +314,11 @@ std::list<NotifyArgs> TouchInputMapper::reconfigure(nsecs_t when,
         // Prepare input device calibration.
         parseCalibration();
         resolveCalibration();
+    }
+
+    if (!changes.any() || changes.test(InputReaderConfiguration::Change::POINTER_SPEED)) {
+        mWheelXVelocityControl.setParameters(config.wheelVelocityControlParameters);
+        mWheelYVelocityControl.setParameters(config.wheelVelocityControlParameters);
     }
 
     if (!changes.any() ||
@@ -1270,6 +1286,9 @@ std::list<NotifyArgs> TouchInputMapper::reset(nsecs_t when) {
     std::list<NotifyArgs> out = cancelTouch(when, when);
 
     mCursorButtonAccumulator.reset(getDeviceContext());
+    mCursorScrollAccumulator.reset(getDeviceContext());
+    mWheelXVelocityControl.reset();
+    mWheelYVelocityControl.reset();
     mTouchButtonAccumulator.reset();
 
     mRawStatesPending.clear();
@@ -1304,6 +1323,7 @@ void TouchInputMapper::clearStylusDataPendingFlags() {
 
 std::list<NotifyArgs> TouchInputMapper::process(const RawEvent& rawEvent) {
     mCursorButtonAccumulator.process(rawEvent);
+    mCursorScrollAccumulator.process(rawEvent);
     mTouchButtonAccumulator.process(rawEvent);
 
     std::list<NotifyArgs> out;
@@ -1334,6 +1354,12 @@ std::list<NotifyArgs> TouchInputMapper::sync(nsecs_t when, nsecs_t readTime) {
 
     // Sync touch
     syncTouch(when, &next);
+
+    next.vscroll = mCursorScrollAccumulator.haveRelativeVWheel()
+            ? mCursorScrollAccumulator.getRelativeVWheel() : 0;
+    next.hscroll = mCursorScrollAccumulator.haveRelativeHWheel()
+            ? mCursorScrollAccumulator.getRelativeHWheel() : 0;
+    mCursorScrollAccumulator.finishSync();
 
     // The last RawState is the actually second to last, since we just added a new state
     const RawState& last =
@@ -1488,6 +1514,8 @@ std::list<NotifyArgs> TouchInputMapper::cookAndDispatch(nsecs_t when, nsecs_t re
         out += dispatchHoverEnterAndMove(when, readTime, policyFlags);
         out += dispatchButtonPress(when, readTime, policyFlags);
     }
+
+    out += dispatchScroll(when, readTime, policyFlags);
 
     if (mCurrentCookedState.cookedPointerData.pointerCount == 0) {
         mCurrentMotionAborted = false;
@@ -1978,6 +2006,34 @@ std::list<NotifyArgs> TouchInputMapper::dispatchHoverEnterAndMove(nsecs_t when, 
                                      mCurrentCookedState.cookedPointerData.hoveringIdBits, -1));
     }
     return out;
+}
+
+std::list<NotifyArgs> TouchInputMapper::dispatchScroll(nsecs_t when, nsecs_t readTime,
+                                                    uint32_t policyFlags) {
+    // Consume the sample even when it cannot be dispatched. In particular,
+    // stylus-fusion timeouts must not replay an earlier mouse-wheel packet.
+    float vscroll = mCurrentRawState.vscroll;
+    float hscroll = mCurrentRawState.hscroll;
+    mCurrentRawState.vscroll = 0;
+    mCurrentRawState.hscroll = 0;
+    const auto& data = mCurrentCookedState.cookedPointerData;
+    if (mDeviceMode != DeviceMode::POINTER || mCurrentMotionAborted ||
+        data.pointerCount != 1 || data.pointerProperties[0].toolType != ToolType::MOUSE ||
+        (vscroll == 0 && hscroll == 0) || findActiveIdBits(data).isEmpty()) {
+        return {};
+    }
+
+    if (mConfig.mouseReverseVerticalScrollingEnabled) vscroll = -vscroll;
+    mWheelXVelocityControl.move(when, &hscroll, nullptr);
+    mWheelYVelocityControl.move(when, nullptr, &vscroll);
+    CoordsArray coords = data.pointerCoords;
+    coords[0].setAxisValue(AMOTION_EVENT_AXIS_VSCROLL, vscroll);
+    coords[0].setAxisValue(AMOTION_EVENT_AXIS_HSCROLL, hscroll);
+    if (mParameters.wake) policyFlags |= POLICY_FLAG_WAKE;
+    return {dispatchMotion(when, readTime, policyFlags, resolveDisplayId(),
+                           AMOTION_EVENT_ACTION_SCROLL, 0, 0, getContext()->getGlobalMetaState(),
+                           mCurrentCookedState.buttonState, data.pointerProperties, coords,
+                           data.idToIndex, findActiveIdBits(data), -1)};
 }
 
 std::list<NotifyArgs> TouchInputMapper::dispatchButtonRelease(nsecs_t when, nsecs_t readTime,

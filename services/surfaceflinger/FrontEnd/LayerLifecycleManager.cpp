@@ -250,6 +250,83 @@ void LayerLifecycleManager::onHandlesDestroyed(
     }
 }
 
+bool LayerLifecycleManager::transitionExternalDesktopRootStates(const std::vector<uint32_t>& roots,
+        const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+        int32_t operation, int64_t generation, int64_t atlas, int64_t geometry,
+        int64_t epoch, const std::vector<int64_t>& presentations) {
+    using Control = ExternalDesktopOwnedInputBlockControl;
+    if (roots.empty() || roots.size() > 128 * 8 || roots.size() != origins.size() ||
+            roots.size() != revisions.size() || roots.size() != presentations.size() ||
+            operation < 0 || operation > 2 || epoch <= 0) return false;
+    const auto action = static_cast<Control::Operation>(operation);
+    if (action == Control::Operation::REPARK_CLEAR_TAG && (generation || atlas || geometry)) return false;
+    std::vector<RequestedLayerState*> selected;
+    std::vector<std::optional<gui::WindowInfo::StageTag>> tags;
+    selected.reserve(roots.size()); tags.reserve(roots.size());
+    for (size_t i = 0; i < roots.size(); ++i) {
+        auto* layer = getLayerFromId(roots[i]);
+        std::optional<gui::WindowInfo::StageTag> tag;
+        if (action != Control::Operation::REPARK_CLEAR_TAG) {
+            tag = gui::WindowInfo::StageTag{generation, atlas, geometry, epoch,
+                                           static_cast<uint64_t>(presentations[i])};
+        } else if (presentations[i] != 0) {
+            return false;
+        }
+        if (!layer || !layer->handleAlive || !origins[i] || revisions[i] <= 0 ||
+                layer->externalDesktopOwnedInputBlockOrigin != origins[i] ||
+                layer->layerIdToMirror == UNASSIGNED_LAYER_ID ||
+                !layer->externalDesktopOwnedInputBlockControl.acceptsState(static_cast<uint64_t>(revisions[i]),
+                                                               epoch, action, tag)) return false;
+        for (size_t j = 0; j < i; ++j) {
+            if (roots[j] == roots[i] || origins[j] == origins[i]) return false;
+        }
+        selected.push_back(layer); tags.push_back(tag);
+    }
+    // Preallocate ALL commit storage before touching even the first root.
+    mChangedLayers.reserve(mChangedLayers.size() + selected.size());
+    for (size_t i = 0; i < selected.size(); ++i) {
+        auto* layer = selected[i];
+        if (layer->changes.get() == 0) mChangedLayers.push_back(layer);
+        layer->externalDesktopOwnedInputBlockControl.advanceState(epoch, action, tags[i]);
+        layer->changes |= RequestedLayerState::Changes::Input;
+        layer->what |= layer_state_t::eInputInfoChanged;
+    }
+    mGlobalChanges |= RequestedLayerState::Changes::Input;
+    return true;
+}
+
+bool LayerLifecycleManager::setExternalDesktopOwnedInputBlocks(const std::vector<uint32_t>& roots,
+        const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+        int64_t epoch, bool blocked) {
+    if (roots.empty() || roots.size() > 128 * 8 || roots.size() != origins.size() ||
+            roots.size() != revisions.size() || epoch <= 0) return false;
+    std::vector<RequestedLayerState*> selected;
+    selected.reserve(roots.size());
+    for (size_t i = 0; i < roots.size(); ++i) {
+        auto* layer = getLayerFromId(roots[i]);
+        if (!layer || !layer->handleAlive || !origins[i] || revisions[i] <= 0 ||
+                layer->externalDesktopOwnedInputBlockOrigin != origins[i] ||
+                layer->layerIdToMirror == UNASSIGNED_LAYER_ID ||
+                !layer->externalDesktopOwnedInputBlockControl.accepts(static_cast<uint64_t>(revisions[i]),
+                                                          epoch, blocked)) return false;
+        for (size_t j = 0; j < i; ++j) {
+            if (roots[j] == roots[i] || origins[j] == origins[i]) return false;
+        }
+        selected.push_back(layer);
+    }
+    // Allocate commit storage BEFORE any root changes. Everything below is
+    // non-fallible: a late invalid/duplicate root never enables a prefix.
+    mChangedLayers.reserve(mChangedLayers.size() + selected.size());
+    for (auto* layer : selected) {
+        if (layer->changes.get() == 0) mChangedLayers.push_back(layer);
+        layer->externalDesktopOwnedInputBlockControl.advance(epoch, blocked);
+        layer->changes |= RequestedLayerState::Changes::Input;
+        layer->what |= layer_state_t::eInputInfoChanged;
+    }
+    mGlobalChanges |= RequestedLayerState::Changes::Input;
+    return true;
+}
+
 void LayerLifecycleManager::applyTransactions(
         const std::vector<QueuedTransactionState>& transactions, bool ignoreUnknownLayers) {
     for (const auto& transaction : transactions) {

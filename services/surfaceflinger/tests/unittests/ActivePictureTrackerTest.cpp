@@ -120,6 +120,35 @@ TEST_F(ActivePictureTrackerTest, whenListenerAdded_called) {
     tracker.updateAndNotifyListeners(*listener, NO_LISTENERS);
 }
 
+TEST_F(ActivePictureTrackerTest, nativeLifetimeCompletesAfterDerivedLayerResourcesAreDestroyed) {
+    struct Resource {
+        const std::shared_ptr<surfaceflinger::NativeLifetimeToken::State> state;
+        ~Resource() {
+            const auto value = state->value();
+            EXPECT_TRUE(value.available);
+            EXPECT_FALSE(value.completed);
+        }
+    };
+    class DerivedMockLayer : public MockLayer {
+    public:
+        explicit DerivedMockLayer(SurfaceFlinger* flinger)
+              : MockLayer(flinger), mResource{getNativeRetirementToken()->state()} {}
+
+    private:
+        Resource mResource;
+    };
+
+    // NiceMock is another real most-derived class above MockLayer and Layer.
+    auto layer = sp<NiceMock<DerivedMockLayer>>::make(flinger());
+    const auto token = layer->getNativeRetirementToken();
+    EXPECT_TRUE(token->state()->value().available);
+    EXPECT_FALSE(token->state()->value().completed);
+    layer.clear();
+    // Retaining this observation is not a resource lease.
+    EXPECT_TRUE(token->state()->value().available);
+    EXPECT_TRUE(token->state()->value().completed);
+}
+
 TEST_F(ActivePictureTrackerTest, whenListenerAdded_withListenerAlreadyAdded_notCalled) {
     ActivePictureTracker tracker;
     auto listener = createMockListener();

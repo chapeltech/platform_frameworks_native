@@ -18,6 +18,11 @@
 
 #include "InjectionState.h"
 #include "InputTargetFlags.h"
+#include "ExternalDesktopPointerOwnership.h"
+#include "ExternalDesktopHoverRetirement.h"
+#include "ExternalDesktopRebindArrival.h"
+#include "ExternalDesktopNativeIngress.h"
+#include "ExternalDesktopSubmissionLedger.h"
 #include "trace/EventTrackerInterface.h"
 
 #include <ftl/flags.h>
@@ -124,6 +129,10 @@ struct KeyEntry : EventEntry {
     std::unique_ptr<trace::EventTrackerInterface> traceTracker;
 
     bool syntheticRepeat; // set to true for synthetic key repeats
+    // Only an actual pending/inbound synthetic repeat may acquire this fact,
+    // before target selection. Never mark a published/shared recipient event.
+    // Its old held tuple has already been terminal-balanced by same-focus DROP.
+    mutable bool syntheticRepeatCanceledByDrop = false;
 
     enum class InterceptKeyResult {
         // The interception result is unknown.
@@ -172,6 +181,18 @@ struct MotionEntry : EventEntry {
     std::vector<PointerProperties> pointerProperties;
     std::vector<PointerCoords> pointerCoords;
     std::unique_ptr<trace::EventTrackerInterface> traceTracker;
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Owned immutable per-pointer transport only. Raw notify/injection stays
+    // absent; no StageTag/geometry field can manufacture these lifetime keys.
+    ExternalDesktopPointerOwnershipPtr externalDesktopPointerOwnership;
+    // Set once by native ingress BEFORE target/split resolution. Shared across
+    // all targets of this exact raw packet. Informational order only, not
+    // authority, physical-UP proof, a StageTag or a public event-ID ordering.
+    ExternalDesktopNativeIngressPtr externalDesktopNativeIngress;
+    // Raw, native-only physical observation. Injection cannot provide it.
+    ExternalDesktopPhysicalPacketPtr externalDesktopPhysicalPacket;
+#endif
 
     size_t getPointerCount() const { return pointerProperties.size(); }
 
@@ -239,6 +260,29 @@ struct DispatchEntry {
     // The window that this event is targeting. The only case when this windowId is not populated
     // is when dispatching an event to a global monitor.
     std::optional<int32_t> windowId;
+
+    // Per-recipient KEY terminal fact, never shared on EventEntry. A genuine
+    // same-focus DROP canceled this packet's exact held tuple; its late
+    // unhandled FINISHED must not create/relatch a new fallback DOWN.
+    bool keyCanceledByDrop = false;
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Copy of this exact packet's ownership, separate from delivery geometry.
+    // NOT proof of publisher success, ACK completion, or a drained release tail.
+    ExternalDesktopPointerOwnershipPtr externalDesktopPointerOwnership;
+    // Native-only retirement authorization AND removed-key tail reference.
+    // Absent on ordinary packets/raw MotionEntry/injection/public wire data.
+    ExternalDesktopHoverRetirementPtr externalDesktopHoverRetirement;
+    // Exact owned native packet BEFORE target normalization/security zeroing.
+    // Pointer split callers pass their unsplit native origin. Never a receiver
+    // batching/history reconstruction, current WindowInfo or inverse transform.
+    std::shared_ptr<const MotionEntry> externalDesktopPhysicalMotionOrigin;
+    ExternalDesktopRebindArrivalPtr externalDesktopRebindArrival;
+    // Nonresource row references survive actual queue/wait/derived packets.
+    // Their presence is NOT a retirement/teardown or acknowledgement proof.
+    ExternalDesktopSubmissionReservationPtr externalDesktopSubmissionReservation;
+    std::shared_ptr<const ExternalDesktopClosingTail> externalDesktopClosingTail;
+#endif
 
     DispatchEntry(std::shared_ptr<const EventEntry> eventEntry,
                   ftl::Flags<InputTargetFlags> targetFlags, const ui::Transform& transform,

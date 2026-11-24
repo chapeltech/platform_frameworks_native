@@ -54,6 +54,15 @@ private:
                                  const sp<IBinder>& stopAtHandle,
                                  const sp<IBinder>& cropByHandle,
                                  gui::CreateSurfaceResult* outResult) override;
+    binder::Status mirrorExternalDesktopBlockedSurface(const sp<IBinder>& mirrorFromHandle,
+                                            gui::CreateSurfaceResult* outResult) override;
+    binder::Status setExternalDesktopOwnedInputBlocks(const std::vector<sp<IBinder>>& roots,
+            const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+            int64_t epoch, bool blocked) override;
+    binder::Status transitionExternalDesktopRootStates(const std::vector<sp<IBinder>>& roots,
+            const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+            int32_t operation, int64_t generation, int64_t atlas, int64_t geometry,
+            int64_t epoch, const std::vector<int64_t>& presentations) override;
 
     binder::Status mirrorLayerStack(int64_t displayId,
                                     gui::CreateSurfaceResult* outSurfaceResult) override;

@@ -28,6 +28,7 @@
 #include <input/DisplayViewport.h>
 #include <input/Input.h>
 #include <input/InputDevice.h>
+#include <input/VelocityControl.h>
 #include <stdint.h>
 #include <ui/Rect.h>
 #include <ui/Rotation.h>
@@ -37,6 +38,7 @@
 #include <utils/Timers.h>
 
 #include "CursorButtonAccumulator.h"
+#include "CursorScrollAccumulator.h"
 #include "EventHub.h"
 #include "InputMapper.h"
 #include "InputReaderBase.h"
@@ -183,6 +185,9 @@ public:
 
 protected:
     CursorButtonAccumulator mCursorButtonAccumulator;
+    CursorScrollAccumulator mCursorScrollAccumulator;
+    SimpleVelocityControl mWheelXVelocityControl;
+    SimpleVelocityControl mWheelYVelocityControl;
     TouchButtonAccumulator mTouchButtonAccumulator;
 
     struct VirtualKey {
@@ -323,6 +328,10 @@ protected:
         RawPointerData rawPointerData{};
 
         int32_t buttonState{};
+
+        // Keep wheel deltas with the sample when stylus fusion defers dispatch.
+        float vscroll{};
+        float hscroll{};
 
         inline void clear() { *this = RawState(); }
     };
@@ -518,6 +527,8 @@ private:
                                                           uint32_t policyFlags);
     [[nodiscard]] std::list<NotifyArgs> dispatchHoverEnterAndMove(nsecs_t when, nsecs_t readTime,
                                                                   uint32_t policyFlags);
+    [[nodiscard]] std::list<NotifyArgs> dispatchScroll(nsecs_t when, nsecs_t readTime,
+                                                    uint32_t policyFlags);
     [[nodiscard]] std::list<NotifyArgs> dispatchButtonRelease(nsecs_t when, nsecs_t readTime,
                                                               uint32_t policyFlags);
     [[nodiscard]] std::list<NotifyArgs> dispatchButtonPress(nsecs_t when, nsecs_t readTime,

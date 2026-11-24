@@ -17,6 +17,7 @@
 #pragma once
 
 #include "trace/EventTrackerInterface.h"
+#include "ExternalDesktopPointerOwnership.h"
 
 #include <gui/WindowInfo.h>
 #include <input/Input.h>
@@ -57,6 +58,12 @@ struct CancellationOptions {
 
     // The specific pointers to cancel, or nullopt to cancel all pointer events
     std::optional<std::bitset<MAX_POINTER_ID + 1>> pointerIds = std::nullopt;
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Exact private pointer owner only. Never fall back to channel-wide cancel
+    // if this selector is invalid/missing from the memento. No public issuer.
+    std::optional<ExternalDesktopPointerStreamKey> externalDesktopStream;
+#endif
 
     const std::unique_ptr<trace::EventTrackerInterface>& traceTracker;
 

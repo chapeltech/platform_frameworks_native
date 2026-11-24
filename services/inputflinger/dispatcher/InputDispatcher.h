@@ -35,6 +35,10 @@
 #include "LatencyTracker.h"
 #include "Monitor.h"
 #include "TouchState.h"
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+#include "ExternalDesktopStageOwner.h"
+#include "ExternalDesktopTrustedTransfer.h"
+#endif
 #include "TouchedWindow.h"
 #include "trace/InputTracerInterface.h"
 
@@ -167,6 +171,34 @@ public:
     void setInputMethodConnectionIsActive(bool isActive) override;
 
     void setDisplayTopology(const DisplayTopologyGraph& displayTopologyGraph) override;
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    bool lendExternalDesktopStageAuthority(const ExternalDesktopStageLeaseView&) override;
+    bool collectExternalDesktopRetiredClaims() override;
+    bool prepareExternalDesktopStageIntent(const ExternalDesktopStageLeaseView&, ExternalDesktopStageEpochTicket,
+            const WsIntent&, std::vector<WsPresentation>&) override;
+    bool renewExternalDesktopStageIntent(const ExternalDesktopStageLeaseView&, ExternalDesktopStageEpochTicket,
+            const std::shared_ptr<const ExternalDesktopStageRoster>&,const WsLive&,ExternalDesktopStageEpochTicket*) override;
+    bool observeExternalDesktopStageRenewalBinding(const ExternalDesktopStageLeaseView&,ExternalDesktopStageEpochTicket,
+            const std::shared_ptr<const ExternalDesktopStageRoster>&,
+            const std::vector<std::shared_ptr<const ExternalDesktopTaskRootObservation>>&,
+            const std::vector<ExternalDesktopStageSubmissionObservation>&) override;
+    int32_t progressExternalDesktopStageEpoch(const ExternalDesktopStageLeaseView&,ExternalDesktopStageEpochTicket,
+            const std::shared_ptr<const ExternalDesktopStageRoster>&,uint64_t,const WsLive&) override;
+    bool refreshExternalDesktopStageClaims(const ExternalDesktopStageLeaseView&, ExternalDesktopStageEpochTicket,
+            const std::shared_ptr<const ExternalDesktopStageRoster>&, uint64_t) override;
+    bool observeExternalDesktopStageRoots(const ExternalDesktopStageLeaseView&, ExternalDesktopStageEpochTicket,
+            const std::vector<std::shared_ptr<const ExternalDesktopTaskRootObservation>>&,
+            const std::shared_ptr<const ExternalDesktopStageRoster>& expectedRoster = {}) override;
+    bool observeExternalDesktopStageRoster(const ExternalDesktopStageLeaseView&, ExternalDesktopStageEpochTicket,
+            int64_t, int64_t, const std::shared_ptr<const ExternalDesktopStageRoster>&, int32_t) override;
+    bool reserveExternalDesktopStageSubmission(const ExternalDesktopStageLeaseView&, ExternalDesktopStageEpochTicket*) override;
+    bool beginExternalDesktopStageSubmission(const ExternalDesktopStageLeaseView&, ExternalDesktopStageEpochTicket,
+                                   int64_t, int64_t) override;
+    bool noteExternalDesktopStageSubmission(const ExternalDesktopStageLeaseView&, ExternalDesktopStageEpochTicket,
+                                  int64_t, int64_t, bool) override;
+    bool closeExternalDesktopStageSubmission(ExternalDesktopStageEpochTicket) override;
+    bool invalidateExternalDesktopStageSubmission(ExternalDesktopStageEpochTicket, int64_t, int64_t) override;
+#endif
 
 private:
     enum class DropReason {
@@ -177,6 +209,17 @@ private:
         STALE,
         NO_POINTER_CAPTURE,
     };
+
+    // One Context belongs to this actual native dispatcher; construction precedes
+    // listener registration and destruction follows queued/member state teardown.
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    friend class InputDispatcherTest;
+    friend class ExternalDesktopStageBatchWakeupTest;
+    ExternalDesktopStageOwner mExternalDesktopStageOwner GUARDED_BY(mLock);
+    bool mExternalDesktopRetirementRunning GUARDED_BY(mLock) = false;
+    bool mExternalDesktopRetirementWakePosted GUARDED_BY(mLock) = false;
+    bool mExternalDesktopRetirementCallbackWake GUARDED_BY(mLock) = false;
+#endif
 
     JavaVM* mVm;
     std::unique_ptr<InputThread> mThread;
@@ -199,7 +242,14 @@ private:
 
     std::shared_ptr<const EventEntry> mPendingEvent GUARDED_BY(mLock);
     std::deque<std::shared_ptr<const EventEntry>> mInboundQueue GUARDED_BY(mLock);
-    std::deque<std::shared_ptr<const EventEntry>> mRecentQueue GUARDED_BY(mLock);
+    // Diagnostic history is not a dispatch owner. In particular, retaining a
+    // MotionEntry here would also retain its native physical packet after the
+    // real inbound/dispatch queues have drained, preventing quiet retirement.
+    struct RecentEvent {
+        std::string description;
+        nsecs_t eventTime;
+    };
+    std::deque<RecentEvent> mRecentQueue GUARDED_BY(mLock);
 
     // A command entry captures state and behavior for an action to be performed in the
     // dispatch loop after the initial processing has taken place.  It is essentially
@@ -224,6 +274,61 @@ private:
     DropReason mLastDropReason GUARDED_BY(mLock);
 
     const IdGenerator mIdGenerator GUARDED_BY(mLock);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    const std::shared_ptr<const ExternalDesktopNativeIngressOwner> mExternalDesktopIngressOwner{
+            new ExternalDesktopNativeIngressOwner};
+    uint64_t mExternalDesktopIngressOrdinal GUARDED_BY(mLock) = 0;
+    bool mExternalDesktopIngressAvailable GUARDED_BY(mLock) = true;
+    ExternalDesktopNativeIngressPtr allocateExternalDesktopIngressLocked(ExternalDesktopNativeIngress::Kind kind) REQUIRES(mLock);
+    ExternalDesktopSubmissionLedger mExternalDesktopSubmissionLedger GUARDED_BY(mLock);
+    // Actual raw notify state, completely separate from every resolved-window
+    // InputState and successful-delivery checkpoint. Never seeds either one.
+    InputState mExternalDesktopPhysicalInputState GUARDED_BY(mLock) {mIdGenerator};
+    ExternalDesktopPhysicalPacketPtr observeExternalDesktopPhysicalMotionLocked(const MotionEntry& event)
+            REQUIRES(mLock);
+    std::optional<ExternalDesktopSubmissionLedger::PhysicalOwnerCensus> censusExternalDesktopPhysicalOwnersLocked(
+            const std::shared_ptr<const ExternalDesktopPhysicalPointer>& physical) const REQUIRES(mLock);
+    void observeExternalDesktopPhysicalResetLocked(DeviceId device) REQUIRES(mLock);
+    android::base::Result<void> filterExternalDesktopSubmissionLocked(
+            const std::shared_ptr<Connection>& connection, DispatchEntry& packet,
+            const ExternalDesktopPhysicalPacketPtr& physical) REQUIRES(mLock);
+    bool stampExternalDesktopTargetLocked(const gui::WindowInfo&,const MotionEntry*,
+            ExternalDesktopPointerOwnership::Ids,InputTarget&,const ui::Transform&,
+            InputTarget::DispatchMode selectedMode=InputTarget::DispatchMode::AS_IS) REQUIRES(mLock);
+    bool validExternalDesktopPublicationLocked(const std::shared_ptr<Connection>&,const DispatchEntry&)
+            REQUIRES(mLock);
+    ExternalDesktopPublicationState classifyExternalDesktopPublicationLocked(const std::shared_ptr<Connection>&,
+            const DispatchEntry&) REQUIRES(mLock);
+    void pumpExternalDesktopSuspendedOutboundLocked() REQUIRES(mLock);
+    void refuseExternalDesktopSuspendedStreamLocked(const std::shared_ptr<Connection>&,
+            const DispatchEntry&) REQUIRES(mLock);
+    struct ExternalDesktopDeferredRaw {
+        std::shared_ptr<const MotionEntry> event;
+        std::vector<std::shared_ptr<ExternalDesktopSubmissionRow>> rows;
+        std::vector<std::shared_ptr<const MotionEntry>> stockSamples; // actual per-row Reader evidence, NEVER dispatch replacements
+    };
+    static constexpr size_t kExternalDesktopMaxDeferredRaw = 1024;
+    std::deque<ExternalDesktopDeferredRaw> mExternalDesktopDeferredRaw GUARDED_BY(mLock);
+    std::optional<ExternalDesktopDeferredRaw> mExternalDesktopResumingRaw GUARDED_BY(mLock);
+    static bool sameExternalDesktopRawStream(const MotionEntry&, const MotionEntry&);
+    bool deferExternalDesktopRawLocked(const std::shared_ptr<const MotionEntry>&) REQUIRES(mLock);
+    bool selectExternalDesktopDeferredRawLocked(nsecs_t currentTime, nsecs_t& nextWakeupTime) REQUIRES(mLock);
+    void expireExternalDesktopSuspensionsLocked(nsecs_t currentTime, nsecs_t& nextWakeupTime) REQUIRES(mLock);
+    void closeInactiveExternalDesktopSubmissionsLocked(const std::shared_ptr<Connection>&) REQUIRES(mLock);
+    void flushInactiveExternalDesktopSubmissionsLocked() REQUIRES(mLock);
+    android::base::Result<Connection::ExternalDesktopPreparedSentTail> prepareExternalDesktopSentTailLocked(
+            const std::shared_ptr<Connection>&, const DispatchEntry&) REQUIRES(mLock);
+    void noteExternalDesktopSentLiveLocked(const std::shared_ptr<Connection>&) REQUIRES(mLock);
+    void markDrainedExternalDesktopTransportLocked() REQUIRES(mLock);
+    void requestExternalDesktopRetirementLocked() REQUIRES(mLock);
+    void finishExternalDesktopNotifyCallback(); // after callback + raw-local ownership release
+    android::base::Result<std::unique_ptr<ExternalDesktopClosingHandle>> prepareExternalDesktopCloseLocked(
+            const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key,
+            ExternalDesktopPointerOwnership::Ids selected, const ExternalDesktopPhysicalPacketPtr& physical)
+            REQUIRES(mLock);
+    bool canSealExternalDesktopCloseLocked(const ExternalDesktopClosingHandle& handle) const REQUIRES(mLock);
+    void sealExternalDesktopCloseUncheckedLocked(ExternalDesktopClosingHandle& handle) noexcept REQUIRES(mLock);
+#endif
 
     int64_t mWindowInfosVsyncId GUARDED_BY(mLock);
 
@@ -392,6 +497,7 @@ private:
     DispatcherWindowInfo mWindowInfos GUARDED_BY(mLock);
 
     class DispatcherTouchState {
+        friend class InputDispatcher;
     public:
         struct PointerDownArgs {
             const nsecs_t downTimeInTarget;
@@ -399,8 +505,16 @@ private:
             const ftl::Flags<InputTarget::Flags> targetFlags;
         };
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        using ExternalDesktopSelection=std::function<std::optional<bool>(const gui::WindowInfo&,const MotionEntry*,
+                ExternalDesktopPointerOwnership::Ids,InputTarget&,const ui::Transform&,InputTarget::DispatchMode)>;
+#endif
         DispatcherTouchState(const DispatcherWindowInfo& windowInfos,
-                             const ConnectionManager& connections);
+                             const ConnectionManager& connections
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                             ,ExternalDesktopSelection selection={}
+#endif
+                             );
 
         void addPointerWindowTarget(const sp<android::gui::WindowInfoHandle>& windowHandle,
                                     InputTarget::DispatchMode dispatchMode,
@@ -461,6 +575,10 @@ private:
         void clear();
 
     private:
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        const ExternalDesktopSelection mExternalDesktopSelection;
+        const MotionEntry* mExternalDesktopSelectionEntry=nullptr; // scoped real selection; NEVER retained asynchronously
+#endif
         std::unordered_map<ui::LogicalDisplayId, TouchState> mTouchStatesByDisplay;
 
         // As there can be only one CursorState per topology group, we will treat all displays in
@@ -506,7 +624,8 @@ private:
                 const android::inputdispatcher::MotionEntry& entry) const;
 
         bool canWindowReceiveMotion(const sp<gui::WindowInfoHandle>& window,
-                                    const MotionEntry& motionEntry) const;
+                                    const MotionEntry& motionEntry,
+                                    std::optional<size_t> pointerIndex = std::nullopt) const;
 
         // Return true if stylus is currently down anywhere on the specified display,
         // and false otherwise.
@@ -910,10 +1029,18 @@ private:
                                     const InputTarget& inputTarget) REQUIRES(mLock);
     void enqueueDispatchEntryAndStartDispatchCycleLocked(
             nsecs_t currentTime, const std::shared_ptr<Connection>& connection,
-            std::shared_ptr<const EventEntry>, const InputTarget& inputTarget) REQUIRES(mLock);
+            std::shared_ptr<const EventEntry>, const InputTarget& inputTarget
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+            , std::shared_ptr<const MotionEntry> physicalOrigin = nullptr
+#endif
+            ) REQUIRES(mLock);
     void enqueueDispatchEntryLocked(const std::shared_ptr<Connection>& connection,
                                     std::shared_ptr<const EventEntry>,
-                                    const InputTarget& inputTarget) REQUIRES(mLock);
+                                    const InputTarget& inputTarget
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                                    , std::shared_ptr<const MotionEntry> physicalOrigin = nullptr
+#endif
+                                    ) REQUIRES(mLock);
     status_t publishMotionEvent(Connection& connection, DispatchEntry& dispatchEntry) const;
     void startDispatchCycleLocked(nsecs_t currentTime,
                                   const std::shared_ptr<Connection>& connection) REQUIRES(mLock);
@@ -942,6 +1069,49 @@ private:
     void synthesizeCancellationEventsForConnectionLocked(
             const std::shared_ptr<Connection>& connection, const CancellationOptions& options,
             const sp<gui::WindowInfoHandle>& window) REQUIRES(mLock);
+    // Same-focus false->true DROP only. Values captured before WindowInfo's
+    // in-place update must rejoin this exact saved recipient; never fresh focus.
+    // No caller-supplied event: terminal keys come only from its InputState.
+    bool cancelKeysForDroppedWindowLocked(const std::shared_ptr<Connection>& savedConnection,
+                                          const sp<gui::WindowInfoHandle>& savedWindow,
+                                          const sp<IBinder>& savedToken, int32_t savedWindowId,
+                                          ui::LogicalDisplayId displayId,
+                                          bool wasFocusedDisplay) REQUIRES(mLock);
+
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Native-only cold transaction. No public transfer/Binder/StageTag caller
+    // can construct the capability; StageOwner's real full-claim issuer is OPEN.
+    struct ExternalDesktopPreparedTransfer final {
+        ExternalDesktopTrustedTransfer* capability;
+        std::shared_ptr<Connection> source;
+        std::shared_ptr<Connection> destination;
+        std::unique_ptr<Connection::ExternalDesktopPreparedUnsentRemoval> sourcePlan;
+        // null for same Connection: one composed plan, never two swaps of the
+        // same advanced state or two decrements of one old queue reference.
+        std::unique_ptr<Connection::ExternalDesktopPreparedUnsentRemoval> destinationPlan;
+        std::unique_ptr<ExternalDesktopClosingHandle> closing;
+    };
+    android::base::Result<std::unique_ptr<ExternalDesktopPreparedTransfer>>
+    prepareExternalDesktopTrustedTransferLocked(ExternalDesktopTrustedTransfer& capability) REQUIRES(mLock);
+    android::base::Result<void> commitExternalDesktopTrustedTransferLocked(ExternalDesktopPreparedTransfer& prepared)
+            REQUIRES(mLock);
+    bool isExternalDesktopTransferCurrentLocked(const ExternalDesktopTrustedTransfer& capability,
+                                     const std::shared_ptr<Connection>& source,
+                                     const std::shared_ptr<Connection>& destination) const REQUIRES(mLock);
+    // Cold unsent-only owner substep; NOT cancellation/activation/claim release.
+    // No production caller until the trusted stream issuer/admission exists.
+    android::base::Result<void> removeExternalDesktopUnpublishedStreamLocked(
+            const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key)
+            REQUIRES(mLock);
+    // QUEUES saved-successful-geometry cancellation, then leaves the normal
+    // publisher/ACK path to advance evidence. This is not a drain/release API.
+    android::base::Result<void> queueExternalDesktopSavedCancellationLocked(
+            const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key)
+            REQUIRES(mLock);
+    android::base::Result<void> commitExternalDesktopQueueChangeLocked(
+            const std::shared_ptr<Connection>& connection, const ExternalDesktopPointerStreamKey& key,
+            bool cancelCurrent,std::shared_ptr<const ExternalDesktopClosingHandle> closing={}) REQUIRES(mLock);
+#endif
 
     void synthesizePointerDownEventsForConnectionLocked(
             const nsecs_t downTime, const std::shared_ptr<Connection>& connection,

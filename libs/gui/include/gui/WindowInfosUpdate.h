@@ -19,6 +19,8 @@
 #include <binder/Parcelable.h>
 #include <gui/DisplayInfo.h>
 #include <gui/WindowInfo.h>
+#include <gui/LayerSourceInfo.h>
+#include <gui/NativeLifetimeFacts.h>
 
 namespace android::gui {
 
@@ -26,16 +28,25 @@ struct WindowInfosUpdate : public Parcelable {
     WindowInfosUpdate() {}
 
     WindowInfosUpdate(std::vector<WindowInfo> windowInfos, std::vector<DisplayInfo> displayInfos,
-                      int64_t vsyncId, int64_t timestamp)
+                      int64_t vsyncId, int64_t timestamp,
+                      std::vector<LayerSourceInfo> sources = {}, bool sourcesComplete = false)
           : windowInfos(std::move(windowInfos)),
             displayInfos(std::move(displayInfos)),
             vsyncId(vsyncId),
-            timestamp(timestamp) {}
+            timestamp(timestamp),
+            layerSourcesComplete(sourcesComplete),
+            layerSources(std::move(sources)) {}
 
     std::vector<WindowInfo> windowInfos;
     std::vector<DisplayInfo> displayInfos;
     int64_t vsyncId = -1;
     int64_t timestamp = 0;
+    // Private coherent-OS companion, captured from the SAME native snapshots.
+    // Unavailable is explicit; never populate it from requested tags/client IDs.
+    bool layerSourcesComplete = false;
+    std::vector<LayerSourceInfo> layerSources;
+    // v6 PRIVATE actual-dispatch witness, never vsync/time or an enqueue counter.
+    NativePublication nativePublication;
 
     status_t writeToParcel(android::Parcel*) const override;
     status_t readFromParcel(const android::Parcel*) override;

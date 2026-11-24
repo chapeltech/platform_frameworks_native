@@ -41,6 +41,7 @@ filegroup {
         "FocusResolver.cpp",
         "InjectionState.cpp",
         "InputDispatcher.cpp",
+        "ExternalDesktopStageOwner.cpp",
         "InputEventTimeline.cpp",
         "InputState.cpp",
         "InputTarget.cpp",
@@ -56,6 +57,7 @@ filegroup {
 
 cc_defaults {
     name: "libinputdispatcher_defaults",
+    defaults: ["external_desktop_native_stage_consumer_defaults"],
     srcs: [
         ":libinputdispatcher_sources",
     ],

@@ -63,6 +63,8 @@ cc_test {
         "InputDeviceMetricsCollector_test.cpp",
         "InputDeviceMetricsSource_test.cpp",
         "InputDispatcher_test.cpp",
+        "ExternalDesktopTaskRootObservation_test.cpp",
+        "ExternalDesktopStageBatchWakeup_test.cpp",
         "InputMapperTest.cpp",
         "InputProcessorConverter_test.cpp",
         "InputProcessor_test.cpp",

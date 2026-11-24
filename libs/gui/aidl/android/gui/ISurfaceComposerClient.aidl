@@ -66,4 +66,21 @@ interface ISurfaceComposerClient {
     CreateSurfaceResult mirrorDisplay(long displayId);
 
     SchedulingPolicy getSchedulingPolicy();
+
+    // PRIVATE coherent-OS successor, appended: old transaction IDs unchanged.
+    // Only kernel-authenticated system_server may create this independently
+    // blocked root. No enable/tag/clear operation or APK SDK is introduced.
+    CreateSurfaceResult mirrorExternalDesktopBlockedSurface(IBinder mirrorFromHandle);
+
+    // PRIVATE coherent-OS continuation, kernel UID+SID authenticated. No public
+    // SurfaceControl/SDK boolean setter. Success is not a compositor fence.
+    void setExternalDesktopOwnedInputBlocks(in IBinder[] roots, in IBinder[] origins,
+            in long[] expectedRevisions, long epoch, boolean blocked);
+
+    // PRIVATE appended producer only. Operation0=re-PARK/clear,1=ARM/tagged
+    // DROP,2=ENABLE same stored tag. Key fields are observations, NOT a lease.
+    // presentationKeys preserve uint64 bit patterns; zero is invalid for tags.
+    void transitionExternalDesktopRootStates(in IBinder[] roots, in IBinder[] origins,
+            in long[] expectedRevisions, int operation, long authorityGeneration,
+            long atlasRevision, long geometryRevision, long epoch, in long[] presentationKeys);
 }

@@ -90,6 +90,7 @@
 #include "FrontEnd/LayerLifecycleManager.h"
 #include "FrontEnd/LayerSnapshot.h"
 #include "FrontEnd/LayerSnapshotBuilder.h"
+#include "NativeRetirementTracker.h"
 #include "FrontEnd/TransactionHandler.h"
 #include "MutexUtils.h"
 #include "PowerAdvisor/PowerAdvisor.h"
@@ -808,7 +809,9 @@ private:
     void persistDisplayBrightness(bool needsComposite) REQUIRES(kMainThreadContext);
     void buildWindowInfos(std::vector<gui::WindowInfo>& outWindowInfos,
                           std::vector<gui::DisplayInfo>& outDisplayInfos,
-                          std::vector<int32_t>& outVisibleWindowIds) REQUIRES(kMainThreadContext);
+                          std::vector<int32_t>& outVisibleWindowIds,
+                          std::vector<gui::LayerSourceInfo>& outLayerSources,
+                          bool& outLayerSourcesComplete) REQUIRES(kMainThreadContext);
     void commitInputWindowCommands() REQUIRES(mStateLock);
     void updateCursorAsync() REQUIRES(kMainThreadContext);
 
@@ -880,6 +883,14 @@ private:
 
     // Checks if there are layer leaks before creating layer
     status_t checkLayerLeaks();
+
+    status_t setExternalDesktopOwnedInputBlocks(const std::vector<sp<IBinder>>& roots,
+            const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+            int64_t epoch, bool blocked);
+    status_t transitionExternalDesktopRootStates(const std::vector<sp<IBinder>>& roots,
+            const std::vector<sp<IBinder>>& origins, const std::vector<int64_t>& revisions,
+            int32_t operation, int64_t generation, int64_t atlas, int64_t geometry,
+            int64_t epoch, const std::vector<int64_t>& presentations);
 
     status_t mirrorLayer(const LayerCreationArgs& args, const sp<IBinder>& mirrorFromHandle,
                          const sp<IBinder>& stopAtHandle, const sp<IBinder>& cropByHandle,
@@ -1685,6 +1696,7 @@ private:
     frontend::LayerLifecycleManager mLayerLifecycleManager GUARDED_BY(kMainThreadContext);
     frontend::LayerHierarchyBuilder mLayerHierarchyBuilder GUARDED_BY(kMainThreadContext);
     frontend::LayerSnapshotBuilder mLayerSnapshotBuilder GUARDED_BY(kMainThreadContext);
+    surfaceflinger::NativeRetirementTracker mNativeRetirements GUARDED_BY(kMainThreadContext);
     frontend::caching::MergeableHierarchyManager mMergeableHierarchyManager
             GUARDED_BY(kMainThreadContext);
 

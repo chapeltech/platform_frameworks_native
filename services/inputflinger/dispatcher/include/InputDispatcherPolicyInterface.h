@@ -78,6 +78,12 @@ public:
 
     /* Notifies the system that an input channel is unrecoverably broken. */
     virtual void notifyInputChannelBroken(const sp<IBinder>& token) = 0;
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Non-authoritative wakeup only; invoked after releasing dispatcher locks.
+    virtual void notifyExternalDesktopStageBatchObserved(int64_t, int64_t, int64_t, int64_t) {}
+    // Scheduling only; called without dispatcher locks, never carries a claim.
+    virtual void notifyExternalDesktopRetirementWork() {}
+#endif
     virtual void notifyFocusChanged(const sp<IBinder>& oldToken, const sp<IBinder>& newToken) = 0;
     virtual void notifySensorEvent(DeviceId deviceId, InputDeviceSensorType sensorType,
                                    InputDeviceSensorAccuracy accuracy, nsecs_t timestamp,

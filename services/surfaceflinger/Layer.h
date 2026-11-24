@@ -22,6 +22,7 @@
 #include <ftl/small_map.h>
 #include <gui/BufferQueue.h>
 #include <gui/LayerState.h>
+#include <gui/LayerSourceInfo.h>
 #include <gui/WindowInfo.h>
 #include <layerproto/LayerProtoHeader.h>
 #include <math/vec4.h>
@@ -50,6 +51,7 @@
 #include <vector>
 
 #include "Client.h"
+#include "NativeLifetimeToken.h"
 #include "DisplayHardware/HWComposer.h"
 #include "FrameTracker.h"
 #include "LayerFE.h"
@@ -77,7 +79,8 @@ namespace scheduler {
 class SurfaceFrame;
 } // namespace scheduler
 
-class Layer : public virtual RefBase {
+// Further-derived Layers must be able to destroy this first virtual base too.
+class Layer : protected virtual surfaceflinger::NativeLifetimeGuard, public virtual RefBase {
 public:
     // The following constants represent priority of the window. SF uses this information when
     // deciding which window has a priority when deciding about the refresh rate of the screen.
@@ -363,6 +366,8 @@ public:
     // Creates a new handle each time, so we only expect
     // this to be called once.
     sp<IBinder> getHandle();
+    gui::LayerSourceLifetime getSourceLifetimeForFacts() const;
+    sp<surfaceflinger::NativeLifetimeToken> getNativeRetirementToken() const { return mSourceLifetimeIdentity; }
     const std::string& getName() const { return mName; }
 
     virtual uid_t getOwnerUid() const { return mOwnerUid; }
@@ -525,6 +530,8 @@ private:
     }
 
     bool mGetHandleCalled = false;
+    const sp<surfaceflinger::NativeLifetimeToken> mSourceLifetimeIdentity;
+    wp<IBinder> mPublishedSourceHandle GUARDED_BY(mLock);
 
     // Game mode for the layer. Set by WindowManagerShell and recorded by SurfaceFlingerStats.
     gui::GameMode mGameMode = gui::GameMode::Unsupported;

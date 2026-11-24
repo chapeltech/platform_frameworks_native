@@ -29,6 +29,7 @@
 #include <utils/Mutex.h>
 
 #include "scheduler/VsyncId.h"
+#include "NativeLifetimeToken.h"
 
 namespace android {
 
@@ -44,7 +45,8 @@ public:
 
     void windowInfosChanged(gui::WindowInfosUpdate update,
                             WindowInfosReportedListenerSet windowInfosReportedListeners,
-                            bool forceImmediateCall);
+                            bool forceImmediateCall,uint64_t nativeRemovalPass=0,
+                            std::vector<sp<surfaceflinger::NativeLifetimeToken>> nativeRetirements={});
 
     binder::Status ackWindowInfosReceived(int64_t, int64_t) override;
 
@@ -66,6 +68,9 @@ private:
             mWindowInfosListeners;
 
     std::optional<gui::WindowInfosUpdate> mDelayedUpdate;
+    uint64_t mDelayedNativeRemovalPass=0,mNativePublicationSerial=0;
+    const sp<IBinder> mNativePublicationOrigin=sp<BBinder>::make();
+    std::vector<sp<surfaceflinger::NativeLifetimeToken>> mDelayedNativeRetirements;
     WindowInfosReportedListenerSet mReportedListeners;
     void eraseListenerAndAckMessages(const wp<IBinder>&);
 

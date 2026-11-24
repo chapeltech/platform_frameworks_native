@@ -101,14 +101,17 @@ public:
 
 private:
     void writeHierarchyToProto(const frontend::LayerHierarchy& root,
-                               const frontend::LayerHierarchy::TraversalPath& path);
+                               const frontend::LayerHierarchy::TraversalPath& path,
+                               const frontend::LayerSnapshot& parent);
     frontend::LayerSnapshot* getSnapshot(const frontend::LayerHierarchy::TraversalPath& path,
-                                         const frontend::RequestedLayerState& layer);
+                                         const frontend::RequestedLayerState& layer,
+                                         const frontend::LayerSnapshot& parent);
 
     const frontend::LayerSnapshotBuilder& mSnapshotBuilder;
     const std::unordered_map<uint32_t, sp<Layer>>& mLegacyLayers;
     const frontend::DisplayInfos& mDisplayInfos;
     uint32_t mTraceFlags;
+    frontend::LayerSnapshot mNativeEmptyResourceRoot; // synthetic ROOT owns no Layer/resource group.
     perfetto::protos::LayersProto mLayersProto;
     std::unordered_set<uint32_t> mVisitedLayers;
 

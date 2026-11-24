@@ -123,4 +123,35 @@ TEST_F(TransactionFrameTracerTest, BLASTTransactionSendsFrameTracerEvents) {
     BLASTTransactionSendsFrameTracerEvents();
 }
 
+TEST_F(TransactionFrameTracerTest, SourceFactsUseOriginalPublishedHandleAndNonresourceIdentity) {
+    sp<Layer> layer = createLayer();
+    const auto unpublished = layer->getSourceLifetimeForFacts();
+    ASSERT_NE(unpublished.identity, nullptr);
+    EXPECT_EQ(unpublished.publishedHandle.promote(), nullptr);
+    auto handle = layer->getHandle(); // ONLY original creation call
+    ASSERT_NE(handle, nullptr);
+    const auto published = layer->getSourceLifetimeForFacts();
+    EXPECT_EQ(published.identity, unpublished.identity);
+    EXPECT_EQ(published.publishedHandle.promote(), handle);
+    handle.clear();
+    EXPECT_EQ(published.publishedHandle.promote(), nullptr);
+    const auto after = layer->getSourceLifetimeForFacts();
+    EXPECT_EQ(after.identity, published.identity);
+    EXPECT_EQ(after.publishedHandle.promote(), nullptr); // never recreated
+}
+
+TEST_F(TransactionFrameTracerTest, SourceFactsIdentityAloneDoesNotKeepActualLayerAlive) {
+    sp<IBinder> identity;
+    wp<Layer> weak;
+    {
+        sp<Layer> layer = createLayer();
+        weak = layer;
+        const auto observed = layer->getSourceLifetimeForFacts();
+        identity = observed.identity;
+        EXPECT_EQ(observed.publishedHandle.promote(), nullptr);
+    }
+    ASSERT_NE(identity, nullptr);
+    EXPECT_EQ(weak.promote(), nullptr); // token has NO owner/resource back-pointer
+}
+
 } // namespace android

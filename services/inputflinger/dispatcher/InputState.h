@@ -23,6 +23,10 @@
 #include <utils/Timers.h>
 #include <bitset>
 
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+#include <android-base/result.h>
+#endif
+
 namespace android {
 namespace inputdispatcher {
 
@@ -37,7 +41,11 @@ public:
 
     // Returns true if the specified source is known to have received a hover enter
     // motion event.
-    bool isHovering(DeviceId deviceId, uint32_t source, ui::LogicalDisplayId displayId) const;
+    bool isHovering(DeviceId deviceId, uint32_t source, ui::LogicalDisplayId displayId
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                    , const ExternalDesktopPointerOwnershipPtr& ownership = nullptr
+#endif
+                    ) const;
 
     // Records tracking information for a key event that has just been published.
     // Returns true if the event should be delivered, false if it is inconsistent
@@ -56,7 +64,11 @@ public:
      * PointerProperties are needed to specify the order in which the pointer coords are stored.
      */
     std::optional<std::pair<std::vector<PointerProperties>, std::vector<PointerCoords>>>
-    getPointersOfLastEvent(const MotionEntry& entry, bool hovering) const;
+    getPointersOfLastEvent(const MotionEntry& entry, bool hovering
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+                          , ExternalDesktopPointerOwnershipPtr* ownership = nullptr
+#endif
+                          ) const;
 
     // Create cancel events for the previous stream if the current motionEntry requires it.
     std::unique_ptr<EventEntry> cancelConflictingInputStream(const MotionEntry& motionEntry);
@@ -72,7 +84,28 @@ public:
     void clear();
 
     // Merges pointer-related parts of the input state into another instance.
-    void mergePointerStateTo(InputState& other);
+    bool mergePointerStateTo(InputState& other);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    // Private transfers are unsupported until an explicit trusted rebind exists.
+    // Call BEFORE changing TouchState, wallpaper or synthesizing any event.
+    bool hasExternalDesktopPointerOwnership() const;
+
+    // A bounded motion-only value copy for the REAL successful-publication
+    // checkpoint/replay owner. Never seed this from advanced enqueue state.
+    // Key/fallback state is deliberately excluded and never canceled here.
+    static constexpr size_t kExternalDesktopMaxPublishedMotionMementos = 64;
+    android::base::Result<std::unique_ptr<InputState>> prepareExternalDesktopPublishedMotion(
+            const MotionEntry& entry, ftl::Flags<MotionFlag> flags) const;
+    // No-allocation commit; both values must belong to the same dispatcher.
+    bool swapExternalDesktopMotionProjection(InputState& prepared) noexcept;
+
+    // Cold selective-queue preparation only. This is an owned copy of this
+    // projection, never a claim that enqueue state was delivered to a client.
+    android::base::Result<std::unique_ptr<InputState>> copyExternalDesktopMotionProjection() const;
+    bool sameExternalDesktopMotionProjection(const InputState& other) const;
+    bool hasExternalDesktopStream(const ExternalDesktopPointerStreamKey& key) const;
+    std::optional<nsecs_t> externalDesktopMotionDownTime(const MotionEntry& entry) const;
+#endif
 
     // Gets the fallback key associated with a keycode.
     // Returns std::nullopt if none.
@@ -117,7 +150,13 @@ private:
         bool hovering;
         uint32_t policyFlags;
 
-        void setPointers(const MotionEntry& entry);
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+        // PhaseA enqueue state only, NOT last-successfully-published state.
+        // Current publisher/queue/ACK and cancellation geometry remain PhaseB.
+        ExternalDesktopPointerOwnershipPtr externalDesktopPointerOwnership;
+#endif
+
+        bool setPointers(const MotionEntry& entry);
         void mergePointerStateTo(MotionMemento& other) const;
         size_t getPointerCount() const;
     };
@@ -138,6 +177,34 @@ private:
     static bool shouldCancelMotion(const MotionMemento& memento,
                                    const CancellationOptions& options);
     bool shouldCancelPreviousStream(const MotionEntry& motionEntry) const;
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+    bool canTrackExternalDesktopMotion(const MotionEntry& entry) const;
+    static bool compatibleExternalDesktopPointers(const MotionMemento&, const MotionEntry&);
+    bool hasBoundedExternalDesktopMotionProjection() const;
+    // An owned, read-only view of the actual physical memento. Only the trusted
+    // transfer owner and explicit native fixture inspection may use this: the
+    // query identifies device/source/display/hover, NOT an incoming transition
+    // or an ownership claim. Public getPointersOfLastEvent and every write keep
+    // their strict ownership-continuity checks.
+    struct ExternalDesktopPhysicalMotionSnapshot final {
+        std::vector<PointerProperties> pointerProperties;
+        std::vector<PointerCoords> pointerCoords;
+        ExternalDesktopPointerOwnershipPtr externalDesktopPointerOwnership;
+        nsecs_t downTime;
+    };
+    android::base::Result<std::optional<ExternalDesktopPhysicalMotionSnapshot>>
+    copyExternalDesktopPhysicalMotionSnapshotForOwner(const MotionEntry& query, bool hovering) const;
+    // Only a native packet capability, validated by its real publication owner,
+    // can authorize the one roster-shrink transition. Ordinary trackMotion and
+    // missing-metadata continuity remain strict and unchanged.
+    android::base::Result<std::unique_ptr<InputState>> prepareExternalDesktopHoverRetirement(
+            const DispatchEntry& packet) const;
+    android::base::Result<std::unique_ptr<InputState>> prepareExternalDesktopRebindArrival(
+            const DispatchEntry& packet) const;
+    friend class Connection;
+    friend class InputDispatcher;
+    friend class InputDispatcherTest;
+#endif
     std::unique_ptr<MotionEntry> createCancelEntryForMemento(const MotionMemento& memento,
                                                              nsecs_t eventTime) const;
 

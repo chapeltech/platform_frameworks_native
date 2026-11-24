@@ -17,6 +17,7 @@
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
 #include <PowerAdvisor/Workload.h>
+#include <binder/Binder.h>
 #include <aidl/android/hardware/graphics/composer3/Composition.h>
 #include <gui/LayerState.h>
 #include <utils/Log.h>
@@ -104,8 +105,11 @@ std::ostream& operator<<(std::ostream& os, const ui::Transform& transform) {
 } // namespace
 
 LayerSnapshot::LayerSnapshot(const RequestedLayerState& state,
-                             const LayerHierarchy::TraversalPath& path)
-      : path(path) {
+                             const LayerHierarchy::TraversalPath& path,
+                             const LayerSnapshot& parent)
+      : NativeLifetimeGuard(gui::NativeLifetimeKind::Snapshot), path(path),
+        nativeSnapshotIdentity(nativeLifetimeToken()) {
+    retainNativeResourceGroups(state,path,parent);
     // Provide a unique id for all snapshots.
     // A front end layer can generate multiple snapshots if its mirrored.
     // Additionally, if the layer is not reachable, we may choose to destroy
@@ -125,6 +129,7 @@ LayerSnapshot::LayerSnapshot(const RequestedLayerState& state,
     premultipliedAlpha = state.premultipliedAlpha;
     inputInfo.name = state.name;
     inputInfo.id = static_cast<int32_t>(uniqueSequence);
+    updateInputCloneLineage(path);
     inputInfo.ownerUid = gui::Uid{state.ownerUid};
     inputInfo.ownerPid = gui::Pid{state.ownerPid};
     uid = state.ownerUid;
@@ -405,6 +410,21 @@ Hwc2::IComposerClient::BlendMode LayerSnapshot::getBlendMode(
     return blendMode;
 }
 
+void LayerSnapshot::updateInputCloneLineage(const LayerHierarchy::TraversalPath& traversalPath) {
+    // Requested tags are never SF provenance. The builder may subsequently
+    // derive a tag from a protected actual root; NEVER from requested WindowInfo.
+    inputInfo.stageTag.reset();
+    preViewportTouchableRegionBeforeCrop.reset();
+    if (!traversalPath.isClone()) {
+        inputInfo.cloneLineage.reset();
+        return;
+    }
+    std::vector<uint32_t> roots(traversalPath.mirrorRootIds.begin(),
+                                traversalPath.mirrorRootIds.end());
+    inputInfo.cloneLineage = gui::WindowInfo::CloneLineage{.sourceLayerId = traversalPath.id,
+                                                           .mirrorRootIds = std::move(roots)};
+}
+
 void LayerSnapshot::merge(const RequestedLayerState& requested, bool forceUpdate,
                           bool displayChanges, bool forceFullDamage, uint32_t displayRotationFlags,
                           ShaderRegistry* shaderRegistry) {
@@ -499,6 +519,7 @@ void LayerSnapshot::merge(const RequestedLayerState& requested, bool forceUpdate
     if (forceUpdate || requested.what & layer_state_t::eInputInfoChanged) {
         inputInfo = requested.getWindowInfo();
         inputInfo.id = static_cast<int32_t>(uniqueSequence);
+        updateInputCloneLineage(path);
         touchCropId = requested.touchCropId;
     }
 

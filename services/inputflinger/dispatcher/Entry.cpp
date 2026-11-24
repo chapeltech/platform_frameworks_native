@@ -296,6 +296,9 @@ DispatchEntry::DispatchEntry(std::shared_ptr<const EventEntry> eventEntry,
         case EventEntry::Type::MOTION: {
             const MotionEntry& motionEntry = static_cast<const MotionEntry&>(*this->eventEntry);
             resolvedMotionFlags = motionEntry.flags;
+#if defined(EXTERNAL_DESKTOP_EXPERIMENTAL_NATIVE_STAGE)
+            externalDesktopPointerOwnership = motionEntry.externalDesktopPointerOwnership;
+#endif
             break;
         }
         default: {

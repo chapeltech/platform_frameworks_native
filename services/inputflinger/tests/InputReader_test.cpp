@@ -5031,6 +5031,146 @@ TEST_F(SingleTouchInputMapperTest, Process_ShouldHandleAllToolTypes) {
     ASSERT_EQ(ToolType::FINGER, motionArgs.pointerProperties[0].toolType);
 }
 
+class AbsoluteMouseScrollTest : public SingleTouchInputMapperTest {
+protected:
+    SingleTouchInputMapper& mouse(bool highResolution = false,
+                                 const char* type = "pointer", bool wheels = true) {
+        addConfigurationProperty("touch.deviceType", type);
+        prepareDisplay(ui::ROTATION_0);
+        prepareButtons();
+        prepareAxes(POSITION);
+        mFakePolicy->setPointerGestureEnabled(true);
+        mFakePolicy->setVelocityControlParams(VelocityControlParameters());
+        for (int key : {BTN_TOOL_MOUSE, BTN_TOOL_FINGER, BTN_LEFT}) {
+            mFakeEventHub->addKey(EVENTHUB_ID, key, 0, AKEYCODE_UNKNOWN, 0);
+        }
+        if (wheels) {
+            mFakeEventHub->addRelativeAxis(EVENTHUB_ID, REL_WHEEL);
+            mFakeEventHub->addRelativeAxis(EVENTHUB_ID, REL_HWHEEL);
+        }
+        if (highResolution) {
+            mFakeEventHub->addRelativeAxis(EVENTHUB_ID, REL_WHEEL_HI_RES);
+            mFakeEventHub->addRelativeAxis(EVENTHUB_ID, REL_HWHEEL_HI_RES);
+        }
+        auto& mapper = constructAndAddMapper<SingleTouchInputMapper>();
+        processKey(mapper, BTN_TOOL_MOUSE, 1);
+        processMove(mapper, 200, 300);
+        processSync(mapper);
+        return mapper;
+    }
+
+    std::vector<NotifyMotionArgs> scrolls(const std::list<NotifyArgs>& events) {
+        std::vector<NotifyMotionArgs> result;
+        for (const auto& event : events) {
+            const auto* motion = std::get_if<NotifyMotionArgs>(&event);
+            if (motion && motion->action == AMOTION_EVENT_ACTION_SCROLL) result.push_back(*motion);
+        }
+        return result;
+    }
+
+    void relative(SingleTouchInputMapper& mapper, int code, int value) {
+        process(mapper, ARBITRARY_TIME, READ_TIME, EV_REL, code, value);
+    }
+};
+
+TEST_F(AbsoluteMouseScrollTest, BothAxesKeepMouseIdentityCoordinatesAndHeldButtons) {
+    auto& mapper = mouse();
+    processKey(mapper, BTN_LEFT, 1);
+    const auto press = processSync(mapper);
+    relative(mapper, REL_WHEEL, -2);
+    relative(mapper, REL_HWHEEL, 3);
+    const auto events = scrolls(processSync(mapper));
+    ASSERT_EQ(1u, events.size());
+    const auto& event = events[0];
+    EXPECT_EQ(AINPUT_SOURCE_MOUSE, event.source);
+    EXPECT_EQ(DISPLAY_ID, event.displayId);
+    EXPECT_EQ(ToolType::MOUSE, event.pointerProperties[0].toolType);
+    EXPECT_EQ(AMOTION_EVENT_BUTTON_PRIMARY, event.buttonState);
+    EXPECT_FLOAT_EQ(-2, event.pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_VSCROLL));
+    EXPECT_FLOAT_EQ(3, event.pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_HSCROLL));
+    const auto& first = std::get<NotifyMotionArgs>(press.front());
+    EXPECT_FLOAT_EQ(first.pointerCoords[0].getX(), event.pointerCoords[0].getX());
+    EXPECT_FLOAT_EQ(first.pointerCoords[0].getY(), event.pointerCoords[0].getY());
+    EXPECT_TRUE(scrolls(processSync(mapper)).empty());
+}
+
+TEST_F(AbsoluteMouseScrollTest, HighResolutionFractionDoesNotDoubleCountLegacyAxes) {
+    auto& mapper = mouse(true);
+    relative(mapper, REL_WHEEL, 1);
+    relative(mapper, REL_WHEEL_HI_RES, 30);
+    relative(mapper, REL_HWHEEL, -1);
+    relative(mapper, REL_HWHEEL_HI_RES, -90);
+    const auto events = scrolls(processSync(mapper));
+    ASSERT_EQ(1u, events.size());
+    EXPECT_FLOAT_EQ(.25f, events[0].pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_VSCROLL));
+    EXPECT_FLOAT_EQ(-.75f, events[0].pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_HSCROLL));
+}
+
+TEST_F(AbsoluteMouseScrollTest, ResetDiscardsPendingWheelSample) {
+    auto& mapper = mouse();
+    relative(mapper, REL_WHEEL, 1);
+    resetMapper(mapper, ARBITRARY_TIME);
+    processKey(mapper, BTN_TOOL_MOUSE, 1);
+    processMove(mapper, 200, 300);
+    EXPECT_TRUE(scrolls(processSync(mapper)).empty());
+}
+
+TEST_F(AbsoluteMouseScrollTest, TouchscreenDoesNotAcquireMouseScrollSemantics) {
+    auto& mapper = mouse(false, "touchScreen");
+    relative(mapper, REL_WHEEL, 1);
+    EXPECT_TRUE(scrolls(processSync(mapper)).empty());
+}
+
+TEST_F(AbsoluteMouseScrollTest, FingerToolOnPointerDeviceDoesNotAcquireMouseScrollSemantics) {
+    auto& mapper = mouse();
+    processKey(mapper, BTN_TOOL_MOUSE, 0);
+    processKey(mapper, BTN_TOOL_FINGER, 1);
+    processKey(mapper, BTN_TOUCH, 1);
+    relative(mapper, REL_WHEEL, 1);
+    EXPECT_TRUE(scrolls(processSync(mapper)).empty());
+}
+
+TEST_F(AbsoluteMouseScrollTest, UnadvertisedAxesCannotScroll) {
+    auto& mapper = mouse(false, "pointer", false);
+    relative(mapper, REL_WHEEL, 1);
+    EXPECT_TRUE(scrolls(processSync(mapper)).empty());
+    processKey(mapper, BTN_TOOL_MOUSE, 0);
+    relative(mapper, REL_WHEEL, 1);
+    EXPECT_TRUE(scrolls(processSync(mapper)).empty());
+}
+
+TEST_F(AbsoluteMouseScrollTest, AdvertisedWheelWithoutActiveToolCannotScroll) {
+    auto& mapper = mouse();
+    processKey(mapper, BTN_TOOL_MOUSE, 0);
+    processSync(mapper);
+    relative(mapper, REL_WHEEL, 1);
+    relative(mapper, REL_HWHEEL, -1);
+    EXPECT_TRUE(scrolls(processSync(mapper)).empty());
+}
+
+TEST_F(AbsoluteMouseScrollTest, ConfigurationBoundaryDiscardsPendingWheelSample) {
+    auto& mapper = mouse();
+    relative(mapper, REL_WHEEL, 1);
+    const auto unused = mapper.reconfigure(ARBITRARY_TIME, mFakePolicy->getReaderConfiguration(),
+            InputReaderConfiguration::Change::DEVICE_CONFIGURATION_OVERRIDES);
+    EXPECT_TRUE(scrolls(processSync(mapper)).empty());
+}
+
+TEST_F(AbsoluteMouseScrollTest, ReverseVerticalSettingAndWheelScaleAreHonored) {
+    auto& mapper = mouse();
+    auto config = mFakePolicy->getReaderConfiguration();
+    config.mouseReverseVerticalScrollingEnabled = true;
+    config.wheelVelocityControlParameters = VelocityControlParameters(2, 0, 0, 1);
+    const auto unused = mapper.reconfigure(ARBITRARY_TIME, config,
+                                          InputReaderConfiguration::Change::POINTER_SPEED);
+    relative(mapper, REL_WHEEL, 1);
+    relative(mapper, REL_HWHEEL, -1);
+    const auto events = scrolls(processSync(mapper));
+    ASSERT_EQ(1u, events.size());
+    EXPECT_FLOAT_EQ(-2, events[0].pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_VSCROLL));
+    EXPECT_FLOAT_EQ(-2, events[0].pointerCoords[0].getAxisValue(AMOTION_EVENT_AXIS_HSCROLL));
+}
+
 TEST_F(SingleTouchInputMapperTest, Process_WhenBtnTouchPresent_HoversIfItsValueIsZero) {
     addConfigurationProperty("touch.deviceType", "touchScreen");
     prepareDisplay(ui::ROTATION_0);

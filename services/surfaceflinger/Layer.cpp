@@ -134,7 +134,11 @@ Layer::Layer(const surfaceflinger::LayerCreationArgs& args)
         mFlinger(sp<SurfaceFlinger>::fromExisting(args.flinger)),
         mName(base::StringPrintf("%s#%d", args.name.c_str(), sequence)),
         mWindowType(static_cast<WindowInfo::Type>(
-                args.metadata.getInt32(gui::METADATA_WINDOW_TYPE, 0))) {
+                args.metadata.getInt32(gui::METADATA_WINDOW_TYPE, 0))),
+        mSourceLifetimeIdentity(sp<surfaceflinger::NativeLifetimeToken>::make(
+                gui::NativeLifetimeKind::Layer,args.nativeResourceGroup)) {
+    attach(mSourceLifetimeIdentity); // Virtual sentinel base is shared even by derived test Layers.
+    attachResourceGroup(args.sequence,args.nativeResourceGroup);
     ALOGV("Creating Layer %s", getDebugName());
 
     mDrawingState.crop = {0, 0, -1, -1};
@@ -208,7 +212,14 @@ sp<IBinder> Layer::getHandle() {
     }
     mGetHandleCalled = true;
     mHandleAlive = true;
-    return sp<LayerHandle>::make(mFlinger, sp<Layer>::fromExisting(this));
+    const auto handle = sp<LayerHandle>::make(mFlinger, sp<Layer>::fromExisting(this));
+    mPublishedSourceHandle = handle; // WEAK; preserve real handle destruction.
+    return handle;
+}
+
+gui::LayerSourceLifetime Layer::getSourceLifetimeForFacts() const {
+    Mutex::Autolock _l(mLock);
+    return {mSourceLifetimeIdentity, mPublishedSourceHandle};
 }
 
 // ---------------------------------------------------------------------------

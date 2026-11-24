@@ -87,7 +87,9 @@ void WindowInfosListenerInvoker::eraseListenerAndAckMessages(const wp<IBinder>& 
 
 void WindowInfosListenerInvoker::windowInfosChanged(
         gui::WindowInfosUpdate update, WindowInfosReportedListenerSet reportedListeners,
-        bool forceImmediateCall) {
+        bool forceImmediateCall,uint64_t nativeRemovalPass,
+        std::vector<sp<surfaceflinger::NativeLifetimeToken>> nativeRetirements) {
+    update.nativePublication={}; // Only this actual publisher mints the witness.
     if (!mDelayInfo) {
         mDelayInfo = DelayInfo{
                 .vsyncId = update.vsyncId,
@@ -103,12 +105,15 @@ void WindowInfosListenerInvoker::windowInfosChanged(
     // to reduce the amount of binder memory used.
     if (!mUnackedState.empty() && !forceImmediateCall) {
         mDelayedUpdate = std::move(update);
+        mDelayedNativeRemovalPass=nativeRemovalPass;
+        mDelayedNativeRetirements=std::move(nativeRetirements);
         mReportedListeners.merge(reportedListeners);
         return;
     }
 
     if (mDelayedUpdate) {
         mDelayedUpdate.reset();
+        mDelayedNativeRetirements.clear();mDelayedNativeRemovalPass=0;
     }
 
     if (CC_UNLIKELY(mWindowInfosListeners.empty())) {
@@ -133,13 +138,24 @@ void WindowInfosListenerInvoker::windowInfosChanged(
     mDelayInfo.reset();
     updateMaxSendDelay();
 
+    // AFTER coalescing/no-listener checks, immediately before actual dispatch.
+    // Never mint a fence for an unavailable/partial companion or from vsync/time.
+    if (update.layerSourcesComplete && gui::layerSourcesValid(update.layerSources,update.windowInfos,true) &&
+            nativeRemovalPass && mNativePublicationSerial<UINT64_MAX) {
+        update.nativePublication={mNativePublicationOrigin,++mNativePublicationSerial,nativeRemovalPass};
+    }
     // Call the listeners
+    bool dispatched=false;
     for (auto& pair : mWindowInfosListeners) {
         auto& [listenerId, listener] = pair.second;
         auto status = listener->onWindowInfosChanged(update);
+        dispatched|=status.isOk();
         if (!status.isOk()) {
             ackWindowInfosReceived(update.vsyncId, listenerId);
         }
+    }
+    if (dispatched && update.nativePublication.available()) {
+        for (const auto& token:nativeRetirements) token->state()->publish(update.nativePublication);
     }
 }
 
@@ -198,7 +214,9 @@ binder::Status WindowInfosListenerInvoker::ackWindowInfosReceived(int64_t vsyncI
         }
         gui::WindowInfosUpdate update{std::move(*mDelayedUpdate)};
         mDelayedUpdate.reset();
-        windowInfosChanged(std::move(update), {}, false);
+        auto nativeRetirements=std::move(mDelayedNativeRetirements);
+        const auto nativeRemovalPass=mDelayedNativeRemovalPass;mDelayedNativeRemovalPass=0;
+        windowInfosChanged(std::move(update), {}, false,nativeRemovalPass,std::move(nativeRetirements));
     }});
     return binder::Status::ok();
 }

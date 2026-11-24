@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include "ExternalDesktopOwnedInputBlock.h"
+#include "../NativeLifetimeToken.h"
+
 #include <PowerAdvisor/Workload.h>
 #include <SkRuntimeEffect.h>
 #include <android/gui/ISystemContentPriorityConstants.h>
@@ -67,11 +70,34 @@ struct RoundedCornerState {
 // LayerSnapshot stores Layer state used by CompositionEngine and RenderEngine. Composition
 // Engine uses a pointer to LayerSnapshot (as LayerFECompositionState*) and the LayerSettings
 // passed to Render Engine are created using properties stored on this struct.
-struct LayerSnapshot : public compositionengine::LayerFECompositionState {
+struct LayerSnapshot : private NativeLifetimeGuard, public compositionengine::LayerFECompositionState {
     LayerSnapshot() = default;
-    LayerSnapshot(const RequestedLayerState&, const LayerHierarchy::TraversalPath&);
+    // Explicit real parent is required: no clone constructor can silently omit
+    // its actual ancestor aggregates. Resource-free hierarchy ROOT is explicit.
+    LayerSnapshot(const RequestedLayerState&, const LayerHierarchy::TraversalPath&,
+                  const LayerSnapshot& parent);
+    LayerSnapshot(const LayerSnapshot&)=default;
+    LayerSnapshot(LayerSnapshot&&)=default;
+    // Replacing the guard before resource fields would falsely complete the
+    // old lifetime. Actual SF consumers construct/copy snapshots, never assign.
+    LayerSnapshot& operator=(const LayerSnapshot&)=delete;
+    LayerSnapshot& operator=(LayerSnapshot&&)=delete;
+    sp<NativeLifetimeToken> getNativeRetirementToken() const { return nativeLifetimeToken(); }
+    void retainNativeResourceGroups(const RequestedLayerState& state,
+                                    const LayerHierarchy::TraversalPath& actualPath,
+                                    const LayerSnapshot& parent) {
+        attachResourceGroup(state.id,state.nativeResourceGroup);
+        inheritResourceGroups(parent,actualPath.mirrorRootIds);
+    }
+
+    // Re-derive after every requested WindowInfo copy; client values are not SF lineage.
+    void updateInputCloneLineage(const LayerHierarchy::TraversalPath&);
 
     LayerHierarchy::TraversalPath path;
+    // Read-only nonresource token minted by the OWNED snapshot constructor.
+    // Plain observation copies preserve it; rebuilt owned snapshots do not.
+    sp<IBinder> nativeSnapshotIdentity;
+    std::optional<LayerHierarchy::TraversalPath> nativeTraversalParent;
     size_t globalZ = std::numeric_limits<ssize_t>::max();
     bool invalidTransform = false;
     bool isHiddenByPolicyFromParent = false;
@@ -108,11 +134,20 @@ struct LayerSnapshot : public compositionengine::LayerFECompositionState {
     bool autoRefresh;
     ui::Transform localTransformInverse;
     gui::WindowInfo inputInfo;
+    // Owned display-space candidate before task/root/viewport intersections.
+    // Reused only to recompute SECONDARY metadata on crop-only changes, never dispatch input.
+    std::optional<Region> preViewportTouchableRegionBeforeCrop;
     ui::Transform localTransform;
     // set to true if this snapshot will ignore local transforms. Used when the snapshot
     // is a mirror root
     bool ignoreLocalTransform;
     gui::DropInputMode dropInputMode;
+    // Pure native composed-parent fact. Separate from this root's LOCAL
+    // request so a later owned-drop join cannot clear stock/ancestor drops.
+    gui::DropInputMode nativeParentDropInputMode = gui::DropInputMode::NONE;
+    ExternalDesktopOwnedInputBlockState nativeOwnedInputBlock;
+    uint32_t nativeStockInputConfig = 0;
+    bool nativeStockProjectionComplete = false;
     gui::TrustedOverlay trustedOverlay;
     gui::GameMode gameMode;
     scheduler::LayerInfo::FrameRate frameRate;

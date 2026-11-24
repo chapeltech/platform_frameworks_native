@@ -106,16 +106,13 @@ void DisplayTransactionCommitTest::verifyDisplayIsConnected(const sp<IBinder>& d
     ASSERT_TRUE(hasDisplayDevice(displayToken));
     const auto& display = getDisplayDevice(displayToken);
 
-    // Physical external displays start non-secure when HDCP support is enabled, and only become
-    // secure later after HDCP negotiation succeeds. Pixel devices set debug.sf.hdcp_support=1.
-    // When DisplayModeController::supportsHdcp() is true, DisplayModeController::registerDisplay()
-    // sets external displays to non-secure initially. They become secure later via
-    // SurfaceFlinger::updateHdcpLevels() once HDCP negotiation reports connectedLevel >= HDCP_V1.
-    // Doesn't seem straightforward to mock negotiations here.
+    // processHotplugConnect() initializes physical external displays as non-secure,
+    // independently of a support property. They become secure later through
+    // onComposerHalHdcpLevelsChanged() when connectedLevel >= HDCP_V1. This
+    // connection check runs before that separate negotiation callback.
     const auto connectionType = Case::Display::CONNECTION_TYPE::value;
     const bool hdcpExternalConnection = connectionType &&
-            *connectionType == ui::DisplayConnectionType::External &&
-            mFlinger.mutableDisplayModeController().supportsHdcp();
+            *connectionType == ui::DisplayConnectionType::External;
     if (hdcpExternalConnection) {
         EXPECT_EQ(false, display.isSecure());
     } else {
